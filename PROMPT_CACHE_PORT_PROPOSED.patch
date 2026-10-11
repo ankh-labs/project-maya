@@ -1,0 +1,158 @@
+# PROMPT_CACHE_PORT_PROPOSED.patch — stage 1 (rev 2)
+# Against: homelab/v3q-support (5218aeb), src/program/generate.cpp only.
+# Rev 2 changes (review points 2-3):
+#   - identity now carries kv precision, dense.bin size+mtime, and a content hash of
+#     index.txt (pack identity is content-derived, not name-derived)
+#   - .meta stores size + mtime alongside the checksum: startup indexing verifies the FULL
+#     hash once (the torn-file guard); a restore fast-paths on size+mtime match and only
+#     re-hashes when the file changed - a restore costs ~0 hash I/O, not a second full read
+#   - checksum presence is an explicit flag, not a 0-sentinel
+# PREFIX HITS WORK TODAY: slot_take matches stored tokens as a strict prefix of the prompt
+# (growing agent conversations hit). Stage 4 only adds the shorter-shared-prefix case.
+# Hunk line numbers are approximate; use `git apply -C1` if context drifts.
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1310,6 +1310,22 @@
+     namespace fs = std::filesystem;
+     std::filesystem::path slot_dir;
++    // FNV-1a 64 over a whole file, streamed. A .meta's byte count alone cannot tell a torn or
++    // rot-corrupted .bin from a whole one; the fork's spill blobs are hash-checked on use and
++    // Maya's slots were not - this is the stage-1 guard against the silent-restore class.
++    // Returns the FNV basis (never 0) for an empty file; 0 only when the file cannot be opened.
++    const auto file_sum = [](const std::string& path) -> uint64_t {
++        std::ifstream f(path, std::ios::binary);
++        if (!f) return 0;
++        uint64_t h = 1469598103934665603ull;
++        char buf[1 << 16];
++        for (;;) {
++            f.read(buf, sizeof buf);
++            const std::streamsize n = f.gcount();
++            for (std::streamsize i = 0; i < n; ++i) h = (h ^ (uint8_t) buf[i]) * 1099511628211ull;
++            if (n < (std::streamsize) sizeof buf) break;
++        }
++        return h;
++    };
+     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
+     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
+     const std::string slot_identity = [&] {
+@@ -1324,9 +1340,17 @@
+         std::vector<std::string> shards;
+         for (const auto& de : fs::directory_iterator(fs::path(o.glm_pack).parent_path(), ec))
+             if (de.path().extension() == ".gguf")
+                 shards.push_back(de.path().filename().string() + ":" + std::to_string(de.file_size(ec)));
+         std::sort(shards.begin(), shards.end());
+         for (const auto& s : shards) id << " " << s;
++        // content-derived pack identity: two packs with identical shard NAMES and sizes would
++        // otherwise collide and a restore would be silently wrong.  index.txt is hashed (its
++        // content names the shards); dense.bin contributes size + mtime.
++        std::error_code ec2;
++        id << " idx:" << file_sum((fs::path(o.glm_pack) / "index.txt").string());
++        const auto dense = fs::path(o.glm_pack) / "dense.bin";
++        id << " dense:" << fs::file_size(dense, ec2) << ":" << fs::last_write_time(dense, ec2).time_since_epoch().count();
++        // launch-time meaning, not placement: k changes expert routing (production k=7 against a
++        // pack whose metadata says 8), the context bounds n_pos, and the KV precision changes what
++        // the serialized latents mean.  Expert-cache / slot sizing is deliberately NOT here - it
++        // changes placement, not state meaning, the same exclusion the fork's sig applies to
++        // batch/ubatch.
++        id << " kv=" << o.kv << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context;
+         return id.str();
+     }();
+     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
+     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
+-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
++    // .meta v2 layout: magic | identity | bytes | mtime | has_sum | sum | tokens | magic.
++    // `sum` is the full-file checksum (the startup torn-file guard); `mtime` + `bytes` are the
++    // restore fast path - a restore re-hashes only when the file's size or mtime changed.
++    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
+         const std::string tmp = path + ".tmp";
+         {
+             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+             const uint64_t il = slot_identity.size(), nt = toks.size();
++            const auto bin_path = path.substr(0, path.size() - 5) + ".bin";
++            std::error_code mec;
++            const uint64_t mtime = fs::last_write_time(bin_path, mec).time_since_epoch().count();
+             f.write((const char*) &kMetaMagic, 8);
+             f.write((const char*) &il, 8);
+             f.write(slot_identity.data(), (std::streamsize) il);
+             f.write((const char*) &bytes, 8);
++            f.write((const char*) &mtime, 8);
++            const uint64_t has_sum = 1;   // explicit presence flag: 0 is never a valid FNV of a
++                                          // non-empty file, but it is also file_sum's open-failure
++                                          // value, so presence is a field, not a sentinel
++            f.write((const char*) &has_sum, 8);
++            const uint64_t sum = file_sum(bin_path);
+             f.write((const char*) &nt, 8);
+             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
++            f.write((const char*) &sum, 8);
+             f.write((const char*) &kMetaMagic, 8);
+             f.flush();
+             if (!f) return false;
+@@ -1370,12 +1410,32 @@
+         std::error_code ec;
+         fs::rename(tmp, path, ec);
+         return !ec;
+     };
+-    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
++    // a .meta of this model -> its tokens, size, mtime and checksum (false: foreign, damaged, not
++    // this model's, or its .bin's checksum no longer matches - a torn or rotted file is refused,
++    // never indexed, and the caller removes it loudly)
+     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
+                               bool verify_full) -> bool {
+         std::ifstream f(path, std::ios::binary);
+-        uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
++        uint64_t m0 = 0, il = 0, bytes_f = 0, mtime = 0, has_sum = 0, nt = 0, sum = 0, m1 = 0;
+         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
+             return false;
+         std::string id(il, '\0');
+         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
+-        if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
++        if (!f.read((char*) &bytes_f, 8) || !f.read((char*) &mtime, 8) || !f.read((char*) &has_sum, 8) ||
++            has_sum != 1 || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
+         toks.resize(nt);
+-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
+-               m1 == kMetaMagic;
++        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &sum, 8) ||
++            !f.read((char*) &m1, 8) || m1 != kMetaMagic) return false;
++        bytes = bytes_f;
++        const std::string bin = path.substr(0, path.size() - 5) + ".bin";
++        std::error_code mec;
++        // `verify_full`: startup indexing hashes the whole file ONCE per boot (the torn-file and
++        // bit-rot guard - seconds of I/O per restart, cheap next to a 60 s prefill).  The restore
++        // path passes false: size + mtime matching the meta is trusted there, so a restore costs
++        // ~0 hash I/O, and only a changed file is re-hashed.
++        if (!verify_full &&
++            fs::file_size(bin, mec) == bytes_f &&
++            fs::last_write_time(bin, mec).time_since_epoch().count() == mtime) return true;
++        return sum != 0 && sum == file_sum(bin);
+     };
++    // the restore-time check: size+mtime must still match the meta, else the full hash decides.
++    // (Called before slot_load trusts a disk slot - the file can rot or be replaced between the
++    // startup index and this restore.)
++    const auto slot_bin_ok = [&](const std::string& bin) -> bool {
++        std::vector<int32_t> vt;
++        uint64_t vb = 0;
++        return meta_read(meta_of(bin), vt, vb, /*verify_full=*/false);
++    };
+@@ -1440,6 +1474,7 @@
+             if (meta_read(p, fd.toks, fd.bytes, /*verify_full=*/true) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+                 found.push_back(std::move(fd));
+             } else {
+                 ++refused;
++                std::fprintf(stderr, "glm slots: refused %s (foreign identity, incomplete, or its checksum failed) - removed\n", p.c_str());
+                 std::filesystem::remove(p, ec);
+                 std::filesystem::remove(bin, ec);
+             }
+@@ -1572,6 +1607,13 @@
+         if (best == SIZE_MAX) return 0;
+         const auto t0 = std::chrono::steady_clock::now();
++        if (!slots[best].data && !slot_bin_ok(slots[best].path)) {   // re-verify at use: the file
++                                                                    // can rot or be replaced
++                                                                    // between index and restore
++            note("refused " + slots[best].path + " at restore (checksum or identity failed) - reading its prompt again");
++            slot_drop(best);
++            snap_tokens.clear();
++            return 0;
++        }
+         std::string e;
+         const bool back = slots[best].data
+                               ? model.slot_load(*slots[best].data, (int64_t) len, e)

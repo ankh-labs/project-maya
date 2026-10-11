@@ -1,0 +1,160 @@
+diff --git a/include/strata/core/glm_model.hpp b/include/strata/core/glm_model.hpp
+index 03a3e0f..2fdff42 100644
+--- a/include/strata/core/glm_model.hpp
++++ b/include/strata/core/glm_model.hpp
+@@ -23,6 +23,7 @@
+ #include "strata/core/glm_dflash.hpp"
+ #include "strata/kernels/cpu/native_expert.hpp"
+ #include "strata/kernels/exl3.hpp"
++#include "strata/kernels/glm_lat_types.hpp"
+ #include "strata/kernels/sampler.hpp"
+ 
+ #include <algorithm>
+@@ -673,10 +674,17 @@ public:
+     int mtp_draft(int32_t next_tok, std::string& err);
+     bool has_mtp() const;
+     bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+-    // the latent cache's precision, as the slot identity and the INFO line name it ("fp16" or "int8"; the
+-    // kv= field keys a slot's layout, so it must name what the state actually holds - a two-valued string
+-    // here let a q4_0 slot pass identity as int8 once q4_0 exists)
+-    const char* kv_name() const { return lat_q8_ ? "int8" : "fp16"; }
++    // stage A of the q4_0 records (GLM_KV_Q4_STAGE_A): lat_type_ is the REQUESTED type (--kv), named
++    // truthfully by kv_name(); lat_records_ is what the cache actually stores (q4_0 records INT8 until the
++    // stage-B kernel branch), and every byte derivation reads lat_rec_bytes of lat_records_ - the layout
++    // always matches what is stored.  Stage B flips lat_records_ to q4_0 with the kernels; the state
++    // signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A slots then, since glm_batch.cu
++    // changes with it.
++    LatType lat_type_ = LatType::fp16;
++    LatType lat_records_ = LatType::fp16;
++    // the latent cache's precision, as the slot identity and the INFO line name it - the kv= field keys a
++    // slot's layout, so it must name the requested type (a two-valued string let a q4_0 slot pass as int8)
++    const char* kv_name() const { return strata::kernels::glmf::lat_type_name(lat_type_); }
+     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
+     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
+     /// or when the context fits in that many anyway
+diff --git a/include/strata/kernels/glm_fast.hpp b/include/strata/kernels/glm_fast.hpp
+index c83d4c2..33fe8c8 100644
+--- a/include/strata/kernels/glm_fast.hpp
++++ b/include/strata/kernels/glm_fast.hpp
+@@ -259,8 +259,9 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
+ void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
+              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
+ /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
+-/// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.
+-__host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }
++/// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.  The record types and their
++/// byte counts live in glm_lat_types.hpp (shared with the model's arena sizing and the slot identity).
++#include "strata/kernels/glm_lat_types.hpp"
+ 
+ /// SwiGLU with GLM's clamp (gate above, up both sides) and the q8_1 of h, n values.
+ void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s);
+diff --git a/include/strata/kernels/glm_lat_types.hpp b/include/strata/kernels/glm_lat_types.hpp
+new file mode 100644
+index 0000000..da5e63f
+--- /dev/null
++++ b/include/strata/kernels/glm_lat_types.hpp
+@@ -0,0 +1,33 @@
++// include/strata/kernels/glm_lat_types.hpp - the latent cache's record types (glm_fast.hpp lat8_rec_bytes,
++// generalized): fp16 rows, INT8 records, q4_0 records.  Shared by the model (glm_model.hpp names the cache's
++// type and sizes its arenas from it) and the kernels (glm_lat8.cuh holds the record convention; stage B of
++// the q4_0 work reads it there).
++#pragma once
++
++#include <cstdint>
++
++namespace strata::kernels::glmf {
++
++/// INT8 records: per position kv_lora int8 codes, then one FP16 scale per 32 values (544 B a position and
++/// layer at kv_lora 512, against the FP16 row's 1024).  glm_lat8.cuh holds the record convention.
++__host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }
++
++/// q4_0 records: per 32 values an FP16 scale + 16 nibble bytes (ggml's convention, value = (q - 8) * d):
++/// 288 B a position and layer at kv_lora 512.
++__host__ __device__ constexpr inline int lat4_rec_bytes(int kv_lora) { return kv_lora / 2 + kv_lora / 32; }
++
++enum class LatType : int { fp16 = 0, int8 = 1, q4_0 = 2 };
++
++/// the bytes a position and layer occupy in the cache, per record type
++__host__ __device__ constexpr inline int lat_rec_bytes(int kv_lora, LatType t) {
++    return t == LatType::int8 ? lat8_rec_bytes(kv_lora)
++         : t == LatType::q4_0 ? lat4_rec_bytes(kv_lora)
++         : kv_lora * 2;
++}
++
++/// the name the slot identity's kv= field and the INFO line report
++__host__ inline const char* lat_type_name(LatType t) {
++    return t == LatType::int8 ? "int8" : t == LatType::q4_0 ? "q4_0" : "fp16";
++}
++
++}  // namespace strata::kernels::glmf
+diff --git a/src/core/glm_model.cu b/src/core/glm_model.cu
+index 1831b34..7bfb103 100644
+--- a/src/core/glm_model.cu
++++ b/src/core/glm_model.cu
+@@ -902,7 +902,7 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
+     if (ls.empty()) return nullptr;
+     auto* K = new KvStream();
+     K->page = g_.idx_kpool;
+-    K->row_bytes = lat_q8_ ? k::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
++    K->row_bytes = strata::kernels::glmf::lat_rec_bytes(g_.kv_lora, lat_records_);
+     K->slots = cells / K->page;
+     K->n_blocks = (ctx + K->page - 1) / K->page;
+     const auto fail = [&](const std::string& e) {
+@@ -3401,16 +3401,30 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
+     int64_t floats = 2 * hc_dim;
+     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
+     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
+-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
+-              std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
++    // stage A of the q4_0 latent records (GLM_KV_Q4_STAGE_A): the requested type is parsed (STRATA_GLM_KV_Q4,
++    // set by --kv q4_0) and named truthfully, but the cache RECORDS INT8 until the stage-B kernel branch -
++    // lat_records_ is what every byte derivation reads, so the layout always matches what is stored.  A q4_0
++    // slot survives a stage-B rebuild only if the state signature still matches (it will not: glm_batch.cu
++    // changes), so the stage-A files refuse loudly instead of restoring silently.
++    const char* kv_int_env = getenv("STRATA_GLM_KV_INT8");
++    const bool want_int8 = kv_int_env != nullptr && std::atoi(kv_int_env) != 0;
++    const char* kv_q4_env = getenv("STRATA_GLM_KV_Q4");
++    const bool want_q4 = kv_q4_env != nullptr && std::atoi(kv_q4_env) != 0;
++    lat_type_ = want_q4 ? LatType::q4_0 : want_int8 ? LatType::int8 : LatType::fp16;
++    lat_records_ = lat_type_ == LatType::q4_0 ? LatType::int8 : lat_type_;
++    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
++    if (lat_type_ == LatType::q4_0)
++        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 requested - RECORDS INT8 for now (the q4_0 kernel "
++                             "branch is stage B); the slot identity and layout are keyed truthfully\n", dev_);
+     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
+     // a layer (kv_stream_setup, below)
+     const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
+-    // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
+-    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
+-                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
+-                                            : (int64_t) g_.kv_lora * lat_rows;
++    // (a record type: lat_rec_bytes a position, a multiple of 16 bytes at kv_lora 512; the reference path
++    // stays F32)
++    const int64_t lat_floats = fast_mode_
++        ? (int64_t) strata::kernels::glmf::lat_rec_bytes(g_.kv_lora, lat_records_) / 4 * lat_rows
++        : (int64_t) g_.kv_lora * lat_rows;
+     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
+                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
+     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 249de31..ab2e3f1 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4679,13 +4679,9 @@ int main(int argc, char** argv) {
+     if (!o.glm_pack.empty()) {
+         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
+         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+-        // --kv q4_0 on the GLM path: refused until the q4_0 latent records exist - silently running fp16
+-        // would put a slot on disk keyed kv=fp16 against a request that asked for q4_0 (loud, not silent)
+-        if (o.kv == "q4_0") {
+-            std::fprintf(stderr, "maya generate: --kv q4_0 - the GLM latent path has no q4_0 records yet "
+-                                 "(fp16 or int8 only); refusing to start silently different\n");
+-            return 2;
+-        }
++        // --kv q4_0 on the GLM path: stage A parses and keys it (STRATA_GLM_KV_Q4; Glm5Model records INT8
++        // until the stage-B kernel branch, loudly at boot).  Unknown --kv values were refused at parse.
++        if (o.kv == "q4_0" && std::getenv("STRATA_GLM_KV_Q4") == nullptr) set_env("STRATA_GLM_KV_Q4", "1");
+         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
+         if (o.kv_resident < 0) {
+             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");

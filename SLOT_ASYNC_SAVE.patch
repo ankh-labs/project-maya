@@ -1,0 +1,90 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7699e2f..f7fb473 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1474,6 +1474,42 @@ static int glm_pack_generate(const Options& o) {
+         if (ec) return 1e9;
+         return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
+     };
++    // stage 2c: one async slot writer.  The D2H copy (slot_save's RAM variant) happens inline - it reads the
++    // device state and must be synchronous, ~25 ms for 160 MB - and the thread only writes bytes we already
++    // hold: tmp, rename, meta.  No device races: the thread never touches the model.  slot_drop, a superseding
++    // save and shutdown join the writer first, so a file being published is never deleted or orphaned.
++    std::thread slot_th;
++    std::shared_ptr<std::vector<uint8_t>> slot_buf;
++    const auto slot_th_join = [&]() {
++        if (slot_th.joinable()) slot_th.join();
++    };
++    const auto slot_th_write = [&](std::shared_ptr<std::vector<uint8_t>> buf, std::vector<int32_t> toks,
++                                   const std::string& path, uint64_t bytes,
++                                   const std::function<bool(const std::string&, const std::vector<int32_t>&, uint64_t)> meta) {
++        slot_th_join();                       // one writer at a time
++        slot_buf = std::move(buf);
++        const auto b = slot_buf;
++        slot_th = std::thread([b, toks = std::move(toks), path, bytes, meta]() {
++            std::error_code ec;
++            {
++                std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
++                if (!f || !f.write((const char*) b->data(), (std::streamsize) b->size()) || !f) {
++                    std::fprintf(stderr, "glm slots: setting the conversation aside failed (writing %s.tmp)\n",
++                                 path.c_str());
++                    std::remove((path + ".tmp").c_str());
++                    return;
++                }
++            }
++            std::filesystem::rename(path + ".tmp", path, ec);
++            if (ec || !meta(path, toks, bytes)) {
++                std::error_code e2;
++                std::filesystem::remove(path + ".tmp", e2);
++                std::filesystem::remove(path, e2);
++                std::fprintf(stderr, "glm slots: setting the conversation aside failed (publishing %s)\n",
++                             path.c_str());
++            }
++        });
++    };
+     // NOTE lines on stdout: the server shows them in its own log (what happens to the conversations)
+     const auto note = [&](const std::string& m) {
+         std::fprintf(stderr, "glm slots: %s\n", m.c_str());
+@@ -1568,6 +1604,7 @@ static int glm_pack_generate(const Options& o) {
+         }
+     }
+     const auto slot_drop = [&](size_t i) {
++        slot_th_join();                           // never delete a file the writer is publishing
+         if (slots[i].data)                       // a RAM slot: its buffer simply dies
+             slots[i].data.reset();
+         else {
+@@ -1635,15 +1672,16 @@ static int glm_pack_generate(const Options& o) {
+         const std::string path = (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) +
+                                               ".bin")).string();
+         std::string e;
+-        const uint64_t bytes = model.slot_save(path + ".tmp", e);
+-        if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
+-            !meta_write(meta_of(path), snap_tokens, bytes)) {
+-            std::filesystem::remove(path + ".tmp", ec);
+-            std::filesystem::remove(path, ec);
++        // stage 2c: the D2H copy inline (the RAM variant of slot_save), the NVMe write on the side thread
++        auto buf = std::make_shared<std::vector<uint8_t>>();
++        buf->reserve(1 << 20);
++        const uint64_t bytes = model.slot_save(*buf, e);
++        if (bytes == 0) {
+             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
+-                         e.empty() ? "writing its files" : e.c_str());
++                         e.empty() ? "the state did not copy" : e.c_str());
+             return;
+         }
++        slot_th_write(std::move(buf), snap_tokens, path, bytes, meta_write);
+         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
+         snap_in_slot = true;
+         uint64_t total = 0;
+@@ -4419,9 +4457,11 @@ static int glm_pack_generate(const Options& o) {
+                 bind_ctx(c);
+                 slot_put(" on shutdown");
+             }
++        slot_th_join();   // stage 2c: the last save publishes before the engine exits
+         return 0;
+     }
+     if (slot_keep && !slot_ram) slot_put(" on shutdown");
++    slot_th_join();   // stage 2c: the last save publishes before the engine exits
+     save_profile("quit");   // #477
+     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
+     return 0;

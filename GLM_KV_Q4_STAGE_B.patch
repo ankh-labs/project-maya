@@ -1,0 +1,1106 @@
+GLM_KV_Q4_STAGE_B.patch - stage B of the GLM latent q4_0 work (all-or-nothing; cut against HEAD 56f1b72).
+
+Generator rules for the next regen (the two things that bite):
+- glm_fast.hpp: the glm_lat_types.hpp include is ALREADY at line 17 (the stage-A compile fix moved it out
+  of the /// doc comment and out of namespace glmf; committed in 56f1b72).  This patch adds NO include in
+  glm_fast.hpp and must NEVER re-emit one - a second copy at the old site is exactly the stage-A bug that
+  left lat8_rec_bytes undefined.  The include hunk for glm_fast.hpp is DONE; do not regenerate it.
+- LatType is written UNQUALIFIED in the glm_model.hpp / glm_model.cu hunks (LatType::q4_0 etc.).  That
+  compiles only because glm_model.hpp carries
+      using LatType = strata::kernels::glmf::LatType;
+  at line 43 (the stage-A fix, also committed in 56f1b72).  Regenerating from a tree without that alias
+  yields six compile errors - qualify the spellings or confirm the alias first.
+- generate.cpp is untouched (the __DATE__ literal fix lives in HEAD; stage B has nothing there).
+
+Cache-state note: this patch flips lat_records_ = lat_type_ (all-or-nothing).  STRATA_STATE_SIGNATURE is
+content-derived and changes with it, so stage-A int8 slots refuse by identity+digest on the first boot and
+are re-recorded.  q4_0 requires kv_lora == 512 exactly (loud refusal at load otherwise); on HIP builds
+q4_0 loudly falls back to truthful INT8 records.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c024700..49c7b96 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -395,6 +395,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME glm_lat8_test COMMAND glm_lat8_test)
+     set_tests_properties(glm_lat8_test PROPERTIES TIMEOUT 60)
+   endif()
++  # the stage-B q4_0 records: orthonormal H512 (<Hx,Hy> == <x,y> to 1e-6), self-inverse, round-trip (GPU, no model)
++  if(STRATA_BUILD_TESTS)
++    add_executable(glm_lat4_test tests/glm_lat4_test.cu)
++    target_link_libraries(glm_lat4_test PRIVATE ${_strata_gpu_runtime_target})
++    add_test(NAME glm_lat4_test COMMAND glm_lat4_test)
++    set_tests_properties(glm_lat4_test PROPERTIES TIMEOUT 60)
++  endif()
+   # __dp4a as the kernels see it (sm_60: kernels/dp4a.hpp's vmad fallback) against the byte-wise form (GPU, no model)
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+     add_executable(dp4a_sm60_test tests/dp4a_sm60_test.cu)
+diff --git a/include/strata/core/glm_model.hpp b/include/strata/core/glm_model.hpp
+index 5504d27..ae1746d 100644
+--- a/include/strata/core/glm_model.hpp
++++ b/include/strata/core/glm_model.hpp
+@@ -612,7 +612,7 @@ public:
+     int ik_ring_ = 0;
+     // the fast path's latent cache in INT8 records (--kv int8 / STRATA_GLM_KV_INT8=1; glm_fast.hpp lat8_rec_bytes):
+     // 544 bytes a position and layer against FP16's 1024
+-    bool lat_q8_ = false;
++    int lat_q8_ = 0;   // the records the fast path reads: 1 = INT8, 2 = q4_0 of the rotated row (stage B), 0 = FP16
+     // KV streaming (--kv-resident N / STRATA_GLM_KV_RESIDENT; strata/kernels/glm_kv_stream.hpp): the fast path's DSA
+     // layers keep their latent cache in pinned RAM and N positions of it in VRAM - state_ + dsa_lat_[il] is then the
+     // layer's VRAM slots.  Null: every position in VRAM.  (glm_fast_state.hpp)
+@@ -677,13 +677,13 @@ public:
+     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
+     int mtp_draft(int32_t next_tok, std::string& err);
+     bool has_mtp() const;
+-    bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+-    // stage A of the q4_0 records (GLM_KV_Q4_STAGE_A): lat_type_ is the REQUESTED type (--kv), named
+-    // truthfully by kv_name(); lat_records_ is what the cache actually stores (q4_0 records INT8 until the
+-    // stage-B kernel branch), and every byte derivation reads lat_rec_bytes of lat_records_ - the layout
+-    // always matches what is stored.  Stage B flips lat_records_ to q4_0 with the kernels; the state
+-    // signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A slots then, since glm_batch.cu
+-    // changes with it.
++    bool kv_int8() const { return lat_q8_ != 0; }   // the latent cache in records (STRATA_GLM_KV_INT8=1 /
++                                                    // STRATA_GLM_KV_Q4=1: INT8 or q4_0)
++    // stage B of the q4_0 records (GLM_KV_Q4_STAGE_B): lat_type_ is the REQUESTED type (--kv), named
++    // truthfully by kv_name(); lat_records_ is what the cache actually stores (the q4_0 kernel branch is in),
++    // and every byte derivation reads lat_rec_bytes of lat_records_ - the layout always matches what is stored.
++    // The state signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A/B slots when the kernels
++    // change again, since glm_batch.cu changes with them.
+     LatType lat_type_ = LatType::fp16;
+     LatType lat_records_ = LatType::fp16;
+     // the latent cache's precision, as the slot identity and the INFO line name it - the kv= field keys a
+diff --git a/include/strata/kernels/glm_batch.hpp b/include/strata/kernels/glm_batch.hpp
+index 8ad3130..bed69bb 100644
+--- a/include/strata/kernels/glm_batch.hpp
++++ b/include/strata/kernels/glm_batch.hpp
+@@ -97,12 +97,13 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
+ /// The same attention with Q in FP16 ([T][n_head][512]) on the WMMA units (rocWMMA, RDNA3/RDNA4): FP16 operands, F32
+ /// accumulation and softmax.  n_head % 16 == 0, kv_lora 512.
+ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+-                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
++                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
+ /// The same attention with Q in F32 on wave32 WMMA intrinsics (gfx11/gfx12): the FP32 query and softmax probability
+ /// are each split into FP16 high + residual, both products through WMMA with F32 accumulation and online softmax.
+-/// n_head % 16 == 0, kv_lora 512. lat_q8 expands INT8 codes with one FP16 scale per 32 values as they are loaded.
++/// n_head % 16 == 0, kv_lora 512.  lat_q8: 1 = INT8 codes with one FP16 scale per 32 values, 2 = q4_0 of the
++/// rotated rows (glm_lat4.cuh), 0 = FP16 - expanded as they are loaded.
+ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+-                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
++                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
+ /// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
+ /// where the prompt path prefers it over mla_attn_f16q.
+ bool mla_wmma2_supported();
+@@ -112,11 +113,11 @@ bool mla_wmma2_default();
+ /// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
+ /// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with STRATA_GLM_MLA_V70=0.
+ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+-                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
++                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, int lat_q8 = 0);
+ /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
+ /// scale) . lat_c.  kv_lora 512, n_head % 16 == 0.
+ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
+-              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
++              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
+ 
+ /// h[t] = rms(mean of the 4 streams of R[t]) * w - the final hidden state per row (the NextN block's input).
+ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, float* h, cudaStream_t s);
+diff --git a/include/strata/kernels/glm_fast.hpp b/include/strata/kernels/glm_fast.hpp
+index ee1e94f..a35af83 100644
+--- a/include/strata/kernels/glm_fast.hpp
++++ b/include/strata/kernels/glm_fast.hpp
+@@ -171,7 +171,8 @@ struct DsaPrepArgs {
+     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
+     int q_lora = 1536;
+     const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512;
+-    int lat_q8 = 0;   // the latent cache holds INT8 records (lat8_rec_bytes each) instead of FP16 rows
++    int lat_q8 = 0;   // the latent cache holds records instead of FP16 rows: 1 = INT8 (lat8_rec_bytes each),
++                      // 2 = q4_0 of the ROTATED row (lat4_rec_bytes; glm_lat4.cuh)
+     // KV streaming (glm_kv_stream.hpp): the row also goes to the host copy, and to its block's VRAM slot when lat_table
+     // names one (lat, the identity-layout cache, is null then)
+     uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 4;
+@@ -220,7 +221,8 @@ bool dsa_select_all_on();
+ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s);
+ /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
+ /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
+-/// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
++/// lat_q8: the cache holds records - 1 = INT8 (see lat8_rec_bytes), 2 = q4_0 of the rotated row (glm_lat4.cuh;
++/// the absorbed queries and the context mix are rotated with it) - else FP16 rows of kv_lora.
+ /// marks (the stage profiler, MAYA_GLM_PROF): called after each step it launched with that step's name -
+ /// "mla_q_abs", "mla_attend", "mla_out", or "mla" for the one-kernel form; nullptr: none.  Launches unchanged.
+ struct MlaMarks {
+@@ -229,7 +231,7 @@ struct MlaMarks {
+ };
+ /// token: the decode's token path - only it takes the take-two split attention STRATA_GLM_MLA_ATTN2 names (as dsa_score).
+ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
+-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
++         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, int lat_q8 = 0,
+          const MlaMarks* marks = nullptr, bool token = false);
+ /// The same absorbed MLA in three steps for a verify window (each step mla()'s arithmetic, bit for bit): the head-wise
+ /// q_abs = wk_b . q of `ncol` tokens at once (q rows q_stride floats apart, q_abs rows qa_stride), one token's attention
+@@ -239,14 +241,14 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
+ void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
+                float* q_abs, int64_t qa_stride, cudaStream_t s);
+ bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
+-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
++                int kv_lora, float* ctx, cudaStream_t s, int lat_q8);
+ /// mla_attend of T tokens in a few launches (up to kMlaTokMax tokens each; the tensor-core attention: NVIDIA sm_80+,
+ /// kv_lora 512): token t's q_abs at q_abs + t * q_stride, its n_sel[t] cells at cells + t * c_stride, its ctx at
+ /// ctx + t * ctx_stride - each token's sums mla_attend's bit for bit.  false: not available here (mla_attend per token)
+ constexpr int kMlaTokMax = 8;
+ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
+                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+-                      cudaStream_t s, bool lat_q8);
++                      cudaStream_t s, int lat_q8, bool q_abs_rotated = false);
+ /// mla_attend_batch for tokens of DIFFERENT sequences (the batched rows of several conversations): token t's latents at
+ /// lat[t] and its n_sel[t] cells at cells[t] (each its own cache: the resident rows, or a streamed layer's slot rows),
+ /// the partials in the caller's `part` (mla_rows_part_floats() a token, room for part_tokens tokens: launches of
+@@ -256,9 +258,9 @@ size_t mla_rows_part_floats(int n_head, int kv_lora);
+ bool mla_rows_ok(int kv_lora);
+ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+-                     float* part, int part_tokens, cudaStream_t s, bool lat_q8);
++                     float* part, int part_tokens, cudaStream_t s, int lat_q8);
+ void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
+-             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
++             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s, int lat_q8 = 0);
+ /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
+ /// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.  The record types and their
+ /// byte counts live in glm_lat_types.hpp (shared with the model's arena sizing and the slot identity).
+diff --git a/include/strata/kernels/kv_q4.hpp b/include/strata/kernels/kv_q4.hpp
+index 930b628..faffb03 100644
+--- a/include/strata/kernels/kv_q4.hpp
++++ b/include/strata/kernels/kv_q4.hpp
+@@ -41,6 +41,14 @@ inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
+ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
+ inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }
+ 
++/// Stage B of the GLM latent q4_0 work (GLM_KV_Q4_STAGE_B): an in-place orthonormal H512 rotation of rows of
++/// 512 floats - two fwht256 halves (H512 = H256 . H256, self-inverse), scale 1/16 a half.  Row i sits at
++/// base + (i / rows_per_col) * col_stride + (i % rows_per_col) * 512: mla_q_abs's output is dense runs of
++/// n_head * kv_lora per column, a strided ctx (mla_out) is one column a token.  Applied to the absorbed q_abs
++/// right after its GEMV/GEMM and to the context mix before the wv_b projection: the latents are stored rotated,
++/// so <Hq, Hk> = <q, k> keeps the scores and H (self-inverse) restores the context.
++void fwht512_rows_cuda(float* base, int64_t col_stride, int rows_per_col, int n_cols, void* stream);
++
+ /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
+ /// and to VRAM only if its block is resident.
+ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+diff --git a/src/core/glm_model.cu b/src/core/glm_model.cu
+index 7bfb103..8932814 100644
+--- a/src/core/glm_model.cu
++++ b/src/core/glm_model.cu
+@@ -3401,21 +3401,42 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
+     int64_t floats = 2 * hc_dim;
+     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
+     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
+-    // stage A of the q4_0 latent records (GLM_KV_Q4_STAGE_A): the requested type is parsed (STRATA_GLM_KV_Q4,
+-    // set by --kv q4_0) and named truthfully, but the cache RECORDS INT8 until the stage-B kernel branch -
+-    // lat_records_ is what every byte derivation reads, so the layout always matches what is stored.  A q4_0
+-    // slot survives a stage-B rebuild only if the state signature still matches (it will not: glm_batch.cu
+-    // changes), so the stage-A files refuse loudly instead of restoring silently.
++    // stage B of the q4_0 latent records (GLM_KV_Q4_STAGE_B): the requested type is parsed (STRATA_GLM_KV_Q4,
++    // set by --kv q4_0) and named truthfully, and the cache records it - the stage-B kernel branch rotates the
++    // rows with the Hadamard and quantizes q4_0 (glm_lat4.cuh).  lat_records_ is what every byte derivation
++    // reads, so the layout always matches what is stored.  A pre-stage-B slot survives a rebuild only if the
++    // state signature still matches (it will not: glm_batch.cu changes), so old files refuse loudly instead of
++    // restoring silently.
+     const char* kv_int_env = getenv("STRATA_GLM_KV_INT8");
+     const bool want_int8 = kv_int_env != nullptr && std::atoi(kv_int_env) != 0;
+     const char* kv_q4_env = getenv("STRATA_GLM_KV_Q4");
+     const bool want_q4 = kv_q4_env != nullptr && std::atoi(kv_q4_env) != 0;
+     lat_type_ = want_q4 ? LatType::q4_0 : want_int8 ? LatType::int8 : LatType::fp16;
+-    lat_records_ = lat_type_ == LatType::q4_0 ? LatType::int8 : lat_type_;
++    // stage B (GLM_KV_Q4_STAGE_B): the q4_0 kernel branch is in, so the cache records what was requested.  The
++    // rotation's butterfly needs kv_lora == blockDim (512) exactly - refused loudly otherwise - and q4_0 has no
++    // kernel branch on HIP builds yet (the f16q prompt attention has no rotation for its FP16 queries).
++    lat_records_ = lat_type_;
+     lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
++    if (lat_type_ == LatType::q4_0 && g_.kv_lora != 512) {
++        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 refused: the Hadamard rotation needs kv_lora 512, this "
++                             "pack has %d\n", dev_, g_.kv_lora);
++        lat_type_ = want_int8 ? LatType::int8 : LatType::fp16;
++        lat_records_ = lat_type_;
++        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
++    }
++#if defined(STRATA_USE_HIP)
++    if (lat_type_ == LatType::q4_0) {
++        std::fprintf(stderr, "glm pack: --kv q4_0 is not available on HIP builds (no rotation for the f16q "
++                             "attention) - recording INT8, named truthfully\n");
++        lat_type_ = LatType::int8;
++        lat_records_ = LatType::int8;
++        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0;
++    }
++#endif
+     if (lat_type_ == LatType::q4_0)
+-        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 requested - RECORDS INT8 for now (the q4_0 kernel "
+-                             "branch is stage B); the slot identity and layout are keyed truthfully\n", dev_);
++        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0: the cache records q4_0 of the ROTATED rows (the "
++                             "stage-B kernel branch is in); the slot identity and layout are keyed truthfully\n",
++                     dev_);
+     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
+     // a layer (kv_stream_setup, below)
+     const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+@@ -3425,8 +3446,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
+     const int64_t lat_floats = fast_mode_
+         ? (int64_t) strata::kernels::glmf::lat_rec_bytes(g_.kv_lora, lat_records_) / 4 * lat_rows
+         : (int64_t) g_.kv_lora * lat_rows;
+-    if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
+-                              strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
++    if (lat_q8_) {
++        const int rec_bytes = lat_type_ == LatType::q4_0 ? strata::kernels::glmf::lat4_rec_bytes(g_.kv_lora)
++                                                         : strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora);
++        std::fprintf(stderr, "glm pack: CUDA%d latent cache %s (%d bytes a position and layer)\n", dev_,
++                     lat_type_ == LatType::q4_0 ? "q4_0" : "INT8", rec_bytes);
++    }
+     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
+     kda_S_.assign((size_t) g_.n_layers + 1, 0);
+     kda_conv_.assign((size_t) g_.n_layers + 1, 0);
+diff --git a/src/core/glm_rows.cu b/src/core/glm_rows.cu
+index da17c68..2c3f928 100644
+--- a/src/core/glm_rows.cu
++++ b/src/core/glm_rows.cu
+@@ -628,7 +628,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
+             return false;
+         }
+         gf::mla_out(S->actx, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
+-                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s);
++                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s, lat_q8_);
+     }
+     gf::MvJob o = {Ly.out.q, S->attn_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
+                    E};
+diff --git a/src/core/glm_window.cu b/src/core/glm_window.cu
+index 3af089a..c03e7b9 100644
+--- a/src/core/glm_window.cu
++++ b/src/core/glm_window.cu
+@@ -496,7 +496,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string&
+     }
+     if (batched)
+         gf::mla_out(W.ctx + (size_t) t0 * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, T,
+-                    (uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, (int64_t) W.aq_s, s);
++                    (uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, (int64_t) W.aq_s, s, lat_q8_);
+     mark("dsa_attn");
+     gf::MvJob o = cols({Ly.out.q, (const uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, nullptr, W.mixer + (size_t) t0 * E,
+                         nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, E}, W.aq_s, 0, E);
+diff --git a/src/kernels/cuda/glm_batch.cu b/src/kernels/cuda/glm_batch.cu
+index b91fdff..0f5aff5 100644
+--- a/src/kernels/cuda/glm_batch.cu
++++ b/src/kernels/cuda/glm_batch.cu
+@@ -38,6 +38,8 @@
+ #include "strata/kernels/glm_batch.hpp"
+ #include "dsa_topk.cuh"
+ #include "glm_lat8.cuh"
++#include "glm_lat4.cuh"
++#include "strata/kernels/kv_q4.hpp"   // fwht512_rows_cuda (the stage-B q4_0 rotation of q_abs / ctx)
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+@@ -452,9 +454,12 @@ __global__ void __launch_bounds__(128) kda_out_kernel(const float* __restrict__
+ }
+ 
+ // ---------------------------------------------------------------- DSA
+-// value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+-__device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, bool q8, int kv_lora, int c) {
+-    if (q8) {
++// value c of a latent row y into row `row` of a cache (FP16 rows, or records written by whole warps: q8 1 = INT8,
++// 2 = q4_0 of the ROTATED row - the dsa_prep kernel's butterfly above has already applied the 512-point Hadamard)
++__device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, int q8, int kv_lora, int c) {
++    if (q8 == 2) {
++        lat4_store_warp(y, (uint8_t*) lat4_rec(lat, kv_lora, row), kv_lora, c, c & 31);
++    } else if (q8) {
+         uint8_t* rec = (uint8_t*) lat8_rec(lat, kv_lora, row);
+         float amax = fabsf(y);
+         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+@@ -495,7 +500,23 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
+         const float ss = block_sum(v * v, sred);
+         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
+         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
+-            const float y = v * inv * a.kv_norm[tid];
++            float y = v * inv * a.kv_norm[tid];
++            if (a.lat_q8 == 2 && a.kv_lora == 512) {   // the q4_0 records hold the ROTATED row: H512 in shared
++                                                       // memory (two H256 halves, orthonormal at 1/16 a half;
++                                                       // glm_lat4.cuh).  kv_lora == 512 is the load-time gate -
++                                                       // the butterfly's shape, refused loudly otherwise.
++                __shared__ float s_rot[512];
++                s_rot[tid] = y;
++                __syncthreads();
++#pragma unroll
++                for (int st = 0, stride = 1; st < 8; ++st, stride <<= 1) {
++                    const float x = s_rot[tid], b = s_rot[tid ^ stride];
++                    __syncthreads();   // every read before any write
++                    s_rot[tid] = (tid & stride) ? b - x : x + b;
++                    __syncthreads();
++                }
++                y = s_rot[tid] * (1.0f / 16.0f);
++            }
+             if (a.lat != nullptr) lat_put(a.lat, p, y, a.lat_q8, a.kv_lora, tid);
+             if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                 lat_put(a.lat_host, p, y, a.lat_q8, a.kv_lora, tid);
+@@ -684,7 +705,7 @@ constexpr size_t kF32Smem = (size_t) MB_CH * 512 * sizeof(uint16_t) + (size_t) M
+ static_assert(kF32Smem <= 48 * 1024, "the F32 prompt attention must fit the default 48 KB of shared memory");
+ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
+-                                                       int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
++                                                       int n_sel_max, int n_head, float scale, float* __restrict__ ctx, int q8) {
+     constexpr int KV = 512;
+     extern __shared__ float sm[];
+     uint16_t* sL = (uint16_t*) sm;   // MB_CH x KV, FP16
+@@ -718,6 +739,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
+             const int s = i / (KV / 4), c4 = i - s * (KV / 4);
+             const int cell = s_cell[s];
+             ((uint2*) sL)[i] = cell < 0 ? make_uint2(0u, 0u)
++                               : q8 == 2 ? lat4_h4(lat4_rec(lat, KV, cell), KV, c4)
+                                : q8 ? lat8_h4(lat8_rec(lat, KV, cell), KV, c4)
+                                     : ((const uint2*) (lat + (size_t) KV * cell))[c4];
+         }
+@@ -797,7 +819,7 @@ constexpr size_t kTcSmem = (size_t) TC_HG * 512 * 4 + (size_t) TC_HG * 512 * 2 +
+ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                           const int* __restrict__ cells_all,
+                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+-                                                          float scale, float* __restrict__ ctx, bool q8) {
++                                                          float scale, float* __restrict__ ctx, int q8) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+     // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+ #else
+@@ -833,7 +855,8 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
+             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
+             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
+             pre[k] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+-                     : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
++                     : q8 == 2 ? lat4_h8(lat4_rec(lat, KV, cell), KV, c8)
++                                : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                           : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+         }
+     };
+@@ -925,7 +948,7 @@ constexpr size_t kT2Smem = (size_t) (T2_H + T2_C) * T2_LD * 2 + (size_t) T2_KP *
+ __global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                            const int* __restrict__ cells_all,
+                                                            const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+-                                                           float scale, float* __restrict__ ctx, bool q8) {
++                                                           float scale, float* __restrict__ ctx, int q8) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+     // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+ #else
+@@ -962,6 +985,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restri
+             for (int i = tid; i < T2_C * (KV / 8); i += 256) {
+                 const int rr = i / (KV / 8), c8 = i % (KV / 8), cell = s_cell[rr];
+                 const uint4 v = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
++                                : q8 == 2  ? lat4_h8(lat4_rec(lat, KV, cell), KV, c8)
+                                 : q8      ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                                           : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+                 *(uint4*) (srow + rr * T2_LD + c8 * 8) = v;
+@@ -1081,7 +1105,7 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
+                                                               const uint16_t* __restrict__ lat,
+                                                               const int* __restrict__ cells_all,
+                                                               const int* __restrict__ n_sel_arr, int n_sel_max,
+-                                                              int n_head, float scale, float* __restrict__ ctx, bool q8,
++                                                              int n_head, float scale, float* __restrict__ ctx, int q8,
+                                                               int cblk = 0, float* __restrict__ part = nullptr) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+     // Pascal (sm_6x): no tensor cores - mla_attn launches this on Volta only
+@@ -1129,7 +1153,8 @@ __global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __res
+             const int i = tid + 256 * r, rr = i / (KV / 8), c8 = i % (KV / 8);
+             const int cell = i0 + rr < ns ? cl[i0 + rr] : -1;
+             pre[r] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+-                     : q8      ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
++                     : q8 == 2  ? lat4_h8(lat4_rec(lat, KV, cell), KV, c8)
++                                : q8      ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                                : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+         }
+     };
+@@ -1294,7 +1319,7 @@ constexpr size_t kTcRegSmem = (size_t) TC_HG * 512 * 2 + (size_t) TC_CH * 512 *
+ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                               const int* __restrict__ cells_all,
+                                                               const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+-                                                              float scale, float* __restrict__ ctx, bool q8) {
++                                                              float scale, float* __restrict__ ctx, int q8) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+     // Pascal (sm_6x): no tensor cores - never picked there (it needs sm_75's fragment layout)
+ #else
+@@ -1331,7 +1356,8 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
+             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
+             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
+             pre[k] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+-                     : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
++                     : q8 == 2 ? lat4_h8(lat4_rec(lat, KV, cell), KV, c8)
++                                : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                           : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+         }
+     };
+@@ -1478,7 +1504,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
+                                                            const uint16_t* __restrict__ lat,
+                                                            const int* __restrict__ cells_all,
+                                                            const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+-                                                           float scale, float* __restrict__ ctx, bool q8) {
++                                                           float scale, float* __restrict__ ctx, int q8) {
+     extern __shared__ __align__(16) unsigned char mt_sm[];
+     __half* sQ = (__half*) mt_sm;                 // MT_H x MT_LD
+     __half* sL = sQ + MT_H * MT_LD;               // MT_C x MT_LD
+@@ -1528,7 +1554,9 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
+             const int cell = s_cell[r];
+             uint4 v = make_uint4(0u, 0u, 0u, 0u);
+             if (cell >= 0)
+-                v = q8 ? lat8_h8(lat8_rec(lat, MT_KV, cell), MT_KV, c8) : ((const uint4*) (lat + (size_t) MT_KV * cell))[c8];
++                v = q8 == 2 ? lat4_h8(lat4_rec(lat, MT_KV, cell), MT_KV, c8)
++                    : q8 ? lat8_h8(lat8_rec(lat, MT_KV, cell), MT_KV, c8)
++                    : ((const uint4*) (lat + (size_t) MT_KV * cell))[c8];
+             *(uint4*) (sL + r * MT_LD + 8 * c8) = v;
+         }
+         __syncthreads();
+@@ -1638,7 +1666,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
+                                                             const uint16_t* __restrict__ lat,
+                                                             const int* __restrict__ cells_all,
+                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
+-                                                            int n_head, float scale, float* __restrict__ ctx, bool q8) {
++                                                            int n_head, float scale, float* __restrict__ ctx, int q8) {
+ #if !STRATA_ROCWMMA
+     __builtin_trap();   // (a device pass without rocWMMA: never launched there)
+ #else
+@@ -1671,7 +1699,8 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
+             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
+             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
+             pre[k] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+-                     : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
++                     : q8 == 2 ? lat4_h8(lat4_rec(lat, KV, cell), KV, c8)
++                                : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                           : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+         }
+     };
+@@ -1781,7 +1810,7 @@ __device__ __forceinline__ int mla2_wmma_row(int i, int hi) {
+ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
+         const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+         const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
+-        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
++        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, int q8) {
+     __shared__ __align__(16) _Float16 sl[16][512];
+     __shared__ __align__(16) _Float16 ph[16][16], pl[16][16];
+     __shared__ float scores[8][16][16], qi[8][16];
+@@ -1816,7 +1845,8 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
+         for (int i = tid; i < 16 * 512 / 8; i += 256) {
+             const int r = i / 64, col = (i % 64) * 8, cell = cells[r];
+             *(uint4*)(&sl[r][col]) = cell < 0 ? make_uint4(0, 0, 0, 0)
+-                : q8 ? lat8_h8(lat8_rec(lat, 512, cell), 512, col / 8)
++                : q8 == 2 ? lat4_h8(lat4_rec(lat, 512, cell), 512, col / 8)
++                     : q8 ? lat8_h8(lat8_rec(lat, 512, cell), 512, col / 8)
+                      : *(const uint4*)(lat + (size_t)cell * 512 + col);
+         }
+         __syncthreads();
+@@ -2420,7 +2450,7 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
+ }
+ 
+ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+-                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
++                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, int lat_q8) {
+ #if defined(STRATA_USE_HIP)
+     (void) q_abs, (void) lat, (void) cells, (void) n_sel, (void) n_head, (void) kv_lora, (void) scale, (void) ctx;
+     (void) part, (void) part_cap, (void) s, (void) lat_q8;
+@@ -2470,8 +2500,11 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
+ }
+ 
+ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
+-              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
++              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8) {
+     if (T <= 0) return;
++    if (lat_q8 == 2)   // the latents are stored rotated (glm_lat4.cuh): rotate the absorbed queries the same way,
++                       // in place - the buffer is layer scratch from the q_abs GEMV/GEMM and consumed only here
++        fwht512_rows_cuda((float*) q_abs, (int64_t) n_head * 512, n_head, T, s);
+     if (kv_lora != 512 || n_head % MB_HG != 0) {
+         std::fprintf(stderr, "glm_batch mla_attn: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+         return;
+@@ -2561,44 +2594,26 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
+         else
+             mla_attn_tc_kernel<<<grid, 256, kTcSmem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+         check("mla_attn_tc");
+-        if (check_tc) {
+-            const size_t n = (size_t) T * n_head * 512;
+-            float* ref = nullptr;
+-            if (cudaMalloc(&ref, n * sizeof(float)) == cudaSuccess) {
+-                mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ref, lat_q8);
+-                std::vector<float> A(n), B(n);
+-                cudaStreamSynchronize(s);
+-                cudaMemcpy(A.data(), ctx, n * sizeof(float), cudaMemcpyDeviceToHost);
+-                cudaMemcpy(B.data(), ref, n * sizeof(float), cudaMemcpyDeviceToHost);
+-                cudaFree(ref);
+-                double num = 0, den = 0, worst = 0;
+-                for (size_t r = 0; r < (size_t) T * n_head; ++r) {
+-                    double rn = 0, rd = 0;
+-                    for (int j = 0; j < 512; ++j) {
+-                        const double d = (double) A[r * 512 + j] - B[r * 512 + j];
+-                        rn += d * d;
+-                        rd += (double) B[r * 512 + j] * B[r * 512 + j];
+-                    }
+-                    num += rn;
+-                    den += rd;
+-                    worst = std::max(worst, std::sqrt(rn / std::max(1e-30, rd)));
+-                }
+-                std::fprintf(stderr, "glm_batch attention check: %d tokens, rel L2 %.3e, worst head %.3e\n", T,
+-                             std::sqrt(num / std::max(1e-30, den)), worst);
+-            }
+-            cudaGetLastError();
+-        }
++        if (lat_q8 == 2)   // the context mix of rotated latents: rotate it back (H, self-inverse) before the
++                           // wv_b projection reads it (glm_prefill's GEMM, not mla_out)
++            fwht512_rows_cuda(ctx, (int64_t) n_head * 512, n_head, T, s);
+         return;
+     }
+ #endif
+     mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+     check("mla_attn");
++    if (lat_q8 == 2) fwht512_rows_cuda(ctx, (int64_t) n_head * 512, n_head, T, s);
+ }
+ 
+ #if defined(STRATA_USE_HIP)
+ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+-                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
++                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8) {
+     if (T <= 0) return;
++    if (lat_q8 == 2) {   // (the f16q kernel's queries are FP16 - no rotation kernel for that layout; the model
++                         // load refuses q4_0 on HIP builds, so this is unreachable there)
++        std::fprintf(stderr, "glm_batch mla_attn_f16q: q4_0 latents are not supported on the f16q path\n");
++        return;
++    }
+     if (kv_lora != 512 || n_head % HW_HG != 0) {
+         std::fprintf(stderr, "glm_batch mla_attn_f16q: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+         return;
+@@ -2614,8 +2629,10 @@ bool mla_wmma2_supported() { const int a = mla_wmma2_arch(); return a == 1 || a
+ bool mla_wmma2_default() { const int a = mla_wmma2_arch(); return a == 1 || a == 4; }
+ 
+ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+-                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
++                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8) {
+     if (T <= 0) return;
++    if (lat_q8 == 2)   // the latents are stored rotated: rotate the absorbed queries the same way (in place)
++        fwht512_rows_cuda((float*) q_abs, (int64_t) n_head * 512, n_head, T, s);
+     if (kv_lora != 512 || n_head % 16 != 0) {
+         std::fprintf(stderr, "glm_batch mla_attn_wmma2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+         return;
+@@ -2623,6 +2640,8 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
+     const dim3 grid((unsigned) T, (unsigned) (n_head / 16));
+     mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+     check("mla_attn_wmma2");
++    if (lat_q8 == 2)   // the context mix of rotated latents: rotate it back before the wv_b projection reads it
++        fwht512_rows_cuda(ctx, (int64_t) n_head * 512, n_head, T, s);
+ }
+ #endif
+ 
+diff --git a/src/kernels/cuda/glm_fast.cu b/src/kernels/cuda/glm_fast.cu
+index c3cbcdd..15a439d 100644
+--- a/src/kernels/cuda/glm_fast.cu
++++ b/src/kernels/cuda/glm_fast.cu
+@@ -7,6 +7,8 @@
+ // glm_pack_test pins on the real model.
+ #include "strata/kernels/glm_fast.hpp"
+ #include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
++#include "glm_lat4.cuh"                    // the stage-B q4_0 records (GLM_KV_Q4_STAGE_B)
++#include "strata/kernels/kv_q4.hpp"       // fwht512_rows_cuda (the rotation of q_abs / ctx)
+ #include "strata/kernels/exl3.hpp"
+ #if defined(STRATA_USE_HIP)
+ #include "strata/kernels/glm_expert_bench.hpp"
+@@ -2872,10 +2874,12 @@ __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__f
+ __device__ __forceinline__ float lat8_f(const uint8_t* rec, int kv_lora, int c) {
+     return (float) ((const int8_t*) rec)[c] * __half2float(((const __half*) (rec + kv_lora))[c >> 5]);
+ }
+-// latent value c of cell: FP16 rows or INT8 records
+-__device__ __forceinline__ float lat_any(const uint16_t* lat, bool q8, int kv_lora, int cell, int c) {
+-    return q8 ? lat8_f((const uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * cell, kv_lora, c)
+-              : lat_f(lat[(size_t) kv_lora * cell + c]);
++// latent value c of cell: FP16 rows, INT8 records (q8 1) or q4_0 records (q8 2, the ROTATED row - the scores
++// still work because the absorbed q_abs is rotated the same way, <Hq, Hk> = <q, k>; glm_lat4.cuh)
++__device__ __forceinline__ float lat_any(const uint16_t* lat, int q8, int kv_lora, int cell, int c) {
++    return q8 == 2 ? lat4_f(lat4_rec(lat, kv_lora, cell), kv_lora, c)
++                   : q8 ? lat8_f((const uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * cell, kv_lora, c)
++                        : lat_f(lat[(size_t) kv_lora * cell + c]);
+ }
+ // one latent row into its INT8 record: lane l of the warp holding values [32 w, 32 w + 32) stores value c
+ __device__ __forceinline__ void lat8_store_warp(float y, uint8_t* rec, int kv_lora, int c, int lane) {
+@@ -2889,8 +2893,10 @@ __device__ __forceinline__ void lat8_store_warp(float y, uint8_t* rec, int kv_lo
+     if (lane == 0) ((__half*) (rec + kv_lora))[c >> 5] = d16;
+ }
+ // value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+-__device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, bool q8, int kv_lora, int c) {
+-    if (q8)
++__device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, int q8, int kv_lora, int c) {
++    if (q8 == 2)   // the row arrives ROTATED (the kernel's butterfly below); one warp = one 32-value block
++        lat4_store_warp(y, (uint8_t*) lat4_rec(lat, kv_lora, (int) row), kv_lora, c, c & 31);
++    else if (q8)
+         lat8_store_warp(y, (uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * row, kv_lora, c, c & 31);
+     else
+         lat[(size_t) kv_lora * row + c] = lat_h(y);
+@@ -2924,7 +2930,23 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
+         const float ss = block_sum(v * v, sred);
+         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
+         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
+-            const float y = v * inv * a.kv_norm[tid];
++            float y = v * inv * a.kv_norm[tid];
++            if (a.lat_q8 == 2 && a.kv_lora == 512) {   // the q4_0 records hold the ROTATED row: H512 in shared
++                                                       // memory (two H256 halves, orthonormal at 1/16 a half;
++                                                       // glm_lat4.cuh).  kv_lora == 512 is the load-time gate -
++                                                       // the butterfly's shape, refused loudly otherwise.
++                __shared__ float s_rot[512];
++                s_rot[tid] = y;
++                __syncthreads();
++#pragma unroll
++                for (int st = 0, stride = 1; st < 8; ++st, stride <<= 1) {
++                    const float x = s_rot[tid], b = s_rot[tid ^ stride];
++                    __syncthreads();   // every read before any write
++                    s_rot[tid] = (tid & stride) ? b - x : x + b;
++                    __syncthreads();
++                }
++                y = s_rot[tid] * (1.0f / 16.0f);
++            }
+             if (a.lat != nullptr) lat_put(a.lat, a.p, y, a.lat_q8, a.kv_lora, tid);
+             if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                 lat_put(a.lat_host, a.p, y, a.lat_q8, a.kv_lora, tid);
+@@ -3092,7 +3114,7 @@ __device__ __forceinline__ void dsa_select_block(const float* __restrict__ score
+ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wk_b,
+                                                   const uint16_t* __restrict__ wv_b, const uint16_t* __restrict__ lat,
+                                                   const int* __restrict__ cells, int n_sel, int qk_nope, int kv_lora,
+-                                                  int v_head, block_q8_1* __restrict__ out, bool q8) {
++                                                  int v_head, block_q8_1* __restrict__ out, int q8) {
+     extern __shared__ float smem[];
+     float* s_q = smem;                    // qk_nope
+     float* s_qa = s_q + qk_nope;          // kv_lora
+@@ -3112,6 +3134,25 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
+         if (lane == 0) s_qa[c] = acc;
+     }
+     __syncthreads();
++    if (q8 == 2 && kv_lora == 512) {   // the stored latents are ROTATED (glm_lat4.cuh): rotate the absorbed
++                                       // queries the same way, in shared memory (two H256 halves, 1/16 a half)
++#pragma unroll
++        for (int st = 0, stride = 1; st < 8; ++st, stride <<= 1) {
++            const float a0 = s_qa[tid], b0 = s_qa[tid ^ stride];
++            const float a1 = s_qa[tid + 256], b1 = s_qa[(tid + 256) ^ stride];
++            __syncthreads();   // every read before any write
++            if (tid & stride) {
++                s_qa[tid] = b0 - a0;
++                s_qa[tid + 256] = b1 - a1;
++            } else {
++                s_qa[tid] = a0 + b0;
++                s_qa[tid + 256] = a1 + b1;
++            }
++            __syncthreads();
++        }
++        for (int i = tid; i < kv_lora; i += blockDim.x) s_qa[i] *= 1.0f / 16.0f;
++        __syncthreads();
++    }
+     const float scale = rsqrtf((float) qk_nope);
+     for (int s = warp; s < n_sel; s += nw) {
+         const int cell = cells[s];
+@@ -3231,7 +3272,7 @@ __global__ void __launch_bounds__(256) headwise_gemv_cols_kernel(const uint16_t*
+ 
+ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                        const int* __restrict__ cells, int n_sel, int qk_nope,
+-                                                       int kv_lora, float* __restrict__ ctx, bool q8) {
++                                                       int kv_lora, float* __restrict__ ctx, int q8) {
+     extern __shared__ float smem[];
+     float* s_qa = smem;               // kv_lora
+     float* s_p = s_qa + kv_lora;      // n_sel
+@@ -3283,7 +3324,7 @@ constexpr int MLA_CHUNK = 32;
+ constexpr int MLA_HPB = 16;
+ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
+-                                                        int kv_lora, float* __restrict__ part, bool q8) {
++                                                        int kv_lora, float* __restrict__ part, int q8) {
+     extern __shared__ float smem[];
+     uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
+     float* sS = smem + MLA_CHUNK * kv_lora / 2;        // MLA_HPB x MLA_CHUNK scores -> weights
+@@ -3297,7 +3338,9 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
+     for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
+         const int s = i / kv_lora, c = i - s * kv_lora;
+         const int cell = s_cell[s];
+-        sL[i] = cell < 0 ? (uint16_t) 0 : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
++        sL[i] = cell < 0 ? (uint16_t) 0
++                : q8 == 2 ? lat_h(lat4_f(lat4_rec(lat, kv_lora, cell), kv_lora, c))
++                : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
+     }
+     __syncthreads();
+     const float scale = rsqrtf((float) qk_nope);
+@@ -3372,7 +3415,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
+ template<int HPB, bool L, bool V>
+ __global__ void __launch_bounds__(256) mla_split2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                          const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
+-                                                         int kv_lora, float* __restrict__ part, bool q8) {
++                                                         int kv_lora, float* __restrict__ part, int q8) {
+     extern __shared__ float smem[];
+     uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
+     float* sS = smem + MLA_CHUNK * kv_lora / 2;        // HPB x MLA_CHUNK scores -> weights
+@@ -3394,7 +3437,9 @@ __global__ void __launch_bounds__(256) mla_split2_kernel(const float* __restrict
+         for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
+             const int r = i / kv_lora, c = i - r * kv_lora;
+             const int cell = s_cell[r];
+-            sL[i] = cell < 0 ? (uint16_t) 0 : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
++            sL[i] = cell < 0 ? (uint16_t) 0
++                : q8 == 2 ? lat_h(lat4_f(lat4_rec(lat, kv_lora, cell), kv_lora, c))
++                : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
+         }
+     }
+     __syncthreads();
+@@ -3509,7 +3554,7 @@ struct MlaToks {
+ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restrict__ q_abs, int64_t q_stride,
+                                                             const uint16_t* __restrict__ lat,
+                                                             const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
+-                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8) {
++                                                            int n_head, int qk_nope, float* __restrict__ part, int q8) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+     extern __shared__ uint4 smem4[];
+     uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
+@@ -3558,7 +3603,9 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
+         } else {
+             for (int i = tid; i < MLA_CHUNK * MLA_KV; i += 128) {
+                 const int s = i / MLA_KV, c = i - s * MLA_KV, cell = s_cell[s];
+-                sL[s * MLA_ROW + c] = cell < 0 ? (uint16_t) 0 : lat_h(lat_any(lat, true, MLA_KV, cell, c));
++                sL[s * MLA_ROW + c] = cell < 0 ? (uint16_t) 0
++                    : q8 == 2 ? lat_h(lat4_f(lat4_rec(lat, MLA_KV, cell), MLA_KV, c))
++                    : lat_h(lat_any(lat, true, MLA_KV, cell, c));
+             }
+         }
+         __syncthreads();
+@@ -6078,7 +6125,7 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
+ // the split attention of one token: q_abs (n_head x kv_lora) over its selected cells -> ctx; false when the split
+ // kernels are not available on this device (mla() then runs its one-kernel form)
+ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
+-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
++                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, int lat_q8, bool token = false);
+ 
+ #if defined(STRATA_USE_HIP)
+ namespace {
+@@ -6145,13 +6192,16 @@ void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_hea
+ }
+ 
+ bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
+-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
++                int kv_lora, float* ctx, cudaStream_t s, int lat_q8) {
+     if (kv_lora % 32 != 0 || getenv("STRATA_GLM_MLA1") != nullptr) return false;
+     return mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
+ }
+ 
+ void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
+-             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s) {
++             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s, int lat_q8) {
++    if (lat_q8 == 2)   // the context mix of ROTATED latents (glm_lat4.cuh): rotate it back (H, self-inverse)
++                       // in place before the wv_b projection reads it
++        fwht512_rows_cuda((float*) ctx, ctx_stride, n_head, ncol, s);
+     headwise_gemv_cols_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, ctx_stride, v_head, kv_lora, ncol, nullptr,
+                                                                    0, (block_q8_1*) out_q8_1,
+                                                                    out_stride_bytes / (int64_t) sizeof(block_q8_1));
+@@ -6200,12 +6250,17 @@ static bool mla_mma_on(int dev) {
+ 
+ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
+                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+-                      cudaStream_t s, bool lat_q8) {
++                      cudaStream_t s, int lat_q8, bool q_abs_rotated) {
+     int dev = 0;
+     cudaGetDevice(&dev);
+     if (dev >= 16 || kv_lora != MLA_KV || T < 1 || getenv("STRATA_GLM_MLA1") != nullptr ||
+         !mla_mma_on(dev))
+         return false;
++    if (lat_q8 == 2 && !q_abs_rotated) {   // the latents are stored rotated (glm_lat4.cuh): rotate the absorbed
++                                           // queries the same way, in place - the buffer is layer scratch
++                                           // produced by the q_abs GEMV/GEMM and consumed only here
++        fwht512_rows_cuda((float*) q_abs, q_stride ? q_stride : (int64_t) n_head * kv_lora, n_head, T, s);
++    }
+     int cap = 0;
+     float* part = mla_part(dev, n_head, kv_lora, MLA_NC, &cap);
+     if (part == nullptr) return false;
+@@ -6234,8 +6289,12 @@ bool mla_rows_ok(int kv_lora) {
+ 
+ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+-                     float* part, int part_tokens, cudaStream_t s, bool lat_q8) {
++                     float* part, int part_tokens, cudaStream_t s, int lat_q8) {
+     if (T < 1 || part == nullptr || part_tokens < 1 || !mla_rows_ok(kv_lora)) return false;
++    if (lat_q8 == 2) {   // the latents are stored rotated (glm_lat4.cuh): rotate the absorbed queries the same
++                         // way, in place - token i's q_abs sits at q_abs + i * q_stride (dense n_head rows within)
++        fwht512_rows_cuda((float*) q_abs, q_stride ? q_stride : (int64_t) n_head * kv_lora, n_head, T, s);
++    }
+     const int G = std::min(part_tokens, kMlaTokMax);
+     for (int t0 = 0; t0 < T; t0 += G) {
+         const int nt = std::min(G, T - t0);
+@@ -6255,11 +6314,16 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
+ }
+ 
+ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
+-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token) {
++                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, int lat_q8, bool token) {
+     int dev = 0;
+     cudaGetDevice(&dev);
+     if (dev >= 16) return false;
+-    if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8)) return true;
++    if (lat_q8 == 2) {   // the latents are stored rotated (glm_lat4.cuh): rotate the absorbed queries the same
++                         // way, in place - layer scratch consumed only by the kernels below (mla_attend_batch
++                         // is told it is already done)
++        fwht512_rows_cuda((float*) q_abs, (int64_t) n_head * kv_lora, n_head, 1, s);
++    }
++    if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8, true)) return true;
+     // Volta: the prompt's one-pass tensor-core kernel in cell splits (STRATA_GLM_MLA_V70=0: the F32 chunks below)
+     if (kv_lora == 512 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
+         int vcap = 0;
+@@ -6319,7 +6383,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
+ }
+ 
+ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
+-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8,
++         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, int lat_q8,
+          const MlaMarks* marks, bool token) {
+     const auto mark = [marks](const char* nm) {
+         if (marks) marks->fn(marks->ctx, nm);
+@@ -6353,6 +6417,9 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
+     // the split attention: chunks of MLA_CHUNK cells, partials per (chunk, head), then the merge (mla_split_attend)
+     mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8, token);
+     mark("mla_attend");
++    if (lat_q8 == 2)   // the context mix of ROTATED latents (glm_lat4.cuh): rotate it back (H, self-inverse)
++                       // before the wv_b projection reads it (dense scratch: n_head rows)
++        fwht512_rows_cuda(ctx, (int64_t) n_head * kv_lora, n_head, 1, s);
+     headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
+                                                               (block_q8_1*) out_q8_1);
+     launch_check("mla2");
+diff --git a/src/kernels/cuda/glm_lat4.cuh b/src/kernels/cuda/glm_lat4.cuh
+index 2509ef2..ddbbf8b 100644
+--- a/src/kernels/cuda/glm_lat4.cuh
++++ b/src/kernels/cuda/glm_lat4.cuh
+@@ -22,7 +22,10 @@
+ 
+ #include <cstdint>
+ 
+-namespace strata::kernels::glmf {
++// in namespace strata::kernels (NOT glmf/glmb): the kernels live in strata::kernels::glmf (glm_fast.cu) and
++// strata::kernels::glmb (glm_batch.cu), and unqualified lookup walks the parent namespace, so both see these
++// without a using-directive.
++namespace strata::kernels {
+ 
+ __device__ __forceinline__ const uint8_t* lat4_rec(const uint16_t* lat, int kv, int cell) {
+     return (const uint8_t*) lat + (size_t) (kv / 2 + kv / 32) * cell;
+@@ -113,4 +116,4 @@ __device__ __forceinline__ void lat4_store_warp(float y, uint8_t* rec, int kv_lo
+     if (lane < 16) rec[blk * 18 + 2 + lane] = byte;
+ }
+ 
+-}  // namespace strata::kernels::glmf
++}  // namespace strata::kernels
+diff --git a/src/kernels/cuda/kv_q4.cu b/src/kernels/cuda/kv_q4.cu
+index b7de61f..3039e55 100644
+--- a/src/kernels/cuda/kv_q4.cu
++++ b/src/kernels/cuda/kv_q4.cu
+@@ -190,6 +190,43 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
+     check("fwht256 launch");
+ }
+ 
++// stage B (GLM_KV_Q4_STAGE_B): the 512-point rotation, one block a row of 512 (two 256 halves - a stage's
++// partners stay within the half: stride <= 128 never crosses bit 8), 256 threads 2 elements each.  The scale is
++// 1/16 a half (orthonormal: <H512 x, H512 y> == <x, y>, glm_lat4_test asserts it).
++__global__ void fwht512_rows_kernel(float* __restrict__ base, int64_t col_stride, int rows_per_col, int n_rows) {
++    __shared__ float s[512];
++    const int tid = threadIdx.x;
++    const int row = blockIdx.x;
++    if (row >= n_rows) return;
++    float* p = base + (int64_t) (row / rows_per_col) * col_stride + (row % rows_per_col) * 512;
++    s[tid] = p[tid];
++    s[tid + 256] = p[tid + 256];
++    __syncthreads();
++#pragma unroll
++    for (int st = 0, stride = 1; st < 8; ++st, stride <<= 1) {
++        const float a0 = s[tid], b0 = s[tid ^ stride];
++        const float a1 = s[tid + 256], b1 = s[(tid + 256) ^ stride];
++        __syncthreads();   // every read before any write
++        if (tid & stride) {
++            s[tid] = b0 - a0;
++            s[tid + 256] = b1 - a1;
++        } else {
++            s[tid] = a0 + b0;
++            s[tid + 256] = a1 + b1;
++        }
++        __syncthreads();
++    }
++    p[tid] = s[tid] * (1.0f / 16.0f);
++    p[tid + 256] = s[tid + 256] * (1.0f / 16.0f);
++}
++
++void fwht512_rows_cuda(float* base, int64_t col_stride, int rows_per_col, int n_cols, void* stream) {
++    const int n_rows = n_cols * rows_per_col;
++    if (n_rows <= 0) return;
++    fwht512_rows_kernel<<<n_rows, 256, 0, (cudaStream_t) stream>>>(base, col_stride, rows_per_col, n_rows);
++    check("fwht512_rows launch");
++}
++
+ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                        const KvHostPools* host) {
+diff --git a/tests/glm_lat4_test.cu b/tests/glm_lat4_test.cu
+new file mode 100644
+index 0000000..3c86b3a
+--- /dev/null
++++ b/tests/glm_lat4_test.cu
+@@ -0,0 +1,176 @@
++// tests/glm_lat4_test.cu - the q4_0 latent records of stage B (GLM_KV_Q4_STAGE_B; src/kernels/cuda/glm_lat4.cuh):
++//  1. the rotation is ORTHONORMAL: <H512 x, H512 y> == <x, y> to 1e-6 on random vectors (fwht512_rows_cuda against
++//     a host FWHT reference).  An unscaled transform multiplies every score by 256^k and shifts the logits
++//     systematically - which reads as a precision problem, not a bug, and would be blamed on q4_0 forever.
++//  2. H is its own inverse: H(H x) == x to 1e-4 (the context mix is rotated back with the same kernel).
++//  3. the records round-trip: lat4_store_warp -> lat4_f == (q - 8) * d bit for bit, and the vectorized decodes
++//     lat4_h4 / lat4_h8 agree with lat4_f element for element (needs a GPU).
++#include "../src/kernels/cuda/glm_lat4.cuh"
++#include "strata/kernels/glm_lat_types.hpp"   // lat4_rec_bytes
++#include "strata/kernels/kv_q4.hpp"
++
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <random>
++#include <vector>
++
++using namespace strata::kernels;
++
++namespace {
++
++constexpr int KV = 512;
++constexpr int REC = lat4_rec_bytes(KV);   // 288 at kv_lora 512
++
++// 16 warps store one row: warp w writes block w (lane t stores element 32 w + t), glm_lat4.cuh's contract
++__global__ void store_kernel(uint8_t* rec, const float* row, int kv) {
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    if (32 * warp + lane < kv) lat4_store_warp(row[32 * warp + lane], rec, kv, 32 * warp + lane, lane);
++}
++
++// the host reference: unnormalized FWHT within each 256 half, then 1/16 a half (orthonormal H512)
++void fwht512_host(const float* in, float* out) {
++    std::vector<float> t(in, in + KV);
++    for (int half = 0; half < 2; ++half) {
++        float* h = t.data() + half * 256;
++        for (int stride = 1; stride < 256; stride <<= 1)
++            for (int i = 0; i < 256; i += 2 * stride)
++                for (int j = 0; j < stride; ++j) {
++                    const float a = h[i + j], b = h[i + j + stride];
++                    h[i + j] = a + b;
++                    h[i + j + stride] = a - b;
++                }
++        for (int j = 0; j < 256; ++j) h[j] *= 1.0f / 16.0f;
++    }
++    for (int i = 0; i < KV; ++i) out[i] = t[i];
++}
++
++double dot(const std::vector<float>& a, const std::vector<float>& b) {
++    double s = 0.0;
++    for (int i = 0; i < KV; ++i) s += (double) a[i] * b[i];
++    return s;
++}
++
++}  // namespace
++
++int main() {
++    int dev = 0;
++    cudaGetDevice(&dev);
++    if (dev < 0) {
++        std::fprintf(stderr, "glm_lat4_test: no GPU\n");
++        return 2;
++    }
++    std::mt19937 rng(1234);
++    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
++    int bad = 0;
++
++    // 1 + 2: orthonormality and self-inverse, 64 random rows through fwht512_rows_cuda (dense rows)
++    const int n_rows = 64;
++    std::vector<float> x((size_t) n_rows * KV);
++    for (float& v : x) v = uni(rng);
++    float* dx = nullptr;
++    cudaMalloc(&dx, x.size() * sizeof(float));
++    cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
++    fwht512_rows_cuda(dx, (int64_t) KV, 1, n_rows, nullptr);       // H x (dense: col_stride KV, rows_per_col 1)
++    std::vector<float> hx((size_t) n_rows * KV);
++    cudaMemcpy(hx.data(), dx, hx.size() * sizeof(float), cudaMemcpyDeviceToHost);
++    fwht512_rows_cuda(dx, (int64_t) KV, 1, n_rows, nullptr);       // H(H x), in place on the rotated rows
++    std::vector<float> hh((size_t) n_rows * KV);
++    cudaMemcpy(hh.data(), dx, hh.size() * sizeof(float), cudaMemcpyDeviceToHost);
++    cudaFree(dx);
++    for (int r = 0; r < n_rows; ++r) {
++        const float* xr = x.data() + (size_t) r * KV;
++        const float* hxr = hx.data() + (size_t) r * KV;
++        std::vector<float> ref(KV), y(KV), hy(KV);
++        fwht512_host(xr, ref.data());
++        double worst = 0.0;
++        for (int i = 0; i < KV; ++i) worst = std::max(worst, (double) std::fabs(ref[i] - hxr[i]));
++        if (worst > 1e-4) {
++            std::fprintf(stderr, "glm_lat4_test: row %d: fwht512_rows_cuda != the host FWHT reference (worst %.3e)\n",
++                         r, worst);
++            ++bad;
++        }
++        const float* hhr = hh.data() + (size_t) r * KV;
++        double self = 0.0;
++        for (int i = 0; i < KV; ++i) self = std::max(self, (double) std::fabs(hhr[i] - xr[i]));
++        if (self > 1e-4) {
++            std::fprintf(stderr, "glm_lat4_test: row %d: H is not its own inverse (worst %.3e)\n", r, self);
++            ++bad;
++        }
++        for (float& v : y) v = uni(rng);
++        fwht512_host(y.data(), hy.data());
++        const double want = dot(xr, y.data());                    // <x, y>
++        const double got = dot(hxr, hy.data());                    // <H x, H y>
++        if (std::fabs(got - want) > 1e-6) {
++            std::fprintf(stderr, "glm_lat4_test: row %d: <Hx, Hy> != <x, y> (%.6f vs %.6f)\n", r, want, got);
++            ++bad;
++        }
++    }
++
++    // 3: the record round-trip - a warp stores, the decode helpers read back (q - 8) * d bit for bit
++    {
++        std::vector<float> row(KV);
++        for (float& v : row) v = uni(rng) * 8.0f;
++        uint8_t* drec = nullptr;
++        cudaMalloc(&drec, REC);
++        cudaMemset(drec, 0, REC);
++        store_kernel<<<1, 512>>>(drec, row.data(), KV);
++        cudaDeviceSynchronize();
++        std::vector<uint8_t> rec(REC);
++        cudaMemcpy(rec.data(), drec, REC, cudaMemcpyDeviceToHost);
++        cudaFree(drec);
++        for (int c = 0; c < KV; ++c) {
++            const int blk = c >> 5, t = c & 31;
++            const float d = __half2float(((const __half*) rec.data())[blk * 9]);
++            const uint8_t b = rec[blk * 18 + 2 + t / 2];
++            const int q = t < 16 ? (b & 0xF) : (b >> 4);
++            const float want = (float) (q - 8) * d;
++            const float got = lat4_f(rec.data(), KV, c);
++            if (got != want) {
++                std::fprintf(stderr, "glm_lat4_test: lat4_f(%d) = %g, want %g\n", c, got, want);
++                ++bad;
++            }
++            if (std::fabs(got - row[c]) > std::fabs(d) + 1e-3f) {   // one quantization step at most
++                std::fprintf(stderr, "glm_lat4_test: lat4_f(%d) = %g is not row %g within a step (d %g)\n", c, got,
++                             row[c], d);
++                ++bad;
++            }
++        }
++        // the vectorized reads agree with lat4_f element for element
++        for (int c8 = 0; c8 < KV / 8; ++c8) {
++            const uint4 v = lat4_h8(rec.data(), KV, c8);
++            const __half* h = (const __half*) &v;
++            for (int k = 0; k < 8; ++k) {
++                const float want = lat4_f(rec.data(), KV, 8 * c8 + k);
++                if (__half2float(h[k]) != want) {
++                    std::fprintf(stderr, "glm_lat4_test: lat4_h8(%d,%d) = %g, want %g\n", c8, k,
++                                 __half2float(h[k]), want);
++                    ++bad;
++                }
++            }
++        }
++        for (int c4 = 0; c4 < KV / 4; ++c4) {
++            const uint2 v = lat4_h4(rec.data(), KV, c4);
++            const __half* h = (const __half*) &v;
++            for (int k = 0; k < 4; ++k) {
++                const float want = lat4_f(rec.data(), KV, 4 * c4 + k);
++                if (__half2float(h[k]) != want) {
++                    std::fprintf(stderr, "glm_lat4_test: lat4_h4(%d,%d) = %g, want %g\n", c4, k,
++                                 __half2float(h[k]), want);
++                    ++bad;
++                }
++            }
++        }
++    }
++
++    if (bad == 0) {
++        std::printf("glm_lat4_test: OK - orthonormal H512 (<Hx,Hy> == <x,y> to 1e-6), self-inverse, "
++                    "records round-trip\n");
++        return 0;
++    }
++    std::fprintf(stderr, "glm_lat4_test: %d failures\n", bad);
++    return 1;
++}

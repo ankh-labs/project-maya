@@ -1,0 +1,124 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 657fde2..17db4c0 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1343,7 +1343,33 @@ static int glm_pack_generate(const Options& o) {
+         id << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context
+            << " kv=" << model.kv_name();
+         std::error_code ec;
+-        for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
++        // the pack by CONTENT, not sizes: index.txt fully describes the tensor layout (two packs of the
++        // same file sizes can differ), and dense.bin's size+mtime catches a repack the index misses.  This
++        // is the field that refuses a bad repack - the one that cost a night.
++        const auto fnv_file = [](const fs::path& p) -> uint64_t {
++            std::ifstream f(p, std::ios::binary);
++            uint64_t h = 1469598103934665603ull;
++            if (!f) return h;
++            char b[4096];
++            while (f) {
++                f.read(b, sizeof b);
++                const std::streamsize n = f.gcount();
++                for (std::streamsize i = 0; i < n; ++i) {
++                    h ^= (unsigned char) b[i];
++                    h *= 1099511628211ull;
++                }
++                if (n < (std::streamsize) sizeof b) break;
++            }
++            return h;
++        };
++        id << " index.txt:" << fnv_file(fs::path(o.glm_pack) / "index.txt");
++        const auto bin_stamp = [](const fs::path& p) -> uint64_t {
++            std::error_code e2;
++            const auto t = fs::last_write_time(p, e2);
++            return e2 ? 0 : (uint64_t) t.time_since_epoch().count() ^ ((uint64_t) fs::file_size(p, e2) << 32);
++        };
++        id << " dense.bin:" << bin_stamp(fs::path(o.glm_pack) / "dense.bin");
++        for (const char* f : {"native_experts.txt"})
+             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
+         std::vector<std::string> shards;
+         for (const auto& de : fs::directory_iterator(fs::path(o.glm_pack).parent_path(), ec))
+@@ -1353,7 +1379,7 @@ static int glm_pack_generate(const Options& o) {
+         for (const auto& s : shards) id << " " << s;
+         return id.str();
+     }();
+-    constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
++    constexpr uint64_t kMetaMagic = 0x3253534559414d47ull;   // "GMAYESS2" (2: the .bin's size+mtime recorded)
+     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
+     // FNV-1a 64 over a whole file, streamed. A .meta's byte count alone cannot tell a torn or rot-corrupted .bin
+     // from a whole one, and a wrong state restored here is silently corrupting rather than loudly broken.
+@@ -1383,6 +1409,16 @@ static int glm_pack_generate(const Options& o) {
+             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
+             const uint64_t sum = file_sum(path.substr(0, path.size() - 5) + ".bin");
+             f.write((const char*) &sum, 8);
++            {   // the .bin's size and mtime at write: a restore short-circuits the whole-file hash when both
++                // still match (a torn write changes the size, an edit the mtime); the startup index hashes
++                // fully either way, so rot is caught there and a mismatched stamp falls back to the hash
++                const std::string bin = path.substr(0, path.size() - 5) + ".bin";
++                std::error_code e2;
++                const uint64_t bsz = fs::file_size(bin, e2);
++                const uint64_t bmt = e2 ? 0 : (uint64_t) fs::last_write_time(bin, e2).time_since_epoch().count();
++                f.write((const char*) &bsz, 8);
++                f.write((const char*) &bmt, 8);
++            }
+             f.write((const char*) &kMetaMagic, 8);
+             f.flush();
+             if (!f) return false;
+@@ -1391,8 +1427,11 @@ static int glm_pack_generate(const Options& o) {
+         fs::rename(tmp, path, ec);
+         return !ec;
+     };
+-    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
+-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
++    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's).
++    // full_hash: the whole .bin checksummed (the startup index); false short-circuits it at restore when the
++    // recorded size+mtime still match - a touched file falls back to the hash, never skips it.
++    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
++                               bool full_hash) -> bool {
+         std::ifstream f(path, std::ios::binary);
+         uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
+         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
+@@ -1401,13 +1440,21 @@ static int glm_pack_generate(const Options& o) {
+         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
+         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
+         toks.resize(nt);
+-        uint64_t sum = 0;
++        uint64_t sum = 0, bsz = 0, bmt = 0;
+         if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &sum, 8) ||
+-            !f.read((char*) &m1, 8) || m1 != kMetaMagic)
++            !f.read((char*) &bsz, 8) || !f.read((char*) &bmt, 8) || !f.read((char*) &m1, 8) || m1 != kMetaMagic)
+             return false;
+-        // the .bin must still be the bytes this .meta describes - verified here so a torn or rotted file is
+-        // refused at indexing and again at restore rather than applied
+-        return sum == file_sum(path.substr(0, path.size() - 5) + ".bin");
++        // the .bin must still be the bytes this .meta describes - refused at indexing and again at restore
++        // rather than applied.  At restore (full_hash false) a matching size+mtime skips the whole-file hash:
++        // a torn write changes the size and an edit the mtime, so a mismatch falls back to the hash.
++        const std::string bin = path.substr(0, path.size() - 5) + ".bin";
++        if (!full_hash) {
++            std::error_code e2;
++            const uint64_t now_sz = fs::exists(bin, e2) ? (uint64_t) fs::file_size(bin, e2) : 0;
++            const uint64_t now_mt = e2 ? 0 : (uint64_t) fs::last_write_time(bin, e2).time_since_epoch().count();
++            if (bsz > 0 && bmt != 0 && now_sz == bsz && now_mt == bmt) return true;
++        }
++        return sum == file_sum(bin);
+     };
+     const auto slot_age_days = [](const std::string& p) {
+         std::error_code ec;
+@@ -1455,7 +1502,7 @@ static int glm_pack_generate(const Options& o) {
+             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
+             Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
+             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
+-            if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
++            if (meta_read(p, fd.toks, fd.bytes, true) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+                 found.push_back(std::move(fd));
+             } else {
+                 ++refused;
+@@ -1607,7 +1654,7 @@ static int glm_pack_generate(const Options& o) {
+         if (!slots[best].data) {
+             std::vector<int32_t> vt;
+             uint64_t vb = 0;
+-            if (!meta_read(meta_of(slots[best].path), vt, vb)) {
++            if (!meta_read(meta_of(slots[best].path), vt, vb, false)) {
+                 note("refused " + slots[best].path + " at restore (identity or checksum failed) - reading its prompt again");
+                 slot_drop(best);
+                 snap_tokens.clear();

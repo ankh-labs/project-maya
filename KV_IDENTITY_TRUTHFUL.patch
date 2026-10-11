@@ -1,0 +1,51 @@
+diff --git a/include/strata/core/glm_model.hpp b/include/strata/core/glm_model.hpp
+index 41f65d2..03a3e0f 100644
+--- a/include/strata/core/glm_model.hpp
++++ b/include/strata/core/glm_model.hpp
+@@ -673,6 +673,10 @@ public:
+     int mtp_draft(int32_t next_tok, std::string& err);
+     bool has_mtp() const;
+     bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
++    // the latent cache's precision, as the slot identity and the INFO line name it ("fp16" or "int8"; the
++    // kv= field keys a slot's layout, so it must name what the state actually holds - a two-valued string
++    // here let a q4_0 slot pass identity as int8 once q4_0 exists)
++    const char* kv_name() const { return lat_q8_ ? "int8" : "fp16"; }
+     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
+     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
+     /// or when the context fits in that many anyway
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 3680750..657fde2 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1076,7 +1076,7 @@ static int glm_pack_generate(const Options& o) {
+         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
+                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
+                     "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
+-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
++                    (long long) o.max_context, model.kv_name(), (long long) model.kv_resident(),
+                     (long long) st.pool_slots,
+                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
+                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
+@@ -1341,7 +1341,7 @@ static int glm_pack_generate(const Options& o) {
+         // metadata says 8), ctx bounds n_pos and the latent rows, and the KV precision changes the latent layout.
+         // Expert-cache / slot sizing is deliberately NOT here - it changes placement, not the state's meaning.
+         id << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context
+-           << " kv=" << (model.kv_int8() ? "int8" : "fp16");
++           << " kv=" << model.kv_name();
+         std::error_code ec;
+         for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
+             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
+@@ -4620,6 +4620,13 @@ int main(int argc, char** argv) {
+     if (!o.glm_pack.empty()) {
+         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
+         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
++        // --kv q4_0 on the GLM path: refused until the q4_0 latent records exist - silently running fp16
++        // would put a slot on disk keyed kv=fp16 against a request that asked for q4_0 (loud, not silent)
++        if (o.kv == "q4_0") {
++            std::fprintf(stderr, "maya generate: --kv q4_0 - the GLM latent path has no q4_0 records yet "
++                                 "(fp16 or int8 only); refusing to start silently different\n");
++            return 2;
++        }
+         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
+         if (o.kv_resident < 0) {
+             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");

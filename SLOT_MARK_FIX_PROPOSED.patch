@@ -1,0 +1,56 @@
+# SLOT_MARK_FIX_PROPOSED.patch - make a grown conversation hit (stage-1 follow-up)
+# Against: homelab/v3q-support (5218aeb), src/program/generate.cpp only.
+#
+# THE MECHANISM (confirmed): snap_tokens is produced at the prompt's end
+# (generate.cpp:1956, snap_tokens.assign(prompt.begin(), prompt.end() - 1)) - the full
+# TEMPLATED prompt minus its last token, so it retains the trailing generation markers the
+# template appends. snapshot_save() takes the state at prompt-1, AFTER those markers. A
+# grown conversation inserts content BEFORE the markers, the markers shift, and the
+# exact-prefix match (snap_ok at :1755, slot_take at :1565) fails at that offset -> MISS.
+# The 1426-slot hitting a 1427 prompt was marker alignment, not prefix reuse: the cache was
+# a byte-identical retry cache.
+#
+# WHY TRIM-ONLY IS UNSAFE: the saved state consumed the markers; slot_load requires the
+# file's n to equal the restored length, and restoring at a shorter claimed position would
+# feed the wrong continuation. The trim must save the STATE at the trimmed position.
+#
+# THE FIX: Maya already snapshots marker-free states mid-read - at every checkpoint mark
+# (a user/observation boundary, ckpt_marks), the live state at pos_ = mark covers tokens
+# [0, mark) and excludes everything after it. So: at the LAST mark, snapshot_save() there,
+# snap_tokens = prompt[0, mark), slot_put(). The stored slot's tokens are then a true
+# prefix of any grown conversation, and the matching code needs NO change. Trade-off, stated:
+# the mark slot ends at the final turn's start, so the final turn's body is re-read on the
+# next turn. Full-body coverage needs a cut at the generation-header token (its id is
+# client-side; propose STRATA_GLM_SLOT_CUT_TOK, default off) - stage 4 material.
+#
+# Costs: snapshot_save() at the mark joins any pending ckpt_save_snapshot side copy
+# (ckpt_join inside snapshot_save) - serialization, acceptable; slot_put writes ~0.17 GB
+# mid-read (~0.3 s) at a call boundary, which is what marks are.
+# Hunk offsets approximate; git apply -C1 if context drifts.
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1885,7 +1885,19 @@
+                 if (pok) {
+                     at = end;
+                     if (end == seg_end && mi < marks.size()) {
+                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
+                         if (end == sys_end) slot_prefix(prompt, end);
++                        // (a) marker-free slot at the last turn boundary: the prompt-end snapshot
++                        // (prompt-1) carries the trailing generation markers, so a grown
++                        // conversation - content inserted before them - never matches it. The
++                        // state at a mark is marker-free: snapshot it and set it aside here, so
++                        // the next turn's prompt (which shares everything before its new
++                        // content) restores it as a prefix.
++                        if (slot_max > 0 && cur_img_pos.empty() && mi + 1 == marks.size() &&
++                            end > sys_end) {   // (== sys_end: slot_prefix saved it as a prefix slot)
++                            if (model.snapshot_save()) {
++                                snap_tokens.assign(prompt.begin(), prompt.begin() + (long) end);
++                                snap_img_hash = img_hash(end);
++                                snap_in_slot = false;
++                                slot_put(" (the last turn's start, marker-free)");
++                            }
++                        }
+                         ++mi;
+                         seg_start = end;
+                         seg_chunk = 0;
+                     }

@@ -1,0 +1,73 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ab2e3f1..7699e2f 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1491,6 +1491,7 @@ static int glm_pack_generate(const Options& o) {
+         double restore_ms = 0.0, saved_s = 0.0;
+     } pc;
+     double prefill_toks = 0.0;   // EWMA of the prompt path's tok/s (0.9/0.1)
++    fs::path prefill_ewma_path;   // stage 2B: the EWMA survives restarts (beside the slots; set with slot_dir)
+     if (slot_max > 0 && slot_ram)
+         note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
+     if (slot_max > 0 && !slot_ram) {
+@@ -1498,6 +1499,19 @@ static int glm_pack_generate(const Options& o) {
+                                                  : std::filesystem::path(o.glm_pack) / "slots";
+         std::error_code ec;
+         std::filesystem::create_directories(slot_dir, ec);
++        // stage 2B: a cache HIT means nothing prefilled, so the PP line never ran and the EWMA stayed 0 - the
++        // accounting reported saved~0 for a restore that avoided a real prefill.  The EWMA persists beside the
++        // slots, keyed by kv/k/ctx: a rate from another configuration is refused (re-seeded), never reused.
++        prefill_ewma_path = slot_dir / "prefill.ewma";
++        {
++            std::ifstream f(prefill_ewma_path);
++            double v = 0;
++            std::string kv_f, k_f, ctx_f;
++            if (f >> v >> kv_f >> k_f >> ctx_f && v > 0.0 && kv_f == "kv=" + o.kv &&
++                k_f == "k=" + std::to_string(model.geometry().n_exp_used) &&
++                ctx_f == "ctx=" + std::to_string(o.max_context))
++                prefill_toks = v;
++        }
+         struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; };
+         std::vector<Found> found;
+         size_t refused = 0;
+@@ -1704,11 +1718,17 @@ static int glm_pack_generate(const Options& o) {
+             pc.restore_ms += cms;
+             pc.saved_s += prefill_toks > 0.0 ? (double) len / prefill_toks : 0.0;
+             char a[224];
+-            std::snprintf(a, sizeof a,
+-                          "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~%.0f s (prefill EWMA %.0f tok/s)",
+-                          (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
+-                          (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms, pc.saved_s,
+-                          prefill_toks);
++            if (prefill_toks > 0.0)
++                std::snprintf(a, sizeof a,
++                              "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~%.0f s (prefill EWMA %.0f tok/s)",
++                              (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
++                              (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms, pc.saved_s,
++                              prefill_toks);
++            else   // stage 2B: zero only ever means zero MEASURED - unmeasured prints ~?, never ~0
++                std::snprintf(a, sizeof a,
++                              "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~? s (no prefill rate measured yet)",
++                              (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
++                              (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms);
+             note(a);
+         }
+         note(m);
+@@ -1954,6 +1974,17 @@ static int glm_pack_generate(const Options& o) {
+                 {   // the EWMA the cache's "saved" figure is computed from: the engine's own rate
+                     const double tps = (double) done / (ms / 1000.0 + 1e-9);
+                     prefill_toks = prefill_toks > 0.0 ? 0.9 * prefill_toks + 0.1 * tps : tps;
++                    // stage 2B: persist it (atomic tmp+rename, the slots' own discipline)
++                    if (!prefill_ewma_path.empty()) {
++                        std::error_code wec;
++                        const std::string tmp = prefill_ewma_path.string() + ".tmp";
++                        std::ofstream w(tmp, std::ios::binary | std::ios::trunc);
++                        w << prefill_toks << " kv=" << o.kv << " k=" << model.geometry().n_exp_used
++                          << " ctx=" << o.max_context << "\n";
++                        w.flush();
++                        if (!w) std::remove(tmp.c_str());
++                        else std::filesystem::rename(tmp, prefill_ewma_path, wec);
++                    }
+                 }
+                 std::fflush(stdout);
+             };
