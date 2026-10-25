@@ -510,6 +510,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(glm_pack_graph_test tests/glm_pack_graph_test.cpp)
     target_include_directories(glm_pack_graph_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_pack_graph_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    # Full-pack diagnostic: compare batched prefill with the token-at-a-time reference on one GPU.
+    add_executable(glm_prefill_probe tests/glm_prefill_probe.cpp)
+    target_include_directories(glm_prefill_probe PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_prefill_probe PRIVATE strata_engine ${_strata_gpu_runtime_target})
   endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
@@ -1268,9 +1272,11 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
     endif()
-    # The MMQ sources are a copy of the checkout's ggml-cuda in the build tree with third_party/ggml/mmq-fused-swiglu.patch
-    # applied (the experts' SwiGLU in the gate/up product's write-back, on the MoE path; the checkout
-    # stays untouched).  The copy is redone when the checkout, its mmq.cuh or the patch changes.  A checkout the patch
+    # The build-tree copy of ggml-cuda gets third_party/ggml/mmq-fused-swiglu.patch: fused expert SwiGLU and
+    # explicit IQ1_S/IQ2_S/IQ3_S register-byte extraction. NVCC 13.2 on Windows can miscompile local byte-pointer
+    # aliases into out-of-bounds codebook reads (covered by the independent CPU-dot regression).
+    # Padded destination IDs in partial expert tiles are also guarded before loading shared memory.
+    # The checkout stays untouched. The copy is redone when the checkout, its mmq.cuh or the patch changes. A checkout the patch
     # does not apply to builds from its own sources, and the prompt path keeps the separate SwiGLU kernel.
     set(_strata_mmq_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/mmq-fused-swiglu.patch)
     set(_strata_mmq_copy ${CMAKE_BINARY_DIR}/strata-ggml-cuda)
