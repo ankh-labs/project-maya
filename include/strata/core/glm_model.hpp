@@ -612,7 +612,7 @@ public:
     int ik_ring_ = 0;
     // the fast path's latent cache in INT8 records (--kv int8 / STRATA_GLM_KV_INT8=1; glm_fast.hpp lat8_rec_bytes):
     // 544 bytes a position and layer against FP16's 1024
-    bool lat_q8_ = false;
+    int lat_q8_ = 0;   // the records the fast path reads: 1 = INT8, 2 = q4_0 of the rotated row (stage B), 0 = FP16
     // KV streaming (--kv-resident N / STRATA_GLM_KV_RESIDENT; strata/kernels/glm_kv_stream.hpp): the fast path's DSA
     // layers keep their latent cache in pinned RAM and N positions of it in VRAM - state_ + dsa_lat_[il] is then the
     // layer's VRAM slots.  Null: every position in VRAM.  (glm_fast_state.hpp)
@@ -677,13 +677,13 @@ public:
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
-    bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
-    // stage A of the q4_0 records (GLM_KV_Q4_STAGE_A): lat_type_ is the REQUESTED type (--kv), named
-    // truthfully by kv_name(); lat_records_ is what the cache actually stores (q4_0 records INT8 until the
-    // stage-B kernel branch), and every byte derivation reads lat_rec_bytes of lat_records_ - the layout
-    // always matches what is stored.  Stage B flips lat_records_ to q4_0 with the kernels; the state
-    // signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A slots then, since glm_batch.cu
-    // changes with it.
+    bool kv_int8() const { return lat_q8_ != 0; }   // the latent cache in records (STRATA_GLM_KV_INT8=1 /
+                                                    // STRATA_GLM_KV_Q4=1: INT8 or q4_0)
+    // stage B of the q4_0 records (GLM_KV_Q4_STAGE_B): lat_type_ is the REQUESTED type (--kv), named
+    // truthfully by kv_name(); lat_records_ is what the cache actually stores (the q4_0 kernel branch is in),
+    // and every byte derivation reads lat_rec_bytes of lat_records_ - the layout always matches what is stored.
+    // The state signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A/B slots when the kernels
+    // change again, since glm_batch.cu changes with them.
     LatType lat_type_ = LatType::fp16;
     LatType lat_records_ = LatType::fp16;
     // the latent cache's precision, as the slot identity and the INFO line name it - the kv= field keys a

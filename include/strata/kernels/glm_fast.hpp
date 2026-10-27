@@ -171,7 +171,8 @@ struct DsaPrepArgs {
     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
     int q_lora = 1536;
     const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512;
-    int lat_q8 = 0;   // the latent cache holds INT8 records (lat8_rec_bytes each) instead of FP16 rows
+    int lat_q8 = 0;   // the latent cache holds records instead of FP16 rows: 1 = INT8 (lat8_rec_bytes each),
+                      // 2 = q4_0 of the ROTATED row (lat4_rec_bytes; glm_lat4.cuh)
     // KV streaming (glm_kv_stream.hpp): the row also goes to the host copy, and to its block's VRAM slot when lat_table
     // names one (lat, the identity-layout cache, is null then)
     uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 4;
@@ -220,7 +221,8 @@ bool dsa_select_all_on();
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s);
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
-/// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
+/// lat_q8: the cache holds records - 1 = INT8 (see lat8_rec_bytes), 2 = q4_0 of the rotated row (glm_lat4.cuh;
+/// the absorbed queries and the context mix are rotated with it) - else FP16 rows of kv_lora.
 /// marks (the stage profiler, MAYA_GLM_PROF): called after each step it launched with that step's name -
 /// "mla_q_abs", "mla_attend", "mla_out", or "mla" for the one-kernel form; nullptr: none.  Launches unchanged.
 struct MlaMarks {
@@ -229,7 +231,7 @@ struct MlaMarks {
 };
 /// token: the decode's token path - only it takes the take-two split attention STRATA_GLM_MLA_ATTN2 names (as dsa_score).
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, int lat_q8 = 0,
          const MlaMarks* marks = nullptr, bool token = false);
 /// The same absorbed MLA in three steps for a verify window (each step mla()'s arithmetic, bit for bit): the head-wise
 /// q_abs = wk_b . q of `ncol` tokens at once (q rows q_stride floats apart, q_abs rows qa_stride), one token's attention
@@ -239,14 +241,14 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
 void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
                float* q_abs, int64_t qa_stride, cudaStream_t s);
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+                int kv_lora, float* ctx, cudaStream_t s, int lat_q8);
 /// mla_attend of T tokens in a few launches (up to kMlaTokMax tokens each; the tensor-core attention: NVIDIA sm_80+,
 /// kv_lora 512): token t's q_abs at q_abs + t * q_stride, its n_sel[t] cells at cells + t * c_stride, its ctx at
 /// ctx + t * ctx_stride - each token's sums mla_attend's bit for bit.  false: not available here (mla_attend per token)
 constexpr int kMlaTokMax = 8;
 bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                      cudaStream_t s, bool lat_q8);
+                      cudaStream_t s, int lat_q8, bool q_abs_rotated = false);
 /// mla_attend_batch for tokens of DIFFERENT sequences (the batched rows of several conversations): token t's latents at
 /// lat[t] and its n_sel[t] cells at cells[t] (each its own cache: the resident rows, or a streamed layer's slot rows),
 /// the partials in the caller's `part` (mla_rows_part_floats() a token, room for part_tokens tokens: launches of
@@ -256,9 +258,9 @@ size_t mla_rows_part_floats(int n_head, int kv_lora);
 bool mla_rows_ok(int kv_lora);
 bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                     float* part, int part_tokens, cudaStream_t s, bool lat_q8);
+                     float* part, int part_tokens, cudaStream_t s, int lat_q8);
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
-             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
+             void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s, int lat_q8 = 0);
 /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
 /// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.  The record types and their
 /// byte counts live in glm_lat_types.hpp (shared with the model's arena sizing and the slot identity).

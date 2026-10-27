@@ -190,6 +190,43 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     check("fwht256 launch");
 }
 
+// stage B (GLM_KV_Q4_STAGE_B): the 512-point rotation, one block a row of 512 (two 256 halves - a stage's
+// partners stay within the half: stride <= 128 never crosses bit 8), 256 threads 2 elements each.  The scale is
+// 1/16 a half (orthonormal: <H512 x, H512 y> == <x, y>, glm_lat4_test asserts it).
+__global__ void fwht512_rows_kernel(float* __restrict__ base, int64_t col_stride, int rows_per_col, int n_rows) {
+    __shared__ float s[512];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= n_rows) return;
+    float* p = base + (int64_t) (row / rows_per_col) * col_stride + (row % rows_per_col) * 512;
+    s[tid] = p[tid];
+    s[tid + 256] = p[tid + 256];
+    __syncthreads();
+#pragma unroll
+    for (int st = 0, stride = 1; st < 8; ++st, stride <<= 1) {
+        const float a0 = s[tid], b0 = s[tid ^ stride];
+        const float a1 = s[tid + 256], b1 = s[(tid + 256) ^ stride];
+        __syncthreads();   // every read before any write
+        if (tid & stride) {
+            s[tid] = b0 - a0;
+            s[tid + 256] = b1 - a1;
+        } else {
+            s[tid] = a0 + b0;
+            s[tid + 256] = a1 + b1;
+        }
+        __syncthreads();
+    }
+    p[tid] = s[tid] * (1.0f / 16.0f);
+    p[tid + 256] = s[tid + 256] * (1.0f / 16.0f);
+}
+
+void fwht512_rows_cuda(float* base, int64_t col_stride, int rows_per_col, int n_cols, void* stream) {
+    const int n_rows = n_cols * rows_per_col;
+    if (n_rows <= 0) return;
+    fwht512_rows_kernel<<<n_rows, 256, 0, (cudaStream_t) stream>>>(base, col_stride, rows_per_col, n_rows);
+    check("fwht512_rows launch");
+}
+
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host) {

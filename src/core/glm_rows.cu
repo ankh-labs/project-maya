@@ -628,7 +628,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             return false;
         }
         gf::mla_out(S->actx, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
-                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s);
+                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s, lat_q8_);
     }
     gf::MvJob o = {Ly.out.q, S->attn_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
                    E};
