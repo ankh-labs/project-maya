@@ -82,7 +82,10 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     // (KV streaming: the arena holds the VRAM slots of kv_resident_cells positions, as load_pack lays it out)
     const int64_t kv_cells = kv_resident_cells(g.idx_kpool, ctx);
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : ctx;
-    const int64_t lat_floats = lat_q8_ ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4 * lat_rows
+    // (the record type is tri-state (0 FP16, 1 INT8, 2 q4_0 of the rotated row), so size it by lat_rec_bytes on
+    // lat_records_ - the same derivation load_pack uses.  A two-way `lat_q8_ ? int8 : fp16` here sizes a q4_0
+    // arena as INT8 (544 B a row against 272) and then trips the layout check below.)
+    const int64_t lat_floats = lat_q8_ ? (int64_t) gf::lat_rec_bytes(g.kv_lora, lat_records_) / 4 * lat_rows
                                        : (int64_t) g.kv_lora * lat_rows / 2;
     for (auto* v : {&c.kda_S, &c.kda_conv, &c.dsa_lat, &c.dsa_ik, &c.dsa_ig, &c.dsa_pool})
         v->assign((size_t) g.n_layers + 1, 0);

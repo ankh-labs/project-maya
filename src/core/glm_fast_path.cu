@@ -7144,14 +7144,17 @@ constexpr uint64_t kSlotMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the 
 
 // (start, floats) of each DSA cache run a slot of n positions holds on one half, in file order: in the state arena, or a
 // KV-streamed layer's latents in its host copy (kv_host[il])
-std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, bool lat_q8, int l0, int l1,
+std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, int lat_q8, int l0, int l1,
                                                       int mtp_il, float* state, const std::vector<uint8_t*>* kv_host,
                                                       const std::vector<int64_t>& lat, const std::vector<int64_t>& ik,
                                                       const std::vector<int64_t>& ig, const std::vector<int64_t>& pool,
                                                       int64_t n) {
     std::vector<std::pair<float*, int64_t>> r;
-    // FP16 latents take half a float each, INT8 records lat8_rec_bytes / 4
-    const int64_t lat_pp = lat_q8      ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
+    // FP16 latents take half a float each, INT8 records lat8_rec_bytes / 4, q4_0 records lat4_rec_bytes / 4.
+    // (lat_q8 is tri-state (0 FP16, 1 INT8, 2 q4_0): a two-way test here would hand a slot save 544 bytes of
+    // stride over a 272-byte-a-row cache - it would read every row into the next and past the end of the arena.)
+    const int64_t lat_pp = lat_q8 == 2 ? (int64_t) gf::lat4_rec_bytes(g.kv_lora) / 4
+                           : lat_q8 == 1 ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
                            : fast_mode ? g.kv_lora / 2
                                        : g.kv_lora;
     const int64_t pools = (n + g.idx_kpool - 1) / g.idx_kpool;
