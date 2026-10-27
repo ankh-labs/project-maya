@@ -594,6 +594,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_compile_definitions(mm3_gguf_test PRIVATE MAYA_DS4_IQ_ONLY)
       add_test(NAME mm3_gguf_test COMMAND mm3_gguf_test)
       set_tests_properties(mm3_gguf_test PROPERTIES TIMEOUT 600)
+      # iq_mmvq's multi-column path against single-column calls: every supported IQ format and width, compared
+      # in raw bits (no model).  The block index is outermost there, so a batch reads each weight block once.
+      add_executable(iq_mmvq_parity_test tests/iq_mmvq_parity_test.cu)
+      target_include_directories(iq_mmvq_parity_test PRIVATE ${_strata_gpu_include_directories} include)
+      target_link_libraries(iq_mmvq_parity_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME iq_mmvq_parity_test COMMAND iq_mmvq_parity_test)
+      set_tests_properties(iq_mmvq_parity_test PROPERTIES TIMEOUT 300)
+
       # the K / V caches in every format (BF16, INT8, FP8, FP4, mixed; rows rotated or not) and the sparse attention
       # over them: exact over the decoded rows, KV streaming the same bits, each format's error (no model)
       add_executable(mm3_kv_test tests/mm3_kv_test.cu src/mm3/mm3_kernels.cu)

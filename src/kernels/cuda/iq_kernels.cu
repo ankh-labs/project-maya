@@ -359,6 +359,74 @@ __device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x
     return warp_sum(s);
 }
 
+/// One row against NC q8_1 activations at once.
+///
+/// row_dot() is called once per activation column and re-reads and re-dequantises the SAME weight bytes
+/// each time, so a k-column batch paid the weight traffic k times.  Here the block index is the OUTER loop:
+/// one block is loaded and decoded once and applied to every column.  The per-lane accumulation order is
+/// unchanged (same k, same stride, same warp_sum), so each column is bit-identical to the single-column
+/// call - this is a scheduling change, not an arithmetic one (tests/iq_mmvq_parity_test.cu checks it over
+/// every supported format and width).
+template<int TY, int NC>
+__device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8_1* x, int xb, int nb, int lane,
+                                              float* s) {
+    using F = Fmt<TY>;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const block_q8_1* base = x + (size_t) kbx * (F::qk / 32);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[c] += F::dot(row, base + (size_t) c * (size_t) xb, kbx, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = warp_sum(s[c]);
+}
+
+template<int TY, int NC>
+__global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                         const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                         int n_in, int n_out, int ncols) {
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    const int lane = threadIdx.x;
+    const int nb = n_in / Fmt<TY>::qk;
+    const int xb = n_in / 32;
+    const uint8_t* wr = w + (size_t) row * row_bytes;
+    int c0 = 0;
+    for (; c0 + NC <= ncols; c0 += NC) {
+        float s[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+        row_dot_multi<TY, NC>(wr, x + (size_t) c0 * (size_t) xb, xb, nb, lane, s);
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) y[(size_t) (c0 + c) * (size_t) n_out + (size_t) row] = s[c];
+        }
+    }
+    for (; c0 < ncols; ++c0) {                 // the tail: the single-column form
+        const float s = row_dot<TY>(wr, x + (size_t) c0 * (size_t) xb, nb, lane);
+        if (lane == 0) y[(size_t) c0 * (size_t) n_out + (size_t) row] = s;
+    }
+}
+
+template<int TY>
+__global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                   const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
+                                                   int n_out, int ncols);
+
+/// The widest column group a batch supports; a single column keeps the plain kernel.
+template<int TY>
+inline void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
+                        const dim3& grid, const dim3& block, cudaStream_t s) {
+    if (ncols >= 8)
+        mmvq_multi_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    else if (ncols >= 4)
+        mmvq_multi_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    else if (ncols >= 2)
+        mmvq_multi_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    else
+        mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+}
+
 template<int TY>
 __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                    const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
@@ -793,16 +861,16 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
     switch (t) {
-        case 16: mmvq_kernel<16><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 17: mmvq_kernel<17><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 18: mmvq_kernel<18><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 20: mmvq_kernel<20><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 21: mmvq_kernel<21><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 22: mmvq_kernel<22><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 23: mmvq_kernel<23><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 29: mmvq_kernel<29><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 19: mmvq_kernel<19><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
-        case 42: mmvq_kernel<42><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+        case 16: launch_mmvq<16>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 17: launch_mmvq<17>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 18: launch_mmvq<18>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 20: launch_mmvq<20>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 21: launch_mmvq<21>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 22: launch_mmvq<22>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 23: launch_mmvq<23>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 29: launch_mmvq<29>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 19: launch_mmvq<19>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 42: launch_mmvq<42>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
