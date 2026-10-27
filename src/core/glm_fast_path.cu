@@ -7263,12 +7263,48 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    // Read the whole slot into one buffer across N streams. A single sequential read reached only
+    // ~0.5 GB/s here, and it then ran interleaved with the per-chunk H2D copies (read 16 MB, copy,
+    // read 16 MB, copy). N streams into one buffer parallelise the disk side, and the copies that
+    // follow are served from RAM instead of from the file.
+    std::error_code fec;
+    const uint64_t fsz = std::filesystem::file_size(path, fec);
+    if (fec || fsz == 0) {
         err = "cannot read " + path;
         return false;
     }
-    const auto get = [&](void* p, size_t bytes) { return (bool) f.read((char*) p, (std::streamsize) bytes); };
+    std::vector<uint8_t> blob((size_t) fsz);
+    {
+        const unsigned nthr = (unsigned) std::min<uint64_t>(
+            8, std::max<uint64_t>(1, (fsz + (uint64_t) (16 << 20) - 1) / (uint64_t) (16 << 20)));
+        std::atomic<int> fail{0};
+        std::vector<std::thread> th;
+        th.reserve(nthr);
+        for (unsigned t = 0; t < nthr; ++t) {
+            th.emplace_back([&, t] {
+                const uint64_t chunk = (fsz + nthr - 1) / nthr;
+                const uint64_t b0 = (uint64_t) t * chunk;
+                const uint64_t b1 = std::min<uint64_t>(fsz, b0 + chunk);
+                if (b0 >= b1) return;
+                std::ifstream fi(path, std::ios::binary);
+                if (!fi) { fail = 1; return; }
+                fi.seekg((std::streamoff) b0);
+                if (!fi.read((char*) blob.data() + b0, (std::streamsize) (b1 - b0))) fail = 1;
+            });
+        }
+        for (auto& x : th) x.join();
+        if (fail) {
+            err = "cannot read " + path;
+            return false;
+        }
+    }
+    size_t rd = 0;
+    const auto get = [&](void* p, size_t bytes) {
+        if (rd + bytes > blob.size()) return false;
+        std::memcpy(p, blob.data() + rd, bytes);
+        rd += bytes;
+        return true;
+    };
     uint64_t magic = 0;
     uint32_t nh = 0;
     int64_t n = 0;
