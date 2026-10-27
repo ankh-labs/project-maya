@@ -5241,6 +5241,46 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
 // A job without the activations its weight type reads - F32 / BF16 the floats (xf), the quantized types the q8_1
 // (xq), EXL3 either - is refused: its kernel would read from address 0 (issue #173: a BF16 DFlash2 drafter's GEMVs
 // carried no xf, and its first draft faulted the device for good)
+// ---- a BF16 weight whose activation this engine only produced as q8_1
+//
+// Three decode sites take their GEMV input straight from a producer that writes q8_1 and never the floats: the
+// DSA and KDA attn_output (mla() and kda_rec() write "the q8_1 of the ... output") and the shared expert's down
+// (the shared gate/up write the h as q8_1).  A GGUF that keeps those projections BF16 - v3q does - therefore has
+// no xf to hand the BF16 GEMV, and mv_inputs_ok refuses the job.  Rather than make three kernels emit a second
+// copy of their output, dequantize the q8_1 row into a scratch float row here: the weights stay BF16 (only the
+// activation carries q8_1's rounding, which the quantized path this engine normally runs already accepts), and
+// the branch is reachable only where the job is refused today, so it cannot change a path that already worked.
+static constexpr size_t kMvXfScratchBytes = 8u << 20;   // 16 columns x 16384 floats is 1 MiB; 8 is headroom
+
+__global__ static void q8_1_to_float_kernel(const block_q8_1* __restrict__ x, float* __restrict__ y, long long n,
+                                            int n_in, long long src_cstride_blocks) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long col = i / n_in, k = i % n_in;
+    const block_q8_1* b = x + col * src_cstride_blocks + k / QK8_1;
+    y[i] = (float) b->qs[k % QK8_1] * __half2float(__low2half(b->ds));
+}
+
+static void q8_1_to_float(const block_q8_1* x, float* y, long long n, int n_in, long long src_cstride_blocks,
+                          cudaStream_t s) {
+    const int threads = 256;
+    const long long blocks = (n + threads - 1) / threads;
+    q8_1_to_float_kernel<<<(unsigned) blocks, threads, 0, s>>>(x, y, n, n_in, src_cstride_blocks);
+}
+
+static float* mv_xf_scratch() {
+    static std::atomic<void*> slot{nullptr};
+    void* p = slot.load(std::memory_order_acquire);
+    if (p == nullptr) {
+        void* want = nullptr;
+        if (cudaMalloc(&want, kMvXfScratchBytes) != cudaSuccess) return nullptr;
+        void* expect = nullptr;
+        if (!slot.compare_exchange_strong(expect, want, std::memory_order_acq_rel)) cudaFree(want);
+        p = slot.load(std::memory_order_acquire);
+    }
+    return (float*) p;
+}
+
 static bool mv_inputs_ok(const MvJob* jobs, int n, const char* who) {
     for (int i = 0; i < n; ++i) {
         const MvJob& j = jobs[i];
@@ -5266,6 +5306,41 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             std::fprintf(stderr, "glm_fast mv: type %d unsupported\n", jobs[i].type);
             return false;
         }
+    // a BF16 job handed only the q8_1 activation: dequantize it into the scratch and carry on with xf set (see
+    // q8_1_to_float above).  Only jobs mv_inputs_ok would refuse take this path.
+    MvJob jl[kMaxMvJobs];
+    {
+        int64_t need = 0;
+        for (int i = 0; i < n; ++i) {
+            const MvJob& j = jobs[i];
+            if (j.type == kTypeBF16 && j.xf == nullptr && j.xq != nullptr && j.n_in > 0 && j.n_in % QK8_1 == 0)
+                need += (int64_t) j.ncol * j.n_in;
+        }
+        if (need > 0) {
+            float* scr = (size_t) need * sizeof(float) > kMvXfScratchBytes ? nullptr : mv_xf_scratch();
+            if (scr == nullptr) {
+                std::fprintf(stderr, "glm_fast mv: no scratch for a BF16 job's q8_1 activation (%lld floats)\n",
+                             (long long) need);
+                return false;
+            }
+            for (int i = 0; i < n; ++i) jl[i] = jobs[i];
+            int64_t off = 0;
+            for (int i = 0; i < n; ++i) {
+                MvJob& j = jl[i];
+                if (!(j.type == kTypeBF16 && j.xf == nullptr && j.xq != nullptr && j.n_in > 0 &&
+                      j.n_in % QK8_1 == 0))
+                    continue;
+                const long long m = (long long) j.ncol * j.n_in;
+                const long long src_blocks =
+                    j.xq_cstride > 0 ? j.xq_cstride / (int64_t) sizeof(block_q8_1) : j.n_in / QK8_1;
+                q8_1_to_float((const block_q8_1*) j.xq, scr + off, m, j.n_in, src_blocks, s);
+                j.xf = scr + off;
+                j.xf_cstride = j.n_in;
+                off += m;
+            }
+            jobs = jl;
+        }
+    }
     if (!mv_inputs_ok(jobs, n, "mv")) return false;
     // the jobs of the common dense types go to a kernel compiled for their type (one launch per type present), the
     // rest to the generic one; the jobs are independent, so their order does not matter

@@ -306,6 +306,16 @@ namespace {
 bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
 }  // namespace
 
+// The f16 path already serves the i-quant formats - dequant_f16 routes them through iq_dequant_f16 - but
+// dequant_bf16_supported(), which only knows the swept `geometry` set, says no.  The batched prompt path's
+// GEMM calls dequant_f16, so asking the bf16 predicate refused an entire pack over a tensor whose
+// conversion is implemented: v3q's shared-expert gate is IQ3_S (21) on some layers, and one such tensor
+// turned the whole prompt into "token by token" (~61 ms/token instead of ~0.5).
+bool dequant_f16_supported(int ggml_type) noexcept {
+    int a, b;
+    return geometry(ggml_type, a, b) || iq_only(ggml_type);
+}
+
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream) {
     launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);

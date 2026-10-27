@@ -615,6 +615,23 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
         err = "glm5_model: hc != 4 is not supported (the mHC kernels pin 4 streams)";
         return false;
     }
+    // MAYA_GLM_EXPERT_USED: the router's top-k, overriding the pack's expert_used_count.  llama.cpp does this with
+    // --override-kv glm5-next.expert_used_count=int:N and our production runs N=7 of the model's 8 (decode +5.9%
+    // mean for +0.0083 KLD, still ahead of Unsloth by 0.0095 - see configs/GLM-5.3-Flash-dsqv3q-s56-v6m-k7.bat).
+    // Only ever LOWERED: the per-layer scratch, the stage rows and the CPU/VRAM slot math are sized from this
+    // value before any tensor is read, so raising it above the pack's would under-allocate.
+    if (const char* ku = getenv("MAYA_GLM_EXPERT_USED")) {
+        const int k = std::atoi(ku);
+        const int was = out.n_exp_used;
+        if (k < 1 || k > was) {
+            err = "glm5_model: MAYA_GLM_EXPERT_USED=" + std::to_string(k) + " is outside 1.." +
+                  std::to_string(was) + " (the pack's expert_used_count; it may only be lowered)";
+            return false;
+        }
+        out.n_exp_used = k;
+        // announce it: a run's stats are only attributable to a k if the log says so
+        std::fprintf(stderr, "glm5_model: MAYA_GLM_EXPERT_USED: expert_used_count %d -> %d\n", was, k);
+    }
     return true;
 }
 
