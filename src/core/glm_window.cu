@@ -496,7 +496,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
     }
     if (batched)
         gf::mla_out(W.ctx + (size_t) t0 * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, T,
-                    (uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, (int64_t) W.aq_s, s);
+                    (uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, (int64_t) W.aq_s, s, lat_q8_);
     mark("dsa_attn");
     gf::MvJob o = cols({Ly.out.q, (const uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, nullptr, W.mixer + (size_t) t0 * E,
                         nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head, E}, W.aq_s, 0, E);

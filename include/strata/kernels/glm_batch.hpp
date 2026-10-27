@@ -97,12 +97,13 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
 /// The same attention with Q in FP16 ([T][n_head][512]) on the WMMA units (rocWMMA, RDNA3/RDNA4): FP16 operands, F32
 /// accumulation and softmax.  n_head % 16 == 0, kv_lora 512.
 void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
-                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
+                   int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
 /// The same attention with Q in F32 on wave32 WMMA intrinsics (gfx11/gfx12): the FP32 query and softmax probability
 /// are each split into FP16 high + residual, both products through WMMA with F32 accumulation and online softmax.
-/// n_head % 16 == 0, kv_lora 512. lat_q8 expands INT8 codes with one FP16 scale per 32 values as they are loaded.
+/// n_head % 16 == 0, kv_lora 512.  lat_q8: 1 = INT8 codes with one FP16 scale per 32 values, 2 = q4_0 of the
+/// rotated rows (glm_lat4.cuh), 0 = FP16 - expanded as they are loaded.
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
-                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
 /// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
@@ -112,11 +113,11 @@ bool mla_wmma2_default();
 /// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
 /// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with STRATA_GLM_MLA_V70=0.
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
-                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
+                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, int lat_q8 = 0);
 /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
 /// scale) . lat_c.  kv_lora 512, n_head % 16 == 0.
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
-              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
+              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat_q8 = 0);
 
 /// h[t] = rms(mean of the 4 streams of R[t]) * w - the final hidden state per row (the NextN block's input).
 void head_rows(const float* R, const float* w, float eps, int T, int n_embd, float* h, cudaStream_t s);

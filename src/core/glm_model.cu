@@ -3401,21 +3401,42 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
-    // stage A of the q4_0 latent records (GLM_KV_Q4_STAGE_A): the requested type is parsed (STRATA_GLM_KV_Q4,
-    // set by --kv q4_0) and named truthfully, but the cache RECORDS INT8 until the stage-B kernel branch -
-    // lat_records_ is what every byte derivation reads, so the layout always matches what is stored.  A q4_0
-    // slot survives a stage-B rebuild only if the state signature still matches (it will not: glm_batch.cu
-    // changes), so the stage-A files refuse loudly instead of restoring silently.
+    // stage B of the q4_0 latent records (GLM_KV_Q4_STAGE_B): the requested type is parsed (STRATA_GLM_KV_Q4,
+    // set by --kv q4_0) and named truthfully, and the cache records it - the stage-B kernel branch rotates the
+    // rows with the Hadamard and quantizes q4_0 (glm_lat4.cuh).  lat_records_ is what every byte derivation
+    // reads, so the layout always matches what is stored.  A pre-stage-B slot survives a rebuild only if the
+    // state signature still matches (it will not: glm_batch.cu changes), so old files refuse loudly instead of
+    // restoring silently.
     const char* kv_int_env = getenv("STRATA_GLM_KV_INT8");
     const bool want_int8 = kv_int_env != nullptr && std::atoi(kv_int_env) != 0;
     const char* kv_q4_env = getenv("STRATA_GLM_KV_Q4");
     const bool want_q4 = kv_q4_env != nullptr && std::atoi(kv_q4_env) != 0;
     lat_type_ = want_q4 ? LatType::q4_0 : want_int8 ? LatType::int8 : LatType::fp16;
-    lat_records_ = lat_type_ == LatType::q4_0 ? LatType::int8 : lat_type_;
+    // stage B (GLM_KV_Q4_STAGE_B): the q4_0 kernel branch is in, so the cache records what was requested.  The
+    // rotation's butterfly needs kv_lora == blockDim (512) exactly - refused loudly otherwise - and q4_0 has no
+    // kernel branch on HIP builds yet (the f16q prompt attention has no rotation for its FP16 queries).
+    lat_records_ = lat_type_;
     lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
+    if (lat_type_ == LatType::q4_0 && g_.kv_lora != 512) {
+        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 refused: the Hadamard rotation needs kv_lora 512, this "
+                             "pack has %d\n", dev_, g_.kv_lora);
+        lat_type_ = want_int8 ? LatType::int8 : LatType::fp16;
+        lat_records_ = lat_type_;
+        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
+    }
+#if defined(STRATA_USE_HIP)
+    if (lat_type_ == LatType::q4_0) {
+        std::fprintf(stderr, "glm pack: --kv q4_0 is not available on HIP builds (no rotation for the f16q "
+                             "attention) - recording INT8, named truthfully\n");
+        lat_type_ = LatType::int8;
+        lat_records_ = LatType::int8;
+        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0;
+    }
+#endif
     if (lat_type_ == LatType::q4_0)
-        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 requested - RECORDS INT8 for now (the q4_0 kernel "
-                             "branch is stage B); the slot identity and layout are keyed truthfully\n", dev_);
+        std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0: the cache records q4_0 of the ROTATED rows (the "
+                             "stage-B kernel branch is in); the slot identity and layout are keyed truthfully\n",
+                     dev_);
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
     const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
@@ -3425,8 +3446,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const int64_t lat_floats = fast_mode_
         ? (int64_t) strata::kernels::glmf::lat_rec_bytes(g_.kv_lora, lat_records_) / 4 * lat_rows
         : (int64_t) g_.kv_lora * lat_rows;
-    if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
-                              strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
+    if (lat_q8_) {
+        const int rec_bytes = lat_type_ == LatType::q4_0 ? strata::kernels::glmf::lat4_rec_bytes(g_.kv_lora)
+                                                         : strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora);
+        std::fprintf(stderr, "glm pack: CUDA%d latent cache %s (%d bytes a position and layer)\n", dev_,
+                     lat_type_ == LatType::q4_0 ? "q4_0" : "INT8", rec_bytes);
+    }
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
     kda_S_.assign((size_t) g_.n_layers + 1, 0);
     kda_conv_.assign((size_t) g_.n_layers + 1, 0);
