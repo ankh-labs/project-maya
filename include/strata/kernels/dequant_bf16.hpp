@@ -13,6 +13,11 @@ namespace strata::kernels {
 
 bool dequant_bf16_supported(int ggml_type) noexcept;
 
+/// The predicate for the FP16 path (`dequant_f16`): the swept `geometry` types plus the i-quant formats,
+/// which go through iq_dequant_f16.  The batched prompt path's low-bit GEMMs call `dequant_f16`, so this
+/// is the check that decides whether a tensor can be served there.
+bool dequant_f16_supported(int ggml_type) noexcept;
+
 /// `rows` rows of `cols` values starting at block row `row0` (so a caller can dequantize a slice of a tensor).
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream);

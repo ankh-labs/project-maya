@@ -737,9 +737,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.attn_norm = f32("attn_norm.weight");
         Ly.ffn_norm = f32("ffn_norm.weight");
         if (Ly.recr) {
-            Ly.q = q("attn_q.weight");
-            Ly.k = q("attn_k.weight");
-            Ly.v = q("attn_v.weight");
+            // v3q keeps these BF16 on disk; a GGUF may do that where Maya's quants quantize them, in
+            // which case the tensor is in dense.bin (w16_) and never reaches ws_map_ - so take the BF16
+            // copy.  Widths are the ones the KDA jobs use (glm_fast_path.cu j[0..2]: n_embd -> d_inner()).
+            Ly.q = q_or_b16("attn_q.weight", g.n_embd, g.d_inner());
+            Ly.k = q_or_b16("attn_k.weight", g.n_embd, g.d_inner());
+            Ly.v = q_or_b16("attn_v.weight", g.n_embd, g.d_inner());
             Ly.f_a = b16("ssm_f_a.weight");
             Ly.g_a = b16("ssm_g_a.weight");
             Ly.f_b = b16("ssm_f_b.weight");
@@ -753,7 +756,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.ssm_norm = f32("ssm_norm.weight");
         } else {
             Ly.q_a = q_or_b16("attn_q_a.weight", g.n_embd, g.q_lora);
-            Ly.q_b = q("attn_q_b.weight");
+            // n_in/n_out from the MLA q_b job (glm_fast_path.cu j2[0], and hgemm_q in glm_prefill.cu):
+            // q_lora -> n_head * qk_nope
+            Ly.q_b = q_or_b16("attn_q_b.weight", g.q_lora, (int64_t) g.n_head * g.qk_nope);
             Ly.kv_a = q_or_b16("attn_kv_a_mqa.weight", g.n_embd, g.kv_lora);
             Ly.q_a_norm = f32("attn_q_a_norm.weight");
             Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
@@ -771,13 +776,18 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
         }
-        Ly.out = q("attn_output.weight");
+        // attn_output is consumed at TWO different input widths: the DSA/MLA path takes n_head*v_head
+        // (the dsa_out_mv job / hgemm_q 2674), the KDA path takes d_inner() (j / DI).  Getting this wrong
+        // is a silent runtime shape error, not a compile error - so it follows the layer type.
+        Ly.out = q_or_b16("attn_output.weight",
+                          Ly.recr ? (int64_t) g.d_inner() : (int64_t) g.n_head * g.v_head, g.n_embd);
         if (Ly.moe) {
             Ly.router = b16("ffn_gate_inp.weight");
             Ly.router_bias = f32("exp_probs_b.bias");
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
-            Ly.sh_down = q("ffn_down_shexp.weight");
+            // n_ff_exp * n_shared -> n_embd, as the shared-expert down job (sd) declares
+            Ly.sh_down = q_or_b16("ffn_down_shexp.weight", (int64_t) g.n_ff_exp * g.n_shared, g.n_embd);
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
@@ -3754,8 +3764,14 @@ bool Glm5Model::fast_warm(std::string& err) {
     size_t done_bytes = 0, total_bytes = 0;
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
     int last_pct = -1;
-    for (size_t b = 0; b < jobs.size(); b += 8) {
-        const int nb = (int) std::min<size_t>(8, jobs.size() - b);
+    // the staging buffers are the router's top-k (F->stage.assign(n_exp_used) in fast_setup),
+    // not 8: a fixed batch of 8 read stage[7] past the end once MAYA_GLM_EXPERT_USED lowered
+    // k -- a garbage destination pointer for a whole expert blob (the 0xc0000005 inside
+    // VCRUNTIME140's memcpy, during warm-up or later from the heap it corrupted).  Clamp the
+    // batch to what stage actually holds; at k=8 this is the same batch of 8 as before.
+    const size_t batch = std::min<size_t>(8, F->stage.size());
+    for (size_t b = 0; b < jobs.size(); b += batch) {
+        const int nb = (int) std::min<size_t>(batch, jobs.size() - b);
         F->workers->run(nb * 3, [&](int job) {
             const Job& J = jobs[b + (size_t) (job / 3)];
             const int role = job % 3;
