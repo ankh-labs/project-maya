@@ -18,11 +18,17 @@
 // reading records, others fp16 rows) is silent corruption, so stage B lands all at once or not at all.
 #pragma once
 
+// there is no __ushort_as_ushort intrinsic: these are bit patterns already held as uint16_t
+__device__ __forceinline__ unsigned short lat4_bits(unsigned short u) { return u; }
+
 #include <cuda_fp16.h>
 
 #include <cstdint>
 
-namespace strata::kernels::glmf {
+// in namespace strata::kernels (NOT glmf/glmb): the kernels live in strata::kernels::glmf (glm_fast.cu) and
+// strata::kernels::glmb (glm_batch.cu), and unqualified lookup walks the parent namespace, so both see these
+// without a using-directive.
+namespace strata::kernels {
 
 __device__ __forceinline__ const uint8_t* lat4_rec(const uint16_t* lat, int kv, int cell) {
     return (const uint8_t*) lat + (size_t) (kv / 2 + kv / 32) * cell;
@@ -52,10 +58,10 @@ __device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, int c4) {
         v[2 * k + 1] = __float2half((float) (q1 - 8) * d);
     }
     uint2 out;
-    out.x = (uint32_t) (__ushort_as_ushort(((const uint16_t*) v)[0]) |
-                        ((uint32_t) __ushort_as_ushort(((const uint16_t*) v)[1]) << 16));
-    out.y = (uint32_t) (__ushort_as_ushort(((const uint16_t*) v)[2]) |
-                        ((uint32_t) __ushort_as_ushort(((const uint16_t*) v)[3]) << 16));
+    out.x = (uint32_t) (lat4_bits(((const uint16_t*) v)[0]) |
+                        ((uint32_t) lat4_bits(((const uint16_t*) v)[1]) << 16));
+    out.y = (uint32_t) (lat4_bits(((const uint16_t*) v)[2]) |
+                        ((uint32_t) lat4_bits(((const uint16_t*) v)[3]) << 16));
     return out;
 }
 
@@ -113,4 +119,4 @@ __device__ __forceinline__ void lat4_store_warp(float y, uint8_t* rec, int kv_lo
     if (lane < 16) rec[blk * 18 + 2 + lane] = byte;
 }
 
-}  // namespace strata::kernels::glmf
+}  // namespace strata::kernels

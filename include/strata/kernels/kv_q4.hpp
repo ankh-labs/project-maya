@@ -41,6 +41,14 @@ inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
 void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
 inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }
 
+/// Stage B of the GLM latent q4_0 work (GLM_KV_Q4_STAGE_B): an in-place orthonormal H512 rotation of rows of
+/// 512 floats - two fwht256 halves (H512 = H256 . H256, self-inverse), scale 1/16 a half.  Row i sits at
+/// base + (i / rows_per_col) * col_stride + (i % rows_per_col) * 512: mla_q_abs's output is dense runs of
+/// n_head * kv_lora per column, a strided ctx (mla_out) is one column a token.  Applied to the absorbed q_abs
+/// right after its GEMV/GEMM and to the context mix before the wv_b projection: the latents are stored rotated,
+/// so <Hq, Hk> = <q, k> keeps the scores and H (self-inverse) restores the context.
+void fwht512_rows_cuda(float* base, int64_t col_stride, int rows_per_col, int n_cols, void* stream);
+
 /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
 /// and to VRAM only if its block is resident.
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
