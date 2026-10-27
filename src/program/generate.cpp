@@ -1344,6 +1344,11 @@ static int glm_pack_generate(const Options& o) {
     const std::string slot_identity = [&] {
         std::ostringstream id;
         id << "maya-session-1 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
+        // launch-time MEANING, not placement: k changes expert routing (production runs k=7 against a pack whose
+        // metadata says 8), ctx bounds n_pos and the latent rows, and the KV precision changes the latent layout.
+        // Expert-cache / slot sizing is deliberately NOT here - it changes placement, not the state's meaning.
+        id << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context
+           << " kv=" << (model.kv_int8() ? "int8" : "fp16");
         std::error_code ec;
         for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
@@ -1357,6 +1362,21 @@ static int glm_pack_generate(const Options& o) {
     }();
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
+    // FNV-1a 64 over a whole file, streamed. A .meta's byte count alone cannot tell a torn or rot-corrupted .bin
+    // from a whole one, and a wrong state restored here is silently corrupting rather than loudly broken.
+    const auto file_sum = [](const std::string& path) -> uint64_t {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return 0;
+        uint64_t h = 1469598103934665603ull;
+        char buf[1 << 16];
+        for (;;) {
+            f.read(buf, sizeof buf);
+            const std::streamsize n = f.gcount();
+            for (std::streamsize i = 0; i < n; ++i) h = (h ^ (uint8_t) buf[i]) * 1099511628211ull;
+            if (n < (std::streamsize) sizeof buf) break;
+        }
+        return h;
+    };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
         const std::string tmp = path + ".tmp";
         {
@@ -1368,6 +1388,8 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) &bytes, 8);
             f.write((const char*) &nt, 8);
             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
+            const uint64_t sum = file_sum(path.substr(0, path.size() - 5) + ".bin");
+            f.write((const char*) &sum, 8);
             f.write((const char*) &kMetaMagic, 8);
             f.flush();
             if (!f) return false;
@@ -1386,8 +1408,13 @@ static int glm_pack_generate(const Options& o) {
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
         toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
-               m1 == kMetaMagic;
+        uint64_t sum = 0;
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &sum, 8) ||
+            !f.read((char*) &m1, 8) || m1 != kMetaMagic)
+            return false;
+        // the .bin must still be the bytes this .meta describes - verified here so a torn or rotted file is
+        // refused at indexing and again at restore rather than applied
+        return sum == file_sum(path.substr(0, path.size() - 5) + ".bin");
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -1432,6 +1459,8 @@ static int glm_pack_generate(const Options& o) {
                 found.push_back(std::move(fd));
             } else {
                 ++refused;
+                std::fprintf(stderr, "glm slots: refused %s (foreign identity, incomplete, or its checksum failed) - removed\n",
+                             p.c_str());
                 std::filesystem::remove(p, ec);
                 std::filesystem::remove(bin, ec);
             }
@@ -1573,6 +1602,18 @@ static int glm_pack_generate(const Options& o) {
         }
         if (best == SIZE_MAX) return 0;
         const auto t0 = std::chrono::steady_clock::now();
+        // a disk slot is re-verified at use: the file can rot or be replaced between the startup index and this
+        // restore, and a corrupted state applied here would be silently corrupting rather than loudly broken
+        if (!slots[best].data) {
+            std::vector<int32_t> vt;
+            uint64_t vb = 0;
+            if (!meta_read(meta_of(slots[best].path), vt, vb)) {
+                note("refused " + slots[best].path + " at restore (identity or checksum failed) - reading its prompt again");
+                slot_drop(best);
+                snap_tokens.clear();
+                return 0;
+            }
+        }
         std::string e;
         const bool back = slots[best].data
                               ? model.slot_load(*slots[best].data, (int64_t) len, e)
@@ -1897,6 +1938,21 @@ static int glm_pack_generate(const Options& o) {
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
+                        // (a) marker-free slot at the last turn boundary: the prompt-end snapshot
+                        // (prompt-1) carries the trailing generation markers, so a grown
+                        // conversation - content inserted before them - never matches it. The
+                        // state at a mark is marker-free: snapshot it and set it aside here, so
+                        // the next turn's prompt (which shares everything before its new
+                        // content) restores it as a prefix.
+                        if (slot_max > 0 && cur_img_pos.empty() && mi + 1 == marks.size() &&
+                            end > sys_end) {   // (== sys_end: slot_prefix saved it as a prefix slot)
+                            if (model.snapshot_save()) {
+                                snap_tokens.assign(prompt.begin(), prompt.begin() + (long) end);
+                                snap_img_hash = img_hash(end);
+                                snap_in_slot = false;
+                                slot_put(" (the last turn's start, marker-free)");
+                            }
+                        }
                         ++mi;
                         seg_start = end;
                         seg_chunk = 0;
