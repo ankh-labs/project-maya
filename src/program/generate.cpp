@@ -1440,6 +1440,13 @@ static int glm_pack_generate(const Options& o) {
         std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1e9);
         return std::string(s);
     };
+    // stage-2 accounting (design doc 2.6): per-tier hits, bytes, restore time and the recompute
+    // avoided, from the engine's OWN measured prefill rate (the EWMA below) - never a constant.
+    struct PcStats {
+        uint64_t ram_hits = 0, disk_hits = 0, misses = 0, bytes = 0;
+        double restore_ms = 0.0, saved_s = 0.0;
+    } pc;
+    double prefill_toks = 0.0;   // EWMA of the prompt path's tok/s (0.9/0.1)
     if (slot_max > 0 && slot_ram)
         note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
     if (slot_max > 0 && !slot_ram) {
@@ -1653,6 +1660,20 @@ static int glm_pack_generate(const Options& o) {
                       slots[best].data ? "RAM" : "disk",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                       prompt.size() - len);
+        {   // accounting: which tier served it, what it cost, what it replaced
+            const double cms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (slots[best].data) ++pc.ram_hits; else ++pc.disk_hits;
+            pc.bytes += slots[best].bytes;
+            pc.restore_ms += cms;
+            pc.saved_s += prefill_toks > 0.0 ? (double) len / prefill_toks : 0.0;
+            char a[224];
+            std::snprintf(a, sizeof a,
+                          "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~%.0f s (prefill EWMA %.0f tok/s)",
+                          (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
+                          (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms, pc.saved_s,
+                          prefill_toks);
+            note(a);
+        }
         note(m);
         return len;
     };
@@ -1841,6 +1862,7 @@ static int glm_pack_generate(const Options& o) {
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
+            if (reuse == 0) ++pc.misses;   // (design doc 2.6: a prefix match that found nothing - counted, not re-attempted)
             if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
         } else if (reuse > 0 && !from_ckpt && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
             // a test: the restored state goes through a slot file and back - the same tokens must follow
@@ -1894,6 +1916,10 @@ static int glm_pack_generate(const Options& o) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), reuse + done, prompt.size(), ms,
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
+                {   // the EWMA the cache's "saved" figure is computed from: the engine's own rate
+                    const double tps = (double) done / (ms / 1000.0 + 1e-9);
+                    prefill_toks = prefill_toks > 0.0 ? 0.9 * prefill_toks + 0.1 * tps : tps;
+                }
                 std::fflush(stdout);
             };
             std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
