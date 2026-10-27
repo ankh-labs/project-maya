@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "strata/kernels/glm_lat_types.hpp"   // record types + byte counts (shared with the model)
 
 namespace strata::kernels::glmf {
 
@@ -259,8 +260,8 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
 /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
-/// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.
-__host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }
+/// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.  The record types and their
+/// byte counts live in glm_lat_types.hpp (shared with the model's arena sizing and the slot identity).
 
 /// SwiGLU with GLM's clamp (gate above, up both sides) and the q8_1 of h, n values.
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s);

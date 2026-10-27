@@ -23,6 +23,7 @@
 #include "strata/core/glm_dflash.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/kernels/glm_lat_types.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -38,6 +39,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+// the latent record types live in strata::kernels::glmf (glm_lat_types.hpp) but are named unqualified
+// in this header and in glm_model.cu; an alias keeps that spelling without a using-directive.
+using LatType = strata::kernels::glmf::LatType;
 
 namespace strata::kernels::glmf {
 struct MoeRequest;
@@ -673,6 +678,17 @@ public:
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
     bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    // stage A of the q4_0 records (GLM_KV_Q4_STAGE_A): lat_type_ is the REQUESTED type (--kv), named
+    // truthfully by kv_name(); lat_records_ is what the cache actually stores (q4_0 records INT8 until the
+    // stage-B kernel branch), and every byte derivation reads lat_rec_bytes of lat_records_ - the layout
+    // always matches what is stored.  Stage B flips lat_records_ to q4_0 with the kernels; the state
+    // signature (STRATA_STATE_SIGNATURE, CMakeLists) invalidates stage-A slots then, since glm_batch.cu
+    // changes with it.
+    LatType lat_type_ = LatType::fp16;
+    LatType lat_records_ = LatType::fp16;
+    // the latent cache's precision, as the slot identity and the INFO line name it - the kv= field keys a
+    // slot's layout, so it must name the requested type (a two-valued string let a q4_0 slot pass as int8)
+    const char* kv_name() const { return strata::kernels::glmf::lat_type_name(lat_type_); }
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
     /// or when the context fits in that many anyway
