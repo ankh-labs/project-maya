@@ -23,7 +23,7 @@ using namespace strata::kernels;
 namespace {
 
 constexpr int KV = 512;
-constexpr int REC = lat4_rec_bytes(KV);   // 288 at kv_lora 512
+constexpr int REC = strata::kernels::glmf::lat4_rec_bytes(KV);   // 288 at kv_lora 512
 
 // 16 warps store one row: warp w writes block w (lane t stores element 32 w + t), glm_lat4.cuh's contract
 __global__ void store_kernel(uint8_t* rec, const float* row, int kv) {
@@ -48,11 +48,13 @@ void fwht512_host(const float* in, float* out) {
     for (int i = 0; i < KV; ++i) out[i] = t[i];
 }
 
-double dot(const std::vector<float>& a, const std::vector<float>& b) {
+double dot(const float* a, const float* b) {
     double s = 0.0;
     for (int i = 0; i < KV; ++i) s += (double) a[i] * b[i];
     return s;
 }
+double dot(const std::vector<float>& a, const std::vector<float>& b) { return dot(a.data(), b.data()); }
+double dot(const std::vector<float>& a, const float* b) { return dot(a.data(), b); }
 
 }  // namespace
 
@@ -104,7 +106,7 @@ int main() {
         fwht512_host(y.data(), hy.data());
         const double want = dot(xr, y.data());                    // <x, y>
         const double got = dot(hxr, hy.data());                    // <H x, H y>
-        if (std::fabs(got - want) > 1e-6) {
+        if (std::fabs(got - want) > 1e-6 * std::max(1.0, std::fabs(want))) {   // relative: 512-term doubles
             std::fprintf(stderr, "glm_lat4_test: row %d: <Hx, Hy> != <x, y> (%.6f vs %.6f)\n", r, want, got);
             ++bad;
         }
@@ -117,15 +119,25 @@ int main() {
         uint8_t* drec = nullptr;
         cudaMalloc(&drec, REC);
         cudaMemset(drec, 0, REC);
-        store_kernel<<<1, 512>>>(drec, row.data(), KV);
-        cudaDeviceSynchronize();
+        // (the row must be on the DEVICE: passing row.data() - host memory - made the kernel fault, write nothing
+        // and leave the record zeroed, so every decode was -0.  The launch error was never checked either.)
+        float* drow = nullptr;
+        cudaMalloc(&drow, KV * sizeof(float));
+        cudaMemcpy(drow, row.data(), KV * sizeof(float), cudaMemcpyHostToDevice);
+        store_kernel<<<1, 512>>>(drec, drow, KV);
+        const cudaError_t st = cudaDeviceSynchronize();
+        if (st != cudaSuccess) {
+            std::fprintf(stderr, "glm_lat4_test: store_kernel failed: %s\n", cudaGetErrorString(st));
+            ++bad;
+        }
+        cudaFree(drow);
         std::vector<uint8_t> rec(REC);
         cudaMemcpy(rec.data(), drec, REC, cudaMemcpyDeviceToHost);
         cudaFree(drec);
         for (int c = 0; c < KV; ++c) {
             const int blk = c >> 5, t = c & 31;
             const float d = __half2float(((const __half*) rec.data())[blk * 9]);
-            const uint8_t b = rec[blk * 18 + 2 + t / 2];
+            const uint8_t b = rec[blk * 18 + 2 + (t & 15)];   // element t low, t + 16 high (see lat4_f)
             const int q = t < 16 ? (b & 0xF) : (b >> 4);
             const float want = (float) (q - 8) * d;
             const float got = lat4_f(rec.data(), KV, c);
@@ -144,7 +156,7 @@ int main() {
             const uint4 v = lat4_h8(rec.data(), KV, c8);
             const __half* h = (const __half*) &v;
             for (int k = 0; k < 8; ++k) {
-                const float want = lat4_f(rec.data(), KV, 8 * c8 + k);
+                const float want = __half2float(__float2half(lat4_f(rec.data(), KV, 8 * c8 + k)));   // h8 returns FP16
                 if (__half2float(h[k]) != want) {
                     std::fprintf(stderr, "glm_lat4_test: lat4_h8(%d,%d) = %g, want %g\n", c8, k,
                                  __half2float(h[k]), want);
@@ -156,7 +168,7 @@ int main() {
             const uint2 v = lat4_h4(rec.data(), KV, c4);
             const __half* h = (const __half*) &v;
             for (int k = 0; k < 4; ++k) {
-                const float want = lat4_f(rec.data(), KV, 4 * c4 + k);
+                const float want = __half2float(__float2half(lat4_f(rec.data(), KV, 4 * c4 + k)));   // h4 returns FP16
                 if (__half2float(h[k]) != want) {
                     std::fprintf(stderr, "glm_lat4_test: lat4_h4(%d,%d) = %g, want %g\n", c4, k,
                                  __half2float(h[k]), want);
