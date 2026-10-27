@@ -13,8 +13,9 @@ namespace strata::kernels::glmf {
 __host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }
 
 /// q4_0 records: per 32 values an FP16 scale + 16 nibble bytes (ggml's convention, value = (q - 8) * d):
-/// 288 B a position and layer at kv_lora 512.
-__host__ __device__ constexpr inline int lat4_rec_bytes(int kv_lora) { return kv_lora / 2 + kv_lora / 32; }
+/// 288 B a position and layer at kv_lora 512.  (kv_lora / 16, NOT / 32: 16 blocks carry 16 two-byte FP16 scales,
+/// so the scales are 32 bytes - the same per-16-values scale convention as lat8_rec_bytes above.)
+__host__ __device__ constexpr inline int lat4_rec_bytes(int kv_lora) { return kv_lora / 2 + kv_lora / 16; }
 
 enum class LatType : int { fp16 = 0, int8 = 1, q4_0 = 2 };
 

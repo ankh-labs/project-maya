@@ -19,7 +19,7 @@
 #pragma once
 
 // there is no __ushort_as_ushort intrinsic: these are bit patterns already held as uint16_t
-__device__ __forceinline__ unsigned short lat4_bits(unsigned short u) { return u; }
+__host__ __device__ __forceinline__ unsigned short lat4_bits(unsigned short u) { return u; }
 
 #include <cuda_fp16.h>
 
@@ -30,32 +30,39 @@ __device__ __forceinline__ unsigned short lat4_bits(unsigned short u) { return u
 // without a using-directive.
 namespace strata::kernels {
 
-__device__ __forceinline__ const uint8_t* lat4_rec(const uint16_t* lat, int kv, int cell) {
-    return (const uint8_t*) lat + (size_t) (kv / 2 + kv / 32) * cell;
+__host__ __device__ __forceinline__ const uint8_t* lat4_rec(const uint16_t* lat, int kv, int cell) {
+    // (the block stride is 18 bytes - 2 scale + 16 nibble - so 16 blocks are 288 at kv 512; lat4_rec_bytes in
+    // glm_lat_types.hpp must agree or every row overlaps the next)
+    return (const uint8_t*) lat + (size_t) (kv / 2 + kv / 16) * cell;
 }
 
-// value c of a record: block c >> 5, the scale one fp16 at the block's head, nibble byte (c % 32) / 2 with
-// c % 32 < 16 in the low nibble (element t) and 16..31 in the high one (element t + 16)
-__device__ __forceinline__ float lat4_f(const uint8_t* rec, int kv, int c) {
+// value c of a record: block c >> 5, the scale one fp16 at the block's head, nibble byte (c % 32) & 15 holding
+// element t = c % 32 in its LOW nibble (< 16) and element t + 16 in its HIGH one - what lat4_store_warp writes
+// (lane t low, its __shfl_down 16 partner high) and what ggml's q4_0 does.  NOT t / 2 (consecutive pairs a byte):
+// that is the other q4 packing and it decodes the wrong element for every t but 0, which is how a cache can look
+// populated and still poison the scores.
+__host__ __device__ __forceinline__ float lat4_f(const uint8_t* rec, int kv, int c) {
     const int blk = c >> 5, t = c & 31;
     const float d = __half2float(((const __half*) rec)[blk * 9]);
-    const uint8_t b = rec[blk * 18 + 2 + t / 2];
+    const uint8_t b = rec[blk * 18 + 2 + (t & 15)];
     const int q = t < 16 ? (b & 0xF) : (b >> 4);
     return (float) (q - 8) * d;
 }
 
-// values [4 c4, 4 c4 + 4) of a record as 4 FP16 (an FP16 row's uint2 there); 4 values sit in one block
-__device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, int c4) {
-    const int blk = c4 >> 3, j = (c4 & 3) * 4;   // (4 * c4) % 32 elements into the block
+// values [4 c4, 4 c4 + 4) of a record as 4 FP16 (an FP16 row's uint2 there); 4 values sit in one block, and a
+// 4-value group is entirely in the LOW nibbles of its bytes (groups 0..3 of a block) or entirely in the HIGH ones
+// (groups 4..7) - see lat4_f.
+__host__ __device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, int c4) {
+    const int blk = c4 >> 3, g = c4 & 7;             // 8 groups of 4 values a block
     const float d = __half2float(((const __half*) rec)[blk * 9]);
-    const uint32_t w = ((const uint32_t*) (rec + blk * 18 + 2))[j / 4];
+    const uint32_t w = ((const uint32_t*) (rec + blk * 18 + 2))[g & 3];
+    const bool hi = g >= 4;                          // elements 16..31 sit in the high nibbles
     __half v[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         const uint8_t b = (uint8_t) (w >> (8 * k));
-        const int q0 = b & 0xF, q1 = b >> 4;
-        v[2 * k] = __float2half((float) (q0 - 8) * d);
-        v[2 * k + 1] = __float2half((float) (q1 - 8) * d);
+        const int q = hi ? (b >> 4) : (b & 0xF);
+        v[k] = __float2half((float) (q - 8) * d);
     }
     uint2 out;
     out.x = (uint32_t) (lat4_bits(((const uint16_t*) v)[0]) |
@@ -65,18 +72,20 @@ __device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, int c4) {
     return out;
 }
 
-// values [8 c8, 8 c8 + 8) of a record as 8 FP16 (an FP16 row's uint4 there); 8 values sit in one block
-__device__ __forceinline__ uint4 lat4_h8(const uint8_t* rec, int kv, int c8) {
-    const int blk = c8 >> 2, j = (c8 & 3) * 4;
+// values [8 c8, 8 c8 + 8) of a record as 8 FP16 (an FP16 row's uint4 there); 8 values sit in one block, in the low
+// nibbles of bytes 0..7 (c8 & 3 == 0), of bytes 8..15 (1), or the high nibbles of those (2, 3)
+__host__ __device__ __forceinline__ uint4 lat4_h8(const uint8_t* rec, int kv, int c8) {
+    const int blk = c8 >> 2, g = c8 & 3;             // 4 groups of 8 values a block
     const float d = __half2float(((const __half*) rec)[blk * 9]);
-    const uint32_t w = ((const uint32_t*) (rec + blk * 18 + 2))[j / 4];
+    const uint32_t* w4 = (const uint32_t*) (rec + blk * 18 + 2);
+    const bool hi = g >= 2;                          // elements 16..31 sit in the high nibbles
     __half v[8];
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        const uint8_t b = (uint8_t) (w >> (8 * k));
-        const int q0 = b & 0xF, q1 = b >> 4;
-        v[2 * k] = __float2half((float) (q0 - 8) * d);
-        v[2 * k + 1] = __float2half((float) (q1 - 8) * d);
+    for (int k = 0; k < 8; ++k) {                    // element k of the group: byte k, word (g & 1) * 2 + k / 4
+        const uint32_t w = w4[(g & 1) * 2 + (k >> 2)];
+        const uint8_t b = (uint8_t) (w >> (8 * (k & 3)));
+        const int q = hi ? (b >> 4) : (b & 0xF);
+        v[k] = __float2half((float) (q - 8) * d);
     }
     uint4 out;
     unsigned* o = (unsigned*) &out;
