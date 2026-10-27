@@ -402,6 +402,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_BUILD_TESTS)
     add_executable(glm_lat4_test tests/glm_lat4_test.cu)
     target_link_libraries(glm_lat4_test PRIVATE ${_strata_gpu_runtime_target})
+    # (this test includes strata/kernels/glm_lat_types.hpp and kv_q4.hpp, unlike its lat8 sibling, so it needs the
+    # public include root - without it nvcc fails C1083 on the first strata include)
+    target_include_directories(glm_lat4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # (fwht512_rows_cuda lives in kv_q4.cu, not in the GPU runtime target - compile that one source in rather than
+    # linking all of strata_kernels, so this stays a ~1-file test)
+    target_sources(glm_lat4_test PRIVATE src/kernels/cuda/kv_q4.cu)
     add_test(NAME glm_lat4_test COMMAND glm_lat4_test)
     set_tests_properties(glm_lat4_test PROPERTIES TIMEOUT 60)
   endif()
