@@ -1084,7 +1084,7 @@ static int glm_pack_generate(const Options& o) {
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
                     "cpu_threads=%d cpu_threads_max=%d pcie_share=%.2f logit_bias=1\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) o.max_context, model.kv_name(), (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
@@ -1347,14 +1347,52 @@ static int glm_pack_generate(const Options& o) {
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
     const std::string slot_identity = [&] {
         std::ostringstream id;
-        id << "maya-session-2 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
+        // the state signature (a build-time digest of the state's meaning sources; see CMakeLists): the only
+        // guard a layout-changing rebuild has - engine= is STRATA_VERSION, the static project version, which
+        // never moves with a release.  "unknown" falls back to the compile stamp: over-strict (every rebuild
+        // invalidates the slots), never permissive.
+        const char* state_sig = STRATA_STATE_SIGNATURE;
+        const bool sig_unknown = std::string(state_sig) == "unknown";
+        if (sig_unknown)
+            std::fprintf(stderr, "glm slots: no state signature - slots key on the compile stamp and every "
+                                 "rebuild invalidates them (over-strict, safe)\n");
+        // unknown -> the compile stamp: it changes every rebuild, so slot reuse across builds is refused
+        const std::string state_part = sig_unknown ? std::string(__DATE__ " " __TIME__) : std::string(state_sig);
+        id << "maya-session-2 engine=" << STRATA_VERSION << " state=" << state_part
+           << " mtp=" << (model.has_mtp() ? 1 : 0);
         // launch-time MEANING, not placement: k changes expert routing (production runs k=7 against a pack whose
         // metadata says 8), ctx bounds n_pos and the latent rows, and the KV precision changes the latent layout.
         // Expert-cache / slot sizing is deliberately NOT here - it changes placement, not the state's meaning.
         id << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context
-           << " kv=" << (model.kv_int8() ? "int8" : "fp16");
+           << " kv=" << model.kv_name();
         std::error_code ec;
-        for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
+        // the pack by CONTENT, not sizes: index.txt fully describes the tensor layout (two packs of the
+        // same file sizes can differ), and dense.bin's size+mtime catches a repack the index misses.  This
+        // is the field that refuses a bad repack - the one that cost a night.
+        const auto fnv_file = [](const fs::path& p) -> uint64_t {
+            std::ifstream f(p, std::ios::binary);
+            uint64_t h = 1469598103934665603ull;
+            if (!f) return h;
+            char b[4096];
+            while (f) {
+                f.read(b, sizeof b);
+                const std::streamsize n = f.gcount();
+                for (std::streamsize i = 0; i < n; ++i) {
+                    h ^= (unsigned char) b[i];
+                    h *= 1099511628211ull;
+                }
+                if (n < (std::streamsize) sizeof b) break;
+            }
+            return h;
+        };
+        id << " index.txt:" << fnv_file(fs::path(o.glm_pack) / "index.txt");
+        const auto bin_stamp = [](const fs::path& p) -> uint64_t {
+            std::error_code e2;
+            const auto t = fs::last_write_time(p, e2);
+            return e2 ? 0 : (uint64_t) t.time_since_epoch().count() ^ ((uint64_t) fs::file_size(p, e2) << 32);
+        };
+        id << " dense.bin:" << bin_stamp(fs::path(o.glm_pack) / "dense.bin");
+        for (const char* f : {"native_experts.txt"})
             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
         std::vector<std::string> shards;
         for (const auto& de : fs::directory_iterator(fs::path(o.glm_pack).parent_path(), ec))
@@ -1364,7 +1402,7 @@ static int glm_pack_generate(const Options& o) {
         for (const auto& s : shards) id << " " << s;
         return id.str();
     }();
-    constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
+    constexpr uint64_t kMetaMagic = 0x3253534559414d47ull;   // "GMAYESS2" (2: the .bin's size+mtime recorded)
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     // FNV-1a 64 over a whole file, streamed. A .meta's byte count alone cannot tell a torn or rot-corrupted .bin
     // from a whole one, and a wrong state restored here is silently corrupting rather than loudly broken.
@@ -1396,6 +1434,16 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) &img, 8);
             const uint64_t sum = file_sum(path.substr(0, path.size() - 5) + ".bin");
             f.write((const char*) &sum, 8);
+            {   // the .bin's size and mtime at write: a restore short-circuits the whole-file hash when both
+                // still match (a torn write changes the size, an edit the mtime); the startup index hashes
+                // fully either way, so rot is caught there and a mismatched stamp falls back to the hash
+                const std::string bin = path.substr(0, path.size() - 5) + ".bin";
+                std::error_code e2;
+                const uint64_t bsz = fs::file_size(bin, e2);
+                const uint64_t bmt = e2 ? 0 : (uint64_t) fs::last_write_time(bin, e2).time_since_epoch().count();
+                f.write((const char*) &bsz, 8);
+                f.write((const char*) &bmt, 8);
+            }
             f.write((const char*) &kMetaMagic, 8);
             f.flush();
             if (!f) return false;
@@ -1405,9 +1453,11 @@ static int glm_pack_generate(const Options& o) {
         return !ec;
     };
     // a .meta of this model -> its tokens, the slot's size and its pictures' hash (false: foreign, damaged or not
-    // this model's)
+    // this model's).
+    // full_hash: the whole .bin checksummed (the startup index); false short-circuits it at restore when the
+    // recorded size+mtime still match - a touched file falls back to the hash, never skips it.
     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               uint64_t& img) -> bool {
+                               uint64_t& img, bool full_hash) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
@@ -1416,19 +1466,65 @@ static int glm_pack_generate(const Options& o) {
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
         toks.resize(nt);
-        uint64_t img = 0, sum = 0;
+        uint64_t sum = 0, bsz = 0, bmt = 0;
         if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &img, 8) ||
-            !f.read((char*) &sum, 8) || !f.read((char*) &m1, 8) || m1 != kMetaMagic)
+            !f.read((char*) &sum, 8) || !f.read((char*) &bsz, 8) || !f.read((char*) &bmt, 8) ||
+            !f.read((char*) &m1, 8) || m1 != kMetaMagic)
             return false;
-        // the .bin must still be the bytes this .meta describes - verified here so a torn or rotted file is
-        // refused at indexing and again at restore rather than applied
-        return sum == file_sum(path.substr(0, path.size() - 5) + ".bin");
+        // the .bin must still be the bytes this .meta describes - refused at indexing and again at restore
+        // rather than applied.  At restore (full_hash false) a matching size+mtime skips the whole-file hash:
+        // a torn write changes the size and an edit the mtime, so a mismatch falls back to the hash.
+        const std::string bin = path.substr(0, path.size() - 5) + ".bin";
+        if (!full_hash) {
+            std::error_code e2;
+            const uint64_t now_sz = fs::exists(bin, e2) ? (uint64_t) fs::file_size(bin, e2) : 0;
+            const uint64_t now_mt = e2 ? 0 : (uint64_t) fs::last_write_time(bin, e2).time_since_epoch().count();
+            if (bsz > 0 && bmt != 0 && now_sz == bsz && now_mt == bmt) return true;
+        }
+        return sum == file_sum(bin);
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
         const auto t = fs::last_write_time(p, ec);
         if (ec) return 1e9;
         return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
+    };
+    // stage 2c: one async slot writer.  The D2H copy (slot_save's RAM variant) happens inline - it reads the
+    // device state and must be synchronous, ~25 ms for 160 MB - and the thread only writes bytes we already
+    // hold: tmp, rename, meta.  No device races: the thread never touches the model.  slot_drop, a superseding
+    // save and shutdown join the writer first, so a file being published is never deleted or orphaned.
+    std::thread slot_th;
+    std::shared_ptr<std::vector<uint8_t>> slot_buf;
+    const auto slot_th_join = [&]() {
+        if (slot_th.joinable()) slot_th.join();
+    };
+    const auto slot_th_write = [&](std::shared_ptr<std::vector<uint8_t>> buf, std::vector<int32_t> toks,
+                                   const std::string& path, uint64_t bytes, uint64_t img,
+                                   const std::function<bool(const std::string&, const std::vector<int32_t>&, uint64_t,
+                                                            uint64_t)> meta) {
+        slot_th_join();                       // one writer at a time
+        slot_buf = std::move(buf);
+        const auto b = slot_buf;
+        slot_th = std::thread([b, toks = std::move(toks), path, bytes, img, meta]() {
+            std::error_code ec;
+            {
+                std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
+                if (!f || !f.write((const char*) b->data(), (std::streamsize) b->size()) || !f) {
+                    std::fprintf(stderr, "glm slots: setting the conversation aside failed (writing %s.tmp)\n",
+                                 path.c_str());
+                    std::remove((path + ".tmp").c_str());
+                    return;
+                }
+            }
+            std::filesystem::rename(path + ".tmp", path, ec);
+            if (ec || !meta(path, toks, bytes, img)) {
+                std::error_code e2;
+                std::filesystem::remove(path + ".tmp", e2);
+                std::filesystem::remove(path, e2);
+                std::fprintf(stderr, "glm slots: setting the conversation aside failed (publishing %s)\n",
+                             path.c_str());
+            }
+        });
     };
     // NOTE lines on stdout: the server shows them in its own log (what happens to the conversations)
     const auto note = [&](const std::string& m) {
@@ -1447,6 +1543,7 @@ static int glm_pack_generate(const Options& o) {
         double restore_ms = 0.0, saved_s = 0.0;
     } pc;
     double prefill_toks = 0.0;   // EWMA of the prompt path's tok/s (0.9/0.1)
+    fs::path prefill_ewma_path;   // stage 2B: the EWMA survives restarts (beside the slots; set with slot_dir)
     if (slot_max > 0 && slot_ram)
         note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
     if (slot_max > 0 && !slot_ram) {
@@ -1454,6 +1551,19 @@ static int glm_pack_generate(const Options& o) {
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
+        // stage 2B: a cache HIT means nothing prefilled, so the PP line never ran and the EWMA stayed 0 - the
+        // accounting reported saved~0 for a restore that avoided a real prefill.  The EWMA persists beside the
+        // slots, keyed by kv/k/ctx: a rate from another configuration is refused (re-seeded), never reused.
+        prefill_ewma_path = slot_dir / "prefill.ewma";
+        {
+            std::ifstream f(prefill_ewma_path);
+            double v = 0;
+            std::string kv_f, k_f, ctx_f;
+            if (f >> v >> kv_f >> k_f >> ctx_f && v > 0.0 && kv_f == "kv=" + o.kv &&
+                k_f == "k=" + std::to_string(model.geometry().n_exp_used) &&
+                ctx_f == "ctx=" + std::to_string(o.max_context))
+                prefill_toks = v;
+        }
         struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; };
         std::vector<Found> found;
         size_t refused = 0;
@@ -1470,7 +1580,7 @@ static int glm_pack_generate(const Options& o) {
             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
             Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec), kNoImages};
             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            if (meta_read(p, fd.toks, fd.bytes, fd.img) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+            if (meta_read(p, fd.toks, fd.bytes, fd.img, true) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
                 found.push_back(std::move(fd));
             } else {
                 ++refused;
@@ -1511,6 +1621,7 @@ static int glm_pack_generate(const Options& o) {
         }
     }
     const auto slot_drop = [&](size_t i) {
+        slot_th_join();                           // never delete a file the writer is publishing
         if (slots[i].data)                       // a RAM slot: its buffer simply dies
             slots[i].data.reset();
         else {
@@ -1582,15 +1693,16 @@ static int glm_pack_generate(const Options& o) {
         const std::string path = (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) +
                                               ".bin")).string();
         std::string e;
-        const uint64_t bytes = model.slot_save(path + ".tmp", e);
-        if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
-            !meta_write(meta_of(path), snap_tokens, bytes, snap_img_hash)) {
-            std::filesystem::remove(path + ".tmp", ec);
-            std::filesystem::remove(path, ec);
+        // stage 2c: the D2H copy inline (the RAM variant of slot_save), the NVMe write on the side thread
+        auto buf = std::make_shared<std::vector<uint8_t>>();
+        buf->reserve(1 << 20);
+        const uint64_t bytes = model.slot_save(*buf, e);
+        if (bytes == 0) {
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
-                         e.empty() ? "writing its files" : e.c_str());
+                         e.empty() ? "the state did not copy" : e.c_str());
             return;
         }
+        slot_th_write(std::move(buf), snap_tokens, path, bytes, snap_img_hash, meta_write);
         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
         slots.back().img = snap_img_hash;
         snap_in_slot = true;
@@ -1628,8 +1740,10 @@ static int glm_pack_generate(const Options& o) {
         // restore, and a corrupted state applied here would be silently corrupting rather than loudly broken
         if (!slots[best].data) {
             std::vector<int32_t> vt;
-            uint64_t vb = 0;
-            if (!meta_read(meta_of(slots[best].path), vt, vb)) {
+            uint64_t vb = 0, vimg = kNoImages;
+            // the .meta must still be this slot's: its identity, its checksum (the whole file only when the
+            // recorded size+mtime moved) and the pictures the state was taken with
+            if (!meta_read(meta_of(slots[best].path), vt, vb, vimg, false) || vimg != slots[best].img) {
                 note("refused " + slots[best].path + " at restore (identity or checksum failed) - reading its prompt again");
                 slot_drop(best);
                 snap_tokens.clear();
@@ -1667,11 +1781,17 @@ static int glm_pack_generate(const Options& o) {
             pc.restore_ms += cms;
             pc.saved_s += prefill_toks > 0.0 ? (double) len / prefill_toks : 0.0;
             char a[224];
-            std::snprintf(a, sizeof a,
-                          "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~%.0f s (prefill EWMA %.0f tok/s)",
-                          (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
-                          (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms, pc.saved_s,
-                          prefill_toks);
+            if (prefill_toks > 0.0)
+                std::snprintf(a, sizeof a,
+                              "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~%.0f s (prefill EWMA %.0f tok/s)",
+                              (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
+                              (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms, pc.saved_s,
+                              prefill_toks);
+            else   // stage 2B: zero only ever means zero MEASURED - unmeasured prints ~?, never ~0
+                std::snprintf(a, sizeof a,
+                              "cache: ram=%llu disk=%llu miss=%llu bytes=%.2f GB restore=%.0f ms saved~? s (no prefill rate measured yet)",
+                              (unsigned long long) pc.ram_hits, (unsigned long long) pc.disk_hits,
+                              (unsigned long long) pc.misses, (double) pc.bytes / 1e9, pc.restore_ms);
             note(a);
         }
         note(m);
@@ -1919,6 +2039,17 @@ static int glm_pack_generate(const Options& o) {
                 {   // the EWMA the cache's "saved" figure is computed from: the engine's own rate
                     const double tps = (double) done / (ms / 1000.0 + 1e-9);
                     prefill_toks = prefill_toks > 0.0 ? 0.9 * prefill_toks + 0.1 * tps : tps;
+                    // stage 2B: persist it (atomic tmp+rename, the slots' own discipline)
+                    if (!prefill_ewma_path.empty()) {
+                        std::error_code wec;
+                        const std::string tmp = prefill_ewma_path.string() + ".tmp";
+                        std::ofstream w(tmp, std::ios::binary | std::ios::trunc);
+                        w << prefill_toks << " kv=" << o.kv << " k=" << model.geometry().n_exp_used
+                          << " ctx=" << o.max_context << "\n";
+                        w.flush();
+                        if (!w) std::remove(tmp.c_str());
+                        else std::filesystem::rename(tmp, prefill_ewma_path, wec);
+                    }
                 }
                 std::fflush(stdout);
             };
@@ -4353,9 +4484,11 @@ static int glm_pack_generate(const Options& o) {
                 bind_ctx(c);
                 slot_put(" on shutdown");
             }
+        slot_th_join();   // stage 2c: the last save publishes before the engine exits
         return 0;
     }
     if (slot_keep && !slot_ram) slot_put(" on shutdown");
+    slot_th_join();   // stage 2c: the last save publishes before the engine exits
     save_profile("quit");   // #477
     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
     return 0;
@@ -4651,6 +4784,9 @@ int main(int argc, char** argv) {
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // --kv q4_0 on the GLM path: stage A parses and keys it (STRATA_GLM_KV_Q4; Glm5Model records INT8
+        // until the stage-B kernel branch, loudly at boot).  Unknown --kv values were refused at parse.
+        if (o.kv == "q4_0" && std::getenv("STRATA_GLM_KV_Q4") == nullptr) set_env("STRATA_GLM_KV_Q4", "1");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
         if (o.kv_resident < 0) {
             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");

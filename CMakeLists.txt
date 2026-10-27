@@ -18,6 +18,62 @@ foreach(_v IN LISTS _maya_cache)
   endif()
 endforeach()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+
+# ---------------------------------------------------------------------------
+# STRATA_STATE_SIGNATURE
+#
+# A digest of the sources that decide what a SERIALIZED CONTEXT STATE MEANS:
+# the state layouts (glm_fast_state.hpp, glm_rows_state.hpp), the state
+# read/write path (glm_fast_path.cu, generate.cpp), the arenas and layout
+# sizes (glm_model.cu/hpp), the graph builders (glm_layer_graphs.hpp), and
+# the kernel that writes the caches (glm_batch.cu - lat_put decides what
+# lands in the serialized latent rows).
+#
+# The slot identity keys on this instead of the project version: STRATA_VERSION
+# is the static project(strata VERSION ...) string and never moves with a Maya
+# release, so nothing else invalidates on a layout-changing rebuild.  Edit a
+# state or graph file and the digest changes, so stale slots refuse loudly on
+# their own; nobody has to remember to bump anything.
+#
+# Deliberately EXCLUDED: the remaining kernels (glm_fast.cu, glm_prefill/
+# glm_window/glm_rows/glm_mtp).  A kernel change perturbs state values in the
+# last bits but does not change what they mean - restoring such a state is
+# resuming across a kernel update.  Add files here if that tradeoff is judged
+# wrong.
+# ---------------------------------------------------------------------------
+file(GLOB STRATA_STATE_SIG_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/glm_fast_state.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/glm_rows_state.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/glm_fast_path.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/glm_model.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/glm_layer_graphs.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/core/glm_model.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/glm_batch.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/program/generate.cpp"
+)
+list(SORT STRATA_STATE_SIG_FILES)
+
+set(STRATA_STATE_SIG_ACC "")
+foreach(_f ${STRATA_STATE_SIG_FILES})
+    file(SHA256 "${_f}" _h)
+    string(APPEND STRATA_STATE_SIG_ACC "${_h}")
+endforeach()
+
+if(STRATA_STATE_SIG_ACC STREQUAL "")
+    # never silently fall back to a constant - every build would look identical and
+    # genuinely incompatible states would restore
+    set(STRATA_STATE_SIGNATURE "unknown")
+    message(WARNING "STRATA_STATE_SIGNATURE: no state sources matched; slot reuse across builds is unsafe")
+else()
+    string(SHA256 STRATA_STATE_SIGNATURE "${STRATA_STATE_SIG_ACC}")
+    string(SUBSTRING "${STRATA_STATE_SIGNATURE}" 0 16 STRATA_STATE_SIGNATURE)
+endif()
+
+add_compile_definitions(STRATA_STATE_SIGNATURE="${STRATA_STATE_SIGNATURE}")
+# re-run configure when any of these change, so the digest cannot go stale
+set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${STRATA_STATE_SIG_FILES})
+message(STATUS "STRATA_STATE_SIGNATURE: ${STRATA_STATE_SIGNATURE}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
