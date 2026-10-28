@@ -49,13 +49,22 @@ __host__ __device__ __forceinline__ float lat4_f(const uint8_t* rec, int kv, int
     return (float) (q - 8) * d;
 }
 
+// the four nibble bytes of word `w` of block `blk` of a record, as one uint32.  NOT a uint32 load: that word sits at
+// rec + blk * 18 + 2 + 4 w, which is 2 (mod 4) aligned whenever blk is even - a 32-bit access there is a
+// misaligned-address fault on the device (it reads fine on the host, which is why it survived until the q4_0 kernel
+// branch first ran for real).  Two 16-bit loads are naturally aligned (2 | 2 + 4 w).
+__host__ __device__ __forceinline__ uint32_t lat4_w32(const uint8_t* rec, int blk, int w) {
+    const uint16_t* h = (const uint16_t*) (rec + blk * 18 + 2 + 4 * w);
+    return (uint32_t) h[0] | ((uint32_t) h[1] << 16);
+}
+
 // values [4 c4, 4 c4 + 4) of a record as 4 FP16 (an FP16 row's uint2 there); 4 values sit in one block, and a
 // 4-value group is entirely in the LOW nibbles of its bytes (groups 0..3 of a block) or entirely in the HIGH ones
 // (groups 4..7) - see lat4_f.
 __host__ __device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, int c4) {
     const int blk = c4 >> 3, g = c4 & 7;             // 8 groups of 4 values a block
     const float d = __half2float(((const __half*) rec)[blk * 9]);
-    const uint32_t w = ((const uint32_t*) (rec + blk * 18 + 2))[g & 3];
+    const uint32_t w = lat4_w32(rec, blk, g & 3);
     const bool hi = g >= 4;                          // elements 16..31 sit in the high nibbles
     __half v[4];
 #pragma unroll
@@ -77,12 +86,11 @@ __host__ __device__ __forceinline__ uint2 lat4_h4(const uint8_t* rec, int kv, in
 __host__ __device__ __forceinline__ uint4 lat4_h8(const uint8_t* rec, int kv, int c8) {
     const int blk = c8 >> 2, g = c8 & 3;             // 4 groups of 8 values a block
     const float d = __half2float(((const __half*) rec)[blk * 9]);
-    const uint32_t* w4 = (const uint32_t*) (rec + blk * 18 + 2);
     const bool hi = g >= 2;                          // elements 16..31 sit in the high nibbles
     __half v[8];
 #pragma unroll
     for (int k = 0; k < 8; ++k) {                    // element k of the group: byte k, word (g & 1) * 2 + k / 4
-        const uint32_t w = w4[(g & 1) * 2 + (k >> 2)];
+        const uint32_t w = lat4_w32(rec, blk, (g & 1) * 2 + (k >> 2));
         const uint8_t b = (uint8_t) (w >> (8 * (k & 3)));
         const int q = hi ? (b >> 4) : (b & 0xF);
         v[k] = __float2half((float) (q - 8) * d);
