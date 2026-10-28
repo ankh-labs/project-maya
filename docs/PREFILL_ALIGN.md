@@ -82,3 +82,28 @@ phase: prefill here (`prefill_align_plan`), decode via `multi_rows` as it alread
 Consequence: a long prefill still stalls other slots' decode for its duration. The mitigations are (a) fewer and
 shorter prefills - the slot cache, which removes prefill entirely on a hit - and (b) this alignment, which stops two
 slots from paying two sweeps. Not slicing.
+
+## Measured under real two-agent load (2026-10-28): chunks are already full, so alignment cannot help long prompts
+
+Sampled `/metrics` every ~0.9 s for 120 s while two agents ran:
+
+- **`active = 2` in 94% of samples** (125/133), `active = 1` in 6%; **`queued` was 0 throughout** - with
+  `--parallel 2` and two clients, the queue never forms and both slots are always busy.
+- **`state = reading` in 133/133 samples**: the engine spent the whole window in prefill, not decode.
+- Only 6 prefill chunks in 120 s, so ~20 s each. One prompt was **7 chunks of 32,768 tokens** (6 x 32,768 +
+  11,847 ~ 208k tokens), each chunk **17-19 s and ~19 GB of expert traffic**.
+
+That last number is the decision-relevant one. The chunk limit is **32,768 tokens** (`--prefill auto, up to 32768`),
+and both agents' chunks are **already at it**. So the proportional-share alignment cannot merge them: two 32k prompts
+would need a 64k chunk. Alignment only pays when chunks are **under-filled** - which is the small-prompt case
+(measured 1.80x at 2 x 1.6k). For the long-context agent workload actually running, the gain would be just the
+rounding waste: 416k tokens of prompt is 13 chunks aligned versus 14 separate (~7%), not 1.8x.
+
+### The lever the data actually points at: chunk size, not alignment
+
+Expert bytes per chunk grow only slowly with tokens (17.16 GB at 19.4k, ~19 GB at 32.8k), so **a larger chunk amortises
+the sweep over more tokens**. Halving the number of chunks for a 208k prompt (14 -> 7) would nearly halve its total
+expert traffic (~270 GB -> ~140 GB for the pair). Whether that is available depends on whether the 32,768 cap is a
+constant or a memory-derived layout limit: `prefill_carve` refuses a chunk whose layout does not fit the lendable
+region, and `--prefill N` / `STRATA_GLM_PREFILL_CHUNK` set the request. **Test `--prefill 65536` before building
+anything else** - it is a config change, and the engine says so itself when a layout does not fit.
