@@ -107,3 +107,33 @@ expert traffic (~270 GB -> ~140 GB for the pair). Whether that is available depe
 constant or a memory-derived layout limit: `prefill_carve` refuses a chunk whose layout does not fit the lendable
 region, and `--prefill N` / `STRATA_GLM_PREFILL_CHUNK` set the request. **Test `--prefill 65536` before building
 anything else** - it is a config change, and the engine says so itself when a layout does not fit.
+
+## RESULT: the chunk cap was the real limiter - `--prefill 65536` is worth ~1.4x on long prompts (2026-10-28)
+
+Tested the hypothesis directly by changing only the chunk cap in the running config.
+
+**65536 (accepted):** `chunks of 65536 tokens, borrowing 13228 MB`, and a 53,507-token prompt then ran as **ONE chunk**:
+
+| prompt | chunks | wall | pcie |
+|---|---|---|---|
+| 53,507 tokens at `--prefill 65536` | **1** | **24.4 s** | **21.37 GB** |
+| the same prompt at `--prefill auto` (32768) | 2 (32,768 + 20,739) | ~35 s (measured 17-19 s + ~17 s) | ~36 GB (measured 19 GB a chunk) |
+
+So raising the cap alone is **~1.4x faster and ~40% fewer expert bytes** on long prompts - and it needs no code change,
+which makes it the cheapest real win found in this whole investigation. It also improves throughput per chunk
+(53.5k tokens / 24.4 s = 2,190 tok/s against 1,873 tok/s at 32k).
+
+**131072 (rejected):** the engine prints `chunks of 131072 tokens, borrowing 23482 MB` and then dies with
+`maya generate: glm fast: the pinned RAM tier did not allocate` - the borrow leaves nothing to pin. So **65,536 is the
+practical ceiling on this box** (48 GB VRAM, 128 GB RAM, 36 GB pool).
+
+Kept at `--prefill 65536`. Note for the record: raising the cap also raises the prefill borrow (8100 -> 13228 MB), so
+a *concurrent* prefill evicts a little more of the expert tier than before; the two-agent sampling above was taken at
+32,768 and is worth repeating at 65,536 with real agents before drawing parallel conclusions.
+
+### What this does to the alignment plan
+
+Alignment's payoff is the *rounding waste* of under-filled chunks. With the cap at 65,536 an agent's 200k prompt is
+4 chunks instead of 7, so there is less rounding to recover - alignment is now worth less, not more. The two changes
+are additive only at the margin; the chunk cap dominates. Do this first, re-measure with real agents, then decide
+whether `gen_admit` alignment is still worth its surgery.
