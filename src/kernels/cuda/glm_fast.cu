@@ -5853,6 +5853,43 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
             std::fprintf(stderr, "glm_fast mv_nt: type %d / %d columns unsupported\n", jobs[i].type, jobs[i].ncol);
             return false;
         }
+    // A BF16 job handed only the q8_1 activation (the rows path: kda_rec's gated_q, with no float copy anywhere) is
+    // refused by mv_inputs_ok, which killed a whole two-conversation batch in multi_fail.  mv() has dequantized such a
+    // job into the scratch float row for a while (q8_1_to_float above); do the same here for ALL the activations at
+    // once - nt rows in one launch, laid out exactly as the per-activation replication below expects (xq advances by
+    // (n_in/32) blocks, xf by n_in floats), so the batch keeps its shared weight reads instead of falling back to one
+    // conversation at a time.
+    MvJob jt[kMaxMvJobs];
+    {
+        int64_t need = 0;
+        for (int i = 0; i < n; ++i) {
+            const MvJob& j = jobs[i];
+            if (j.type == kTypeBF16 && j.xf == nullptr && j.xq != nullptr && j.n_in > 0 && j.n_in % QK8_1 == 0)
+                need += (int64_t) nt * j.n_in;
+        }
+        if (need > 0) {
+            float* scr = (size_t) need * sizeof(float) > kMvXfScratchBytes ? nullptr : mv_xf_scratch();
+            if (scr == nullptr) {
+                std::fprintf(stderr, "glm_fast mv_nt: no scratch for a BF16 job's q8_1 activations (%lld floats)\n",
+                             (long long) need);
+                return false;
+            }
+            for (int i = 0; i < n; ++i) jt[i] = jobs[i];
+            int64_t off = 0;
+            for (int i = 0; i < n; ++i) {
+                MvJob& j = jt[i];
+                if (!(j.type == kTypeBF16 && j.xf == nullptr && j.xq != nullptr && j.n_in > 0 &&
+                      j.n_in % QK8_1 == 0))
+                    continue;
+                q8_1_to_float((const block_q8_1*) j.xq, scr + off, (long long) nt * j.n_in, j.n_in, j.n_in / QK8_1,
+                              s);
+                j.xf = scr + off;
+                j.xf_cstride = j.n_in;
+                off += (int64_t) nt * j.n_in;
+            }
+            jobs = jt;   // (the parameter, not the jobs themselves)
+        }
+    }
     if (!mv_inputs_ok(jobs, n, "mv_nt")) return false;
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
