@@ -294,6 +294,15 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     auto& rows_q = rowq_at;
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
+        // TWO CONVERSATIONS, ONE bf16 PROJECTION (2026-10-28): mv_nt is the multi-row kernel and wants float
+        // activations for a bf16 weight (GGML_TYPE_BF16 = 30), but the rows path only has the q8_1 activations
+        // kda_rec wrote (gated_q) - so rows_layers' kda output projection failed the moment n > 1, which failed the
+        // whole batched step (multi_fail) and both requests died in ~0.08 s with "glm rows: kda output". One
+        // conversation never showed it: n == 1 stays on the single-column path. gf::mv is the token path's kernel: it
+        // takes ncol columns with xq strides, reads a row's weights once for all of them, and handles bf16 against
+        // the q8_1 activations - the same job the token path (glm_fast_path.cu:5735) runs every layer. So fall back
+        // to it rather than fail the step; mv_nt rejects this at a precondition check, so nothing was launched.
+        if (gf::mv(j, nj, s)) return true;
         err = std::string("glm rows: ") + what;
         return false;
     };
@@ -472,6 +481,15 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     auto& rows_q = rowq_at;
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
+        // TWO CONVERSATIONS, ONE bf16 PROJECTION (2026-10-28): mv_nt is the multi-row kernel and wants float
+        // activations for a bf16 weight (GGML_TYPE_BF16 = 30), but the rows path only has the q8_1 activations
+        // kda_rec wrote (gated_q) - so rows_layers' kda output projection failed the moment n > 1, which failed the
+        // whole batched step (multi_fail) and both requests died in ~0.08 s with "glm rows: kda output". One
+        // conversation never showed it: n == 1 stays on the single-column path. gf::mv is the token path's kernel: it
+        // takes ncol columns with xq strides, reads a row's weights once for all of them, and handles bf16 against
+        // the q8_1 activations - the same job the token path (glm_fast_path.cu:5735) runs every layer. So fall back
+        // to it rather than fail the step; mv_nt rejects this at a precondition check, so nothing was launched.
+        if (gf::mv(j, nj, s)) return true;
         err = std::string("glm rows: ") + what;
         return false;
     };
@@ -648,6 +666,15 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     auto& rows_q = rowq_at;
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
+        // TWO CONVERSATIONS, ONE bf16 PROJECTION (2026-10-28): mv_nt is the multi-row kernel and wants float
+        // activations for a bf16 weight (GGML_TYPE_BF16 = 30), but the rows path only has the q8_1 activations
+        // kda_rec wrote (gated_q) - so rows_layers' kda output projection failed the moment n > 1, which failed the
+        // whole batched step (multi_fail) and both requests died in ~0.08 s with "glm rows: kda output". One
+        // conversation never showed it: n == 1 stays on the single-column path. gf::mv is the token path's kernel: it
+        // takes ncol columns with xq strides, reads a row's weights once for all of them, and handles bf16 against
+        // the q8_1 activations - the same job the token path (glm_fast_path.cu:5735) runs every layer. So fall back
+        // to it rather than fail the step; mv_nt rejects this at a precondition check, so nothing was launched.
+        if (gf::mv(j, nj, s)) return true;
         err = std::string("glm rows: ") + what;
         return false;
     };
@@ -839,6 +866,15 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     auto& rows_q = rowq_at;
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
+        // TWO CONVERSATIONS, ONE bf16 PROJECTION (2026-10-28): mv_nt is the multi-row kernel and wants float
+        // activations for a bf16 weight (GGML_TYPE_BF16 = 30), but the rows path only has the q8_1 activations
+        // kda_rec wrote (gated_q) - so rows_layers' kda output projection failed the moment n > 1, which failed the
+        // whole batched step (multi_fail) and both requests died in ~0.08 s with "glm rows: kda output". One
+        // conversation never showed it: n == 1 stays on the single-column path. gf::mv is the token path's kernel: it
+        // takes ncol columns with xq strides, reads a row's weights once for all of them, and handles bf16 against
+        // the q8_1 activations - the same job the token path (glm_fast_path.cu:5735) runs every layer. So fall back
+        // to it rather than fail the step; mv_nt rejects this at a precondition check, so nothing was launched.
+        if (gf::mv(j, nj, s)) return true;
         err = std::string("glm rows: ") + what;
         return false;
     };
