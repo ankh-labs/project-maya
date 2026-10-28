@@ -620,7 +620,13 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     // mean for +0.0083 KLD, still ahead of Unsloth by 0.0095 - see configs/GLM-5.3-Flash-dsqv3q-s56-v6m-k7.bat).
     // Only ever LOWERED: the per-layer scratch, the stage rows and the CPU/VRAM slot math are sized from this
     // value before any tensor is read, so raising it above the pack's would under-allocate.
-    if (const char* ku = getenv("MAYA_GLM_EXPERT_USED")) {
+    // Both spellings: the engine has always read MAYA_GLM_EXPERT_USED, but tools/maya_names.py rewrites a config's
+    // "env" from MAYA_* to STRATA_* (that is what the code is supposed to read), so a CONFIG could never reach this
+    // setting - only a launcher could, and the Maya UI picker would silently run the pack's own k.  Accept either;
+    // the legacy MAYA_ name still wins when both are set.
+    const char* ku = getenv("MAYA_GLM_EXPERT_USED");
+    if (ku == nullptr) ku = getenv("STRATA_GLM_EXPERT_USED");
+    if (ku != nullptr) {
         const int k = std::atoi(ku);
         const int was = out.n_exp_used;
         if (k < 1 || k > was) {
