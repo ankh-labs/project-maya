@@ -1,0 +1,77 @@
+{
+  "exe": "G:\\AI\\maya-eval\\project-maya\\build\\maya.exe",
+  "args": [
+    "--glm-pack",
+    "G:\\AI\\dsquant-work\\gguf\\v3q\\pack-repack-20261027",
+    "--max-context",
+    "524288",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--kv-streaming",
+    "on",
+    "--expert-profile",
+    "G:\\AI\\maya-eval\\project-maya\\data\\expert-profile-glm.bin",
+    "--vram-reserve-mib",
+    "512",
+    "--parallel",
+    "2",
+    "--kv",
+    "q4_0"
+  ],
+  "cwd": "G:\\AI\\maya-eval\\project-maya",
+  "tokenizer": "G:\\AI\\dsquant-work\\gguf\\v3q\\pack-repack-20261027\\tokenizer",
+  "model_name": "glm-5.3-flash",
+  "gpu": [
+    0
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "penalty_last_n": 64
+  },
+  "reasoning_effort": "high",
+  "lib_dirs": [
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin",
+    "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin\\x64"
+  ],
+  "port": 8080,
+  "log": "G:\\AI\\maya-eval\\project-maya\\maya-v3q-q4.log",
+  "installer": {
+    "models_dir": "G:\\AI\\maya-eval\\Maya-data\\models",
+    "quant": "v3q q4_0 KV (streaming - correct)",
+    "gguf": "G:\\AI\\dsquant-work\\gguf\\v3q\\GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+    "gguf_dir": "G:\\AI\\dsquant-work\\gguf\\v3q",
+    "draft": "mtp",
+    "written": "2026-10-26 20:22",
+    "as_set_up": {
+      "context": 262144,
+      "gpus": [
+        0
+      ],
+      "env": {},
+      "images": false,
+      "reserve_mib": null,
+      "parallel": 1,
+      "draft": "mtp",
+      "expert_cache": null,
+      "prefill": null,
+      "kv_streaming": true,
+      "kv_resident": null
+    }
+  },
+  "env": {
+    "MAYA_GLM_SLOT_KEEP": "1",
+    "MAYA_GLM_SLOT_DIR": "G:\\AI\\maya-eval\\scratch\\slots",
+    "MAYA_GLM_SLOTS": "20",
+    "MAYA_GLM_SLOT_MIN": "1024",
+    "MAYA_GLM_SLOT_GB": "24",
+    "MAYA_GLM_EXPERT_USED": "7"
+  }
+}
