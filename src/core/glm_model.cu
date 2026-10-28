@@ -3416,13 +3416,19 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // rotation's butterfly needs kv_lora == blockDim (512) exactly - refused loudly otherwise - and q4_0 has no
     // kernel branch on HIP builds yet (the f16q prompt attention has no rotation for its FP16 queries).
     lat_records_ = lat_type_;
-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
+    // lat_q8_ is the tri-state the kernels dispatch on (0 = FP16 rows, 1 = INT8 records, 2 = q4_0 records of the
+    // rotated row) - NOT a flag.  A two-way `lat_records_ != fp16` here hands every q4_0 config 1, so every q4_0
+    // kernel branch (the readers, lat_put's rotation, the ctx de-rotations) stays dead while lat_rec_bytes and the
+    // arenas are sized for q4_0's 288-byte rows.  Resident that is invisible - the records are written and read at
+    // lat8's 272 and the slack is never touched - but KV streaming's resolve copies whole `row_bytes` rows, so
+    // every row lands 16 bytes further along than the last and the streamed cache decodes garbage.
+    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 ? (int) lat_records_ : 0;
     if (lat_type_ == LatType::q4_0 && g_.kv_lora != 512) {
         std::fprintf(stderr, "glm pack: CUDA%d --kv q4_0 refused: the Hadamard rotation needs kv_lora 512, this "
                              "pack has %d\n", dev_, g_.kv_lora);
         lat_type_ = want_int8 ? LatType::int8 : LatType::fp16;
         lat_records_ = lat_type_;
-        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && lat_records_ != LatType::fp16;
+        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 ? (int) lat_records_ : 0;
     }
 #if defined(STRATA_USE_HIP)
     if (lat_type_ == LatType::q4_0) {
@@ -3430,7 +3436,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                              "attention) - recording INT8, named truthfully\n");
         lat_type_ = LatType::int8;
         lat_records_ = LatType::int8;
-        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0;
+        lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 ? (int) lat_records_ : 0;
     }
 #endif
     if (lat_type_ == LatType::q4_0)
