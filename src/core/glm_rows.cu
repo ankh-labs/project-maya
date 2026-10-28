@@ -867,13 +867,30 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         return false;
     }
     if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;   // (each sequence's pinned embedding row)
+    FastState* F = fast_;
+    RowsState* S = rows_;
+    // BF16 KDA OUTPUT (2026-10-28): rows_layers' kda output projection is a bf16 weight, and the rows path only ever
+    // has kda_rec's q8_1 activations (gated_q) - no float ones.  mv_nt, the multi-row kernel, has only the
+    // row_dot_bf16_cols form and refuses a bf16 job without xf ("mv_nt: a type 30 job without its float activations"),
+    // while the single-column mv falls back to any_row_dot, which does handle a q8 activation.  So a step of TWO or
+    // more conversations failed outright and generate.cpp's multi_fail killed the whole batch (both requests died in
+    // ~0.08 s with "glm rows: kda output"); one conversation never showed it (n == 1 stays on mv).  Until that job is
+    // given float activations, decode such a batch one row at a time: every row's arithmetic is exactly the n == 1
+    // step's, so the outputs are identical - we only lose the shared weight reads.
+    if (n > 1) {
+        bool bf16_out = false;
+        for (int il = l0_; il < l1_ && !bf16_out; ++il) bf16_out = F->L[(size_t) il].out.type == 30;   // GGML_TYPE_BF16
+        if (bf16_out) {
+            for (int i = 0; i < n; ++i)
+                if (!multi_rows(seqs + i, tokens + i, sps + i, 1, tokens_out + i, err)) return false;
+            return true;
+        }
+    }
     cudaSetDevice(dev_);
     // between steps (the device idle): finished promotions go live and the layers get fresh spare slots, as the
     // token path does between tokens - every 32 steps instead, the spares ran dry and the VRAM tier stopped following
     // the routes (two conversations on a V100 streaming its experts from RAM: 27.1 tok/s in all against 34.2)
     if (!fast_boundary(err)) return false;
-    FastState* F = fast_;
-    RowsState* S = rows_;
     // (the token path's profiler collects one token's marks at a time: none from a batched step)
     struct ProfOff {
         FastState* F;
