@@ -110,3 +110,31 @@ deferred.
 Also measured, and consistent with the prefill findings: two concurrent requests still cost about 2x one prompt of
 prefill (6.08 s against 2 x 3.03 s), because `gen_admit` prefills each request as it admits it. That is the seam where
 prefill alignment has to go in.
+
+## Measured: token path vs prefill for a short prompt (2026-10-28, `STRATA_GLM_PREFILL_MIN` set high to force it)
+
+| prompt tokens | token path wall | prefill wall (measured elsewhere) |
+|---|---|---|
+| 39 | 2.27 s | - |
+| 67 | 2.69 s | - |
+| 147 | - | 1.52 s |
+| 311 | 10.88 s | - |
+| 1,594 | 46.48 s | ~2.7 s (extrapolated at 0.33 ms/token + 2.16 s) |
+
+Least squares on the token-path points: **~1.7 s fixed + ~15 ms/token** (about 66 tok/s marginal). Prefill is
+2.16 s + 0.33 ms/token. They cross at **~32 tokens** (0.47 s of difference over 0.0147 s/token); the earlier ~65
+estimate assumed 30 tok/s for the token path and was too pessimistic.
+
+Consequences, and they are not what I expected:
+
+1. **Streaming a short prompt through the decode path is not a latency win.** The token path carries a ~1.7 s fixed
+   cost of its own, so a 39-token prompt costs 2.27 s streamed against ~1.5-2.2 s prefilled. The existing default
+   `prefill_min_n = 8` is already close to the right threshold; ~32 would be marginally better and no more.
+2. **Its real value is non-blocking**, which is a different argument: a streamed prompt never borrows the pool, so it
+   cannot evict the expert tier the parallel requests are reading from. That matters for *queue* behaviour (a cheap
+   request can be promoted without hurting the ones running), not for that request's own speed.
+3. **The unexplained piece is the ~1.7 s fixed cost in the token path.** A 39-token request should be near-instant at
+   21-30 tok/s of decode. Something per request costs ~1.7 s before any useful work: slot restore/save, the
+   system-prompt handling ("saved a 7985-token conversation ... for other chats that start with it"), or engine
+   setup. That is on the critical path of every small agent turn and is worth chasing before any scheduling work -
+   if it is avoidable, it is worth more than every scheduling idea in this document.
