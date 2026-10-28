@@ -857,6 +857,7 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
 }
 
 void Glm5Model::reset() {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     if (!loaded_) return;
     cudaSetDevice(dev_);
     // The state zeroed on the stream that reads it next, and waited for: the fast path's streams are non-blocking, so
@@ -1021,6 +1022,7 @@ Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
 
 bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& logits_out,
                         std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     if (!loaded_) {
         err = "glm5_model: not loaded";
         return false;

@@ -529,6 +529,14 @@ public:
     std::vector<StageJob> stage_q_;
     std::vector<std::thread> stage_workers_;
     std::mutex stage_mu_;
+    // ONE MODEL STEP AT A TIME (2026-10-28).  prefill, the batched rows step and the token path all write the same
+    // FastState / RowsState scratch (rows_scr, S->gated_q, S->mixer, the kda prep/rec state, the expert pool's plan
+    // and spares).  Nothing below serialised them, so two requests in flight - a prompt read beside another's step -
+    // corrupted that scratch and surfaced as "glm rows: kda output" (10 dead requests of 62 on 2026-10-28, all ~0
+    // tok/s).  Recursive because a step entry may call another (forward -> fast).  Held per STEP, not per request, so
+    // the batched path (multi_rows over every ready conversation, one weight read for all) still merges requests
+    // instead of serialising them.
+    std::recursive_mutex step_mu_;
     std::condition_variable stage_cv_, stage_done_cv_;
     int stage_pending_ = 0;
     bool stage_quit_ = false;

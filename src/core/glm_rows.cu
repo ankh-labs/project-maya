@@ -862,6 +862,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
 
 bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                            int* tokens_out, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     if (!rows_ok() || n_parts_ != 1 || seq_.empty() || n < 1 || n > rows_max()) {
         err = "glm rows: not available here (one GPU, several sequences, 1.." + std::to_string(rows_max()) + " rows)";
         return false;
@@ -922,6 +923,7 @@ bool Glm5Model::split_rows_ok() const {
 
 bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
                                  const strata::kernels::SamplerParams* sps, int n, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     if (!split_rows_ok() || n < 1 || n > rows_max()) {
         err = "glm rows: the split batch is not available here (every part's row arena, 1.." +
               std::to_string(rows_max()) + " rows)";

@@ -4219,6 +4219,7 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
 }
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     err.clear();
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;

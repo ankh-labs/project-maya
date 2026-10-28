@@ -215,6 +215,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
 }
 
 bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::SamplerParams& sp, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     if (s < 0 || s >= seq_count() || seq_.empty()) {
         err = "glm multi: no sequence " + std::to_string(s);
         return false;
@@ -287,6 +288,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
 }
 
 int Glm5Model::multi_take(int s, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     SeqCtx& ct = tail->seq_[(size_t) s];
@@ -306,6 +308,7 @@ int Glm5Model::multi_take(int s, std::string& err) {
 }
 
 bool Glm5Model::multi_boundary(std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         if (!m->fast_boundary(err)) return false;

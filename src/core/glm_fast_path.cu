@@ -7264,6 +7264,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 }
 
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     // Read the whole slot into one buffer across N streams. A single sequential read reached only
@@ -7495,6 +7496,7 @@ uint64_t Glm5Model::slot_save(std::vector<uint8_t>& data, std::string& err) {
 }
 
 bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err) {
+    std::lock_guard<std::recursive_mutex> step_lk_(step_mu_);   // (one step at a time: see step_mu_)
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     size_t pos = 0;
