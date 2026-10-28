@@ -49,3 +49,37 @@ arrival order*.
   in principle the count is known; it needs confirming that it is available early enough to decide with.
 - **Whether promotion ever beats waiting.** Measure both under the same arrival pattern: promote-on-arrival vs
   wait-behind, with total turn time as the metric, not tok/s.
+
+## Streaming a short prompt through the decode batch (user idea, 2026-10-28)
+
+For a request whose prompt is a cache hit plus a short tail, there is a third option besides "prefill it now" and
+"wait behind": **feed the tail through the decode batch**, one token a step, so the new request catches up to the
+phase the running ones are already in. No prefill phase is entered at all, so nothing is evicted - which is the whole
+problem with promoting a prefill.
+
+The engine already has the seed of this: `prefill` declines below `prefill_min_n` (`glm_prefill.cu:4231`, default 8)
+and the token path steps the tokens instead. The change would be to raise that threshold and to do it **inside the
+shared step loop** (`multi_step` / `multi_rows`) rather than as a blocking call, so the new request's tokens ride
+along in batches that were going to run anyway.
+
+Crossover, from the measured constants:
+
+- prefill: `2.16 s + 0.33 ms/token`, and it evicts the expert tier for the duration (a cost to everyone else);
+- streamed through decode: ~`45 ms` a token (21.7 tok/s) at the *sole* user's rate, but as *extra rows in a batch
+  that is already running* the marginal cost is far lower - the batch pays for the experts once either way.
+
+So even at the pessimistic 45 ms/token, 8 tokens cost 0.36 s against a 2.2 s prefill; the two are equal around
+**~48 tokens** (2.16 s / 0.045 s), and the real crossover is higher because streamed tokens share an existing batch.
+A threshold in the **50-200 token** range therefore looks right, and it should be treated as a measured constant like
+`prefill_min_n`, not a guess.
+
+Second-order benefit: a streamed prompt never borrows the pool, so it cannot evict the tier that the decoding
+requests are reading from - the failure mode that made promotion expensive in the first place.
+
+Question to settle by measurement: whether `multi_rows` can take a request whose pending token is a *prompt* token
+(the rows path is built for one new token a conversation; a prompt tail is the same shape, just longer) - if so this
+is a scheduling change, not a kernel change.
+
+Note the CPU variant the user also raised: a full CPU forward for a short prompt would need a CPU path for the mixer
+and attention, which this engine does not have (its CPU lane covers a *subset of MoE experts*, not a whole step).
+The GPU-batch version above gets the same "catch up without a phase change" benefit using machinery that exists.
