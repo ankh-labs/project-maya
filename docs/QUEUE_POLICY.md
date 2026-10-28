@@ -83,3 +83,30 @@ is a scheduling change, not a kernel change.
 Note the CPU variant the user also raised: a full CPU forward for a short prompt would need a CPU path for the mixer
 and attention, which this engine does not have (its CPU lane covers a *subset of MoE experts*, not a whole step).
 The GPU-batch version above gets the same "catch up without a phase change" benefit using machinery that exists.
+
+## Measured: where the queue actually is (2026-10-28)
+
+Sampling `/metrics` while two and four clients ran concurrently:
+
+| clients | engine `live.active` | engine `queued` | requests that reached the engine |
+|---|---|---|---|
+| 2 | **2** | 1 (momentarily) | 2 |
+| 4 | 1-2 | 0 | **2** (the other two never arrived) |
+
+So:
+
+- **Engine-level parallel does engage**: `active=2` with `--parallel 2`. The batched decode path is live.
+- **The engine's `pending` deque is not the queue in practice.** `admit_pending` only runs when `pending` is
+  non-empty, and my probe inside it logged nothing across dozens of requests even with four clients - because the
+  fourth/second requests are held in the **serve layer**, not in the engine. That matches `serve/server.py`'s own
+  module doc ("one sequence at a time behind a FairLock").
+- **A third and fourth client is where the queue forms**, and it forms in Python.
+
+Consequence for the policy: the admission decision described above has to be made in `serve/server.py` (or the
+engine's `pending` has to become the real queue). Deciding it in the engine would mean reworking how GEN lines are
+admitted, because today an admitted request goes straight to `gen_admit` and only a request that does not fit is
+deferred.
+
+Also measured, and consistent with the prefill findings: two concurrent requests still cost about 2x one prompt of
+prefill (6.08 s against 2 x 3.03 s), because `gen_admit` prefills each request as it admits it. That is the seam where
+prefill alignment has to go in.
