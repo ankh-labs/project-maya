@@ -188,10 +188,13 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
     const bool verbose = std::getenv("STRATA_HIPBLASLT_VERBOSE") != nullptr;
     const auto* row = state.table.closest(type, n, k, ldy, t);
     if (!row) {
-        if (verbose) {
-            std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d\n",
-                         type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy);
-        }
+        // A miss is not harmless: the heuristic can be several times slower than a
+        // tuned solution, and it is silent. GLM's projections ran at ~1.4% of fp16
+        // peak on gfx1151 for want of four rows here, which no log line showed.
+        // The cache above means this prints once per distinct shape.
+        std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d "
+                             "(tune it: tune_hipblaslt --shape %d,%d,%d)\n",
+                     type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy, t, n, k);
         return state.cache.emplace(key, resolved).first->second;
     }
 
