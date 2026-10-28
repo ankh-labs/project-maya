@@ -278,6 +278,64 @@ int moe_window_rows(size_t T, const Glm5Geometry& g) {
     return (int) std::min(all, env > 0 ? std::max(floor, (size_t) env) : floor);
 }
 
+// ---- PREFILL ALIGN (STRATA_GLM_PREFILL_ALIGN, off by default; docs/PREFILL_ALIGN.md)
+//
+// Slots that are all waiting at the prompt stage can share ONE chunk, so the expert sweep and the mixer pass are paid
+// once instead of once a slot.  Measured (report 9y): two distinct 1.6k prompts prefilled apart cost 23.01 GB over
+// PCIe and 5,512 ms of wall; the same two in one chunk cost 10.94 GB and 3,057 ms (1.80x).  The sweep is a fixed
+// cost per chunk rather than per token (the same text at 1x/2x/3x tokens: 12.22 / 11.52 / 12.09 GB), which is why
+// the cheapest schedule is the one with the fewest chunks.
+bool prefill_align_on() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_ALIGN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// One batch of an aligned chunk: n tokens of slot.
+struct AlignStep {
+    int slot = 0;
+    int n = 0;
+};
+
+// The batch plan for slots with prompt lengths lens[s] and a batch target b: batch i carries a share of EACH slot
+// proportional to its prompt, so every slot finishes on the last batch and no slot is left with a private, ragged
+// tail batch - a tail batch pays a whole expert sweep for a few tokens.  A batch that comes up short because a slot
+// ran out tops itself up from the slot with the most left.  Writes (slot, n) pairs, a batch at a time in slot order,
+// and returns how many pairs it wrote (0: nothing to do).
+int prefill_align_plan(const int64_t* lens, int nslots, int b, AlignStep* out, int cap) {
+    constexpr int kMaxSlots = 16;
+    if (lens == nullptr || out == nullptr || nslots < 1 || nslots > kMaxSlots || b < 1 || cap < 1) return 0;
+    int64_t left[kMaxSlots] = {};
+    int64_t total = 0;
+    for (int s = 0; s < nslots; ++s) {
+        left[s] = std::max<int64_t>(0, lens[s]);
+        total += left[s];
+    }
+    if (total <= 0) return 0;
+    int64_t remaining = total;
+    int k = 0;
+    while (remaining > 0 && k + nslots <= cap) {
+        int taken = 0;
+        for (int s = 0; s < nslots && k < cap; ++s) {
+            if (left[s] <= 0) continue;
+            const int share = (int) ((double) b * (double) lens[s] / (double) total + 0.5);
+            int n = (int) std::min<int64_t>(left[s], (int64_t) std::max(1, share));
+            if (taken + n > b) n = b - taken;          // (the batch target is a maximum)
+            if (n <= 0) continue;
+            out[k].slot = s;
+            out[k].n = n;
+            ++k;
+            left[s] -= n;
+            remaining -= n;
+            taken += n;
+        }
+        if (taken == 0) break;                          // (nothing could be given: do not spin)
+    }
+    return k;
+}
+
 // the MoE runs on the WHOLE chunk (every expert's weights are read once per chunk); the shared expert in sub-batches
 struct MoeBufs {
     float *logits, *rw, *OUTP, *OUTPc;
@@ -1420,6 +1478,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
                  (double) S->borrow_bytes / 1048576.0, (double) S->arena_bytes / 1048576.0,
                  (double) (w16_elems * 2 + w32_elems * 4) / 1048576.0, (double) S->gbuf_bytes / 1048576.0,
                  (double) S->pbuf_bytes / 1048576.0, S->NP, S->nland, (double) S->nland * (double) gstride / 1048576.0);
+    if (prefill_align_on())
+        std::fprintf(stderr, "glm prefill: CUDA%d ALIGNMENT ON (STRATA_GLM_PREFILL_ALIGN): up to %d slots share a %d "
+                             "token chunk, in proportional shares - see docs/PREFILL_ALIGN.md\n",
+                     dev_, 8, S->T);
     return true;
 }
 
