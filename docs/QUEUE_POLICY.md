@@ -138,3 +138,18 @@ Consequences, and they are not what I expected:
    system-prompt handling ("saved a 7985-token conversation ... for other chats that start with it"), or engine
    setup. That is on the critical path of every small agent turn and is worth chasing before any scheduling work -
    if it is avoidable, it is worth more than every scheduling idea in this document.
+
+## Correction: there is no universal per-request floor (2026-10-28, later)
+
+A minimal request (`"hi"`, 13 prompt tokens, 5 out) completes in **0.89 s**: prefill `12 tokens in 475.5 ms`, decode
+5 tokens in 0.2 s. So the ~1.7 s intercept inferred for the token path above is **not** a per-request floor of the
+engine - those measurements came from fresh conversations whose slot behaviour differed (restore/save and the
+system-prompt slot), not from a fixed cost in the step path.
+
+What actually happens is that prefill cost grows with the *chunk it rounds to* and with what the tier has to fetch:
+`12 tokens -> 475 ms`, `147 -> 1,517 ms`, `2,097 -> 2,856 ms`. The 2.16 s constant in 9w is the large-chunk case,
+not a per-request tax - a warm, tiny turn is genuinely fast.
+
+Practical consequence for the queue policy: a small queued request is cheap to promote **when the tier is warm and
+its chunk is small**, which supports the "cheap promotion first" branch, but the decision has to be based on the
+request's own expected chunk (its new-token count), not on a blanket assumption that any request costs ~2 s.
