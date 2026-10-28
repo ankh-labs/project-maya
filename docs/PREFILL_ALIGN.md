@@ -60,17 +60,25 @@ Two distinct ~5k prompts, engine idle, fresh text each arm:
 Plus: single-request prefill must be **byte-identical** to the flag-off path (same chunk line bytes and wall within
 noise), and the battery must stay 7/7. Any deviation on the single-request path means the flag is not gated correctly.
 
-## The decode side of the same idea (not implemented)
+## The decode side: interleaving the two phases is NOT viable here (corrected)
 
-Decode is already aligned by construction: `multi_rows` takes every slot that has a token pending and steps them in
-one launch, one token each, so slots share the expert fetch and the mixer pass without any scheduling work.
+Decode is already aligned within its own phase: `multi_rows` takes every slot with a token pending and steps them in
+one launch, one token each, so slots share the expert fetch and the mixer pass with no scheduling work.
 
-What decode *is* missing is protection from prefill: while one slot streams a 5k prompt, every other slot's decode
-stalls for seconds, because prefill is issued as one long call. The same batch target `b` fixes this: issue prefill in
-slices of `b` tokens and call `multi_rows` between slices, so the other slots keep generating at ~21 tok/s while a
-long prompt streams. The slice size that minimises expert sweeps (4-8k, the flat part of the bytes curve) is also
-small enough that a decode step between slices is a cheap interruption - the two payoffs come from the same knob.
+An earlier revision of this file proposed slicing prefill and running `multi_rows` between slices so a long prompt
+would not starve other slots' decode. **That is wrong for this engine** (user, 2026-10-28): the two phases have
+incompatible VRAM layouts by design.
 
-Order of work: the alignment itself needs the per-row (seq, base, pos) work above; prefill slicing needs only a call
-site change (a slice boundary is a place to call `multi_rows`), so it is the easier of the two and independently
-useful.
+- **Prefill** borrows ~90% of the pool for the chunk's work buffers, and the borrow **evicts the expert tier** to get
+  the space - that is what `PrefillState::dropped` counts, and it is why no residency survives a prefill (measured:
+  three near-identical prompts cost 11.10 / 11.55 / 11.44 GB, never less).
+- **Decode** needs the opposite layout: the expert tier resident in VRAM so a step reads weights from VRAM rather
+  than PCIe.
+
+Interleaving them would evict on every slice boundary and reload for every decode step - the eviction/reload cycle
+would cost far more than the stall it tries to hide. So the phases stay separated, and alignment belongs **inside** a
+phase: prefill here (`prefill_align_plan`), decode via `multi_rows` as it already does.
+
+Consequence: a long prefill still stalls other slots' decode for its duration. The mitigations are (a) fewer and
+shorter prefills - the slot cache, which removes prefill entirely on a hit - and (b) this alignment, which stops two
+slots from paying two sweeps. Not slicing.
