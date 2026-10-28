@@ -153,3 +153,34 @@ not a per-request tax - a warm, tiny turn is genuinely fast.
 Practical consequence for the queue policy: a small queued request is cheap to promote **when the tier is warm and
 its chunk is small**, which supports the "cheap promotion first" branch, but the decision has to be based on the
 request's own expected chunk (its new-token count), not on a blanket assumption that any request costs ~2 s.
+
+## Two scheduler rules from the user (2026-10-28)
+
+### Rule 1 - the length test: do not interleave prompts that cannot share a chunk
+
+If the prompts waiting to be prefilled do not fit one chunk together, there is nothing to share and interleaving only
+adds bookkeeping. So the test is a simple length comparison, and it belongs at the top of any alignment attempt:
+
+    align(slots)  if sum(p_s) <= Tmax        (Tmax = the chunk cap, now 65536)
+    serial(slots) otherwise                  (one prompt at a time, ordinary chunking)
+
+Measured justification: expert bytes are a fixed cost per chunk, so sharing requires the prompts to *be* in one
+chunk. With Tmax = 32768 two 1.6k prompts cost 10.94 GB aligned against 23.01 GB apart (1.80x), while two 208k
+prompts cannot be aligned at all - they are 4 chunks each at the 65536 cap and the gain would be rounding only.
+
+### Rule 2 - do not leave the prefill phase while the queue still has prefill work
+
+Phase changes are expensive here: prefill borrows ~90% of the pool and **evicts the expert tier** to get its work
+buffers (`PrefillState::dropped`), and decode needs that tier resident. So a prefill->decode->prefill flap pays two
+evictions for nothing. If parallel is enabled and queued requests still need prefilling, the engine should drain them
+into the prefill phase **before** returning to decode - the same argument that makes one big chunk cheaper than two
+small ones, applied to the phase instead of the chunk.
+
+Practical shape: when the scheduler enters prefill, it should keep admitting queued requests whose prompts fit the
+remaining chunk budget until either the budget is full or the queue is empty; only then return to decode. The
+decode-side consequence (a slot waiting a little longer for its first token) is a latency trade that the queue
+scoring work later has to price - it is not free, but it is cheaper than flapping.
+
+Both rules are the *mechanical* half. Choosing **which** queued requests to admit - cheap cache hits first, pair-able
+prompts next, long single prefills only when the engine would otherwise idle - is the scoring work; it can only be
+decided once Rule 1 and Rule 2 exist, because they define what is possible at all.
