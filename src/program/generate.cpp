@@ -3079,6 +3079,21 @@ static int glm_pack_generate(const Options& o) {
     };
     // the waiting requests, in order, that an idle context can now hold (a STOP for one ends it unread)
     const auto admit_pending = [&] {
+        // PREFILL ALIGN (STRATA_GLM_PREFILL_ALIGN): the opportunity, sampled BEFORE this pass drains `pending` - two
+        // slots can only share a prompt read if they are waiting together.  (Logging after the drain always sees 0.)
+        static const bool align_probe = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_ALIGN");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (align_probe && !pending.empty()) {
+            int free_ctxs = 0;
+            for (const auto& c : ctxs)
+                if (!c.busy) ++free_ctxs;
+            std::fprintf(stderr, "glm align: %zu waiting for a prompt read, %d context(s) free", pending.size(),
+                         free_ctxs);
+            for (const auto& w : pending) std::fprintf(stderr, " [%zu tok]", w.ids.size());
+            std::fprintf(stderr, "\n");
+        }
         for (size_t i = 0; i < pending.size();) {
             const Pending& w = pending[i];
             bool stopped = false;
