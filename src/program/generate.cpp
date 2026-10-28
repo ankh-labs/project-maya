@@ -1505,7 +1505,8 @@ static int glm_pack_generate(const Options& o) {
         slot_th_join();                       // one writer at a time
         slot_buf = std::move(buf);
         const auto b = slot_buf;
-        slot_th = std::thread([b, toks = std::move(toks), path, bytes, img, meta]() {
+        const std::string mpath = meta_of(path);   // the .meta beside the .bin, never over it
+        slot_th = std::thread([b, toks = std::move(toks), path, mpath, bytes, img, meta]() {
             std::error_code ec;
             {
                 std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
@@ -1517,7 +1518,11 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             std::filesystem::rename(path + ".tmp", path, ec);
-            if (ec || !meta(path, toks, bytes, img)) {
+            // the .meta goes beside the .bin, never over it: `path` IS the .bin, so passing it here made
+            // meta_write replace the whole 0.29 GB payload with its own record (8+8+identity+8+8+nt*4+...),
+            // leaving every disk slot unreadable at restore ("identity or checksum failed") and the disk
+            // tier never hitting
+            if (ec || !meta(mpath, toks, bytes, img)) {
                 std::error_code e2;
                 std::filesystem::remove(path + ".tmp", e2);
                 std::filesystem::remove(path, e2);
