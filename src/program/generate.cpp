@@ -1644,7 +1644,15 @@ static int glm_pack_generate(const Options& o) {
     };
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
-        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
+        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) {
+            // WHY the conversation was not set aside: slot_max (STRATA_GLM_SLOTS), snap_in_slot (the model's
+            // snapshot already is one of the slots), or the token count below STRATA_GLM_SLOT_MIN.  A long agent
+            // conversation that never lands in a slot is re-prefilled from token 0 every turn, which costs 60-90 s at
+            // 200k tokens, so this line is the first thing to read when turns are slow.
+            std::fprintf(stderr, "glm slots: not kept%s: slot_max=%d in_slot=%d tokens=%zu min=%zu\n", why, slot_max,
+                         (int) snap_in_slot, (size_t) snap_tokens.size(), slot_min);
+            return;
+        }
         // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
         // pictures are another conversation)
         for (size_t i = slots.size(); i-- > 0;)
