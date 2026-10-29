@@ -1,0 +1,15 @@
+diff --git a/src/core/glm_rows.cu b/src/core/glm_rows.cu
+index 9366950..663b6f2 100644
+--- a/src/core/glm_rows.cu
++++ b/src/core/glm_rows.cu
+@@ -804,6 +804,10 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
+             cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
+             gf::moe_wait(m, E, F->ps);
+             gf::moe_fetch(m, K, Ly.blob, F->ps);
++        } else if (rows_pf == 2) {
++            // this row's fetch runs once, together with the other rows' fetches after the loop, on the side stream -
++            // fetching here too would run it twice, and the second fetch re-assigns the scratch spares against tier
++            // state the first fetch already updated, so the plans and the slot contents disagree (an illegal access)
+         } else if (skip_empty) {
+             gf::moe_wait_fetch(m, E, K, Ly.blob, s);
+         } else {
