@@ -407,3 +407,32 @@ shows ~0/12 (the writer is innocent and the earlier 4/4 was something else) or r
 - **No I/O inside the service loop.** Two function-local atomics are nearly free; an `fprintf` is a syscall and a lock,
   and it reordered a race by enough to change the layer from 20 to 11. Counters only, one dump at the end of a run.
 - **Vary the prompt when measuring prefill.** Identical prompts reuse the KV and skip the path under test.
+
+### The disk tier: the 14x was mine, and the counter closes the item (2026-10-29)
+
+**Correction to the justification in commit `2ccbc2f` and to the spec.** The 14x compared CPU *compute* (0.214 ms)
+against an NVMe *transfer* (2.98 ms) - but a disk-only expert has to come off disk whichever device computes it:
+
+    GPU path:  disk->host 2.98 + host->VRAM 0.188 + GPU gemv ~0.01  =  ~3.18 ms
+    CPU path:  disk->host 2.98 + CPU compute 0.214                  =  ~3.19 ms
+
+**Dead even.** The two figures are only substitutes for a RAM-tier expert (0.214 vs 0.188, parity), and the lane
+already takes those. So `STRATA_GLM_MISS_TO_CPU` is **not** a latency win and must not be sold as one.
+
+What survives is second-order and is the part worth keeping: with the rule on, a disk-only expert takes **no spare and
+no fetch**, so it does not evict a resident. Admitted to VRAM it costs a future miss, and hit rate is what decode is
+most sensitive to. That is **pool preservation**, not first-order latency.
+
+**Measured (production build, full pool, 200-token decode, slot dir cleared):**
+
+    disk = 0        ram_fetch = 19.3 GB/s      vram_hit = 0.779      promo = 19.7
+
+No disk reads during decode. The RAM tier (78 of ~110 GB) absorbs the misses; disk-only misses do not appear in this
+regime at all. By the rule set for this item - "if disk-only misses are a small fraction of all misses it is noise and
+closes" - **the item closes.** The disk->host read in the lane is not worth its build, and `MISS_TO_CPU` stays a
+default-off knob whose only argument is pool preservation on a path we have not observed.
+
+**The implication for the main line**, which is the useful part: if a disk read is unavoidable once the expert is
+needed, no lane choice takes the SSD tier off the critical path. The only levers are fetching it earlier (prefetch
+depth - the scheduler, which needs the primitive) or not needing it (lossy skip). **The disk tier is a scheduler
+problem**, and the spec's "N = 5-8 of cover to hide a 2.98 ms miss" is the honest statement of what that costs.
