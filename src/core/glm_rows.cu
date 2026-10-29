@@ -130,8 +130,12 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->iq = f32((int64_t) g.idx_heads * g.idx_key);
         S->attn_q = q8((int64_t) g.n_head * g.v_head);
         S->rlog = f32(g.n_expert);
+        S->plog = f32(g.n_expert);
         S->sh_g = f32(FFs);
         S->sh_u = f32(FFs);
+        S->pf_src = (unsigned long long*) take(8 * sizeof(unsigned long long));
+        S->pf_dst = (unsigned long long*) take(8 * sizeof(unsigned long long));
+        S->pf_n = (int*) take(sizeof(int));
         S->dg = f32(g.n_ff_dense);
         S->du = f32(g.n_ff_dense);
         S->dhq = q8(g.n_ff_dense);
@@ -654,7 +658,18 @@ bool rows_route_log_on() {
     }();
     return on;
 }
-void rows_route_log_capture(cudaStream_t s, const int* dev_ids, int k) {
+// STRATA_GLM_ROWS_PRED_PF=<n> (default off): predicted cross-layer prefetch on the rows path - after a layer's
+// routes, the next layer's predicted experts (its router weight on the current x) that are not in VRAM claim that
+// layer's spares and are copied on the side stream while this layer computes.  n caps the prefetches per row per
+// layer (0 = off); STRATA_GLM_PREFETCH_RANK still caps the ranks.  Mutually exclusive with STRATA_GLM_ROWS_PF
+// (they would share ev_pf_prev and the tier tables under both arms).
+int rows_pred_pf_n() {
+    static const int n = [] {
+        const char* v = getenv("STRATA_GLM_ROWS_PRED_PF");
+        return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+    }();
+    return n;
+}void rows_route_log_capture(cudaStream_t s, const int* dev_ids, int k) {
     RowsRouteLog& st = rows_route_log_state();
     if (st.h == nullptr) {
         cudaHostAlloc(&st.h, 2 * 2 * 8 * sizeof(int), cudaHostAllocDefault);
@@ -714,6 +729,8 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     std::string gerr;
     const bool grouped = glmfast::group_experts_on() && rows_moe_grouped(il, n, gerr);
     if (!gerr.empty()) { err = gerr; return false; }
+    // grouped failed here: the previous layer's prefetch is still pending, and this layer's experts read its slots
+    if (rows_pred_pf_n() > 0 && !grouped) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     for (int i = 0; !grouped && i < n; ++i) {
         const MoeIo io = {rows(S->x, E, i), rows_q(S->xq, E, i), rows(S->rlog, g.n_expert, i),
                           rows(S->sh_g, FFs, i), rows(S->sh_u, FFs, i), rows(S->ffn, E, i)};
@@ -764,6 +781,29 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     md.pf_src = F->pf_buf[il & 1];
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];
+    // STRATA_GLM_ROWS_PRED_PF=<n>: the next layer's predicted experts (its router weight on the current x) claim
+    // that layer's spares at this layer's route and are copied on the side stream while this layer computes - the
+    // prefetch overlaps the grouped experts, the biggest phase, not sh_down.  The staging is per row (the token
+    // path's pf buffers hold one route's stage; a second row's route would overwrite the first row's claims, whose
+    // spares are already taken: tab marked resident, no bytes copied - garbage slots).  Exclusive with
+    // STRATA_GLM_ROWS_PF (shared ev_pf_prev and tier tables under both arms).
+    static const int pred_pf = rows_pred_pf_n();
+    static const int rows_pf = [] {
+        const char* v = getenv("STRATA_GLM_ROWS_PF");
+        return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+    }();
+    const bool pred_on = pred_pf > 0 && rows_pf == 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
+    // the previous layer's prefetch must have landed before this layer's routes re-stage the buffers (and before
+    // the experts read the claimed slots).  Never recorded: cudaStreamWaitEvent is a no-op.
+    if (pred_pf > 0 && rows_pf == 0) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
+    if (pred_on) {   // the prediction costs a router GEMV for all rows (the token path pays the same, glm_fast_path.cu)
+        gf::MvJob pj = {F->L[(size_t) il + 1].router, nullptr, S->x, S->plog, nullptr, 1.0f, gf::kTypeBF16, E,
+                        g.n_expert};
+        if (!gf::mv_nt(&pj, 1, n, s)) {
+            err = "glm rows: the next layer's prediction GEMV";
+            return false;
+        }
+    }
     const auto row_dev = [&](int i) {   // (fast_moe_window's tok_dev, and the row's own scratch slots)
         gf::MoeDev m = md;
         m.plan_ptr = W.mplan_ptr + 8 * i;
@@ -773,6 +813,11 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         m.cpu_part = W.mcpu_part + (size_t) E * i;
         m.cpu_flag = W.mcpu_flag + i;
         m.scratch = F->rows_scr + 8 * i;
+        if (pred_on) {   // per-row prefetch staging: the token path's pf buffers hold one route's stage
+            m.pf_src = S->pf_src + 8 * i;
+            m.pf_dst = S->pf_dst + 8 * i;
+            m.pf_n = S->pf_n + i;
+        }
         if (i > 0 && md.cpu_seq != nullptr) {
             m.cpu_seq = W.cpu_seq_w + 16 * i;
             m.cpu_ans = W.ans_d[i];
@@ -787,15 +832,12 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     // concurrency.  The grouped experts wait for the fetches on the compute stream (below, before the launches
     // that read the slots).  The addresses are exact: every row is routed into its own plan before the first
     // fetch runs.
-    static const int rows_pf = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_PF");
-        return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
-    }();
     for (int i = 0; i < n; ++i) {
         const gf::MoeDev m = row_dev(i);
         const MoeIo io = {row_at(S->x, E, i), rowq_at(S->xq, E, i), row_at(S->rlog, g.n_expert, i),
                           row_at(S->sh_g, FFs, i), row_at(S->sh_u, FFs, i), row_at(S->ffn, E, i)};
-        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, false, 0, no_bias, lane, i, n, 1);
+        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
+                       row_at(S->plog, g.n_expert, i), pred_pf);
         ++F->expected;
         if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * i, K);
         if (empty) continue;
@@ -823,6 +865,18 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             gf::moe_wait(m, E, F->ps);
             gf::moe_fetch(m, K, Ly.blob, F->ps);
         }
+    }
+    if (pred_on && !empty) {   // the claims are staged: the side stream copies them while this layer computes
+        cudaEventRecord(F->ev_pf, s);
+        cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
+        for (int i = 0; i < n; ++i) {
+            gf::MoeDev m = md;
+            m.pf_src = S->pf_src + 8 * i;
+            m.pf_dst = S->pf_dst + 8 * i;
+            m.pf_n = S->pf_n + i;
+            gf::moe_prefetch(m, F->L[(size_t) il + 1].blob, F->ps);
+        }
+        cudaEventRecord(F->ev_pf_prev, F->ps);   // the next layer's routes wait for this at its entry
     }
     const float* sh_out = nullptr;
     if (Ly.sh_down.q != nullptr) {
