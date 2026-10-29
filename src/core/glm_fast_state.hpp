@@ -383,6 +383,12 @@ struct Glm5Model::FastState {
     // A SECOND compute stream, for the cross-token layer pipeline (docs/LAYER_PIPELINE.md): a row's layers stay in order
     // on their own stream, and two rows on cs and cs2 overlap.  Null unless the pipeline asks for it.
     cudaStream_t cs2 = nullptr;
+    // ---- the SKEW INVARIANT (DEFUSED_SCHEDULER_SPEC 1): floor = the lowest layer any active slot sits at, monotone
+    // within a step; no slot may advance past floor + S, and eviction may only consider layers strictly below floor.
+    // -1 = no pipeline running (the fused path never sets it).  A single atomic: the rotor writes it, the retire and
+    // boundary paths read it.
+    std::atomic<int> pipe_floor{-1};
+    int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
     unsigned int* need_seq_h = nullptr;   // [8] pinned: each channel's just-published seq (the route kernel writes it)
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
