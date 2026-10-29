@@ -1,0 +1,61 @@
+diff --git a/src/core/glm_rows.cu b/src/core/glm_rows.cu
+index 05fd1f1..d7c7beb 100644
+--- a/src/core/glm_rows.cu
++++ b/src/core/glm_rows.cu
+@@ -640,10 +640,13 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
+     return true;
+ }
+ 
+-// STRATA_GLM_ROWS_ROUTE_LOG=1 (the cross-slot shared-expert count's input): both rows' routed experts, one line a
+-// step.  The ids go to a pinned double buffer on the part's stream; the previous step's line prints here once its
+-// copies are done (cudaEventQuery - nothing in the decode syncs).  Part 0 only: the state is process-wide and the
+-// split's parts run on their own threads.
++// STRATA_GLM_ROWS_ROUTE_LOG=1 (the cross-slot shared-expert count's input, and per-layer coverage): both rows'
++// routed experts, one line a layer - `glm rows route L<n>: ...`.  The ids go to a pinned double buffer on the
++// part's stream; the previous layer's line prints here once its copies are done (cudaEventQuery - nothing in the
++// decode syncs).  The log is LOSSY by design: a round is checked exactly once, at the next layer's first capture,
++// and if the previous layer's copies have not reached the GPU yet (the host runs ahead of it) that round is
++// dropped silently - expect far fewer lines than steps x layers, so aggregate coverage over many steps.  Part 0
++// only: the state is process-wide and the split's parts run on their own threads.
+ namespace {
+ struct RowsRouteLog {
+     int* h = nullptr;               // [2 rounds][2 rows][8 ids]
+@@ -669,7 +672,8 @@ int rows_pred_pf_n() {
+         return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+     }();
+     return n;
+-}void rows_route_log_capture(cudaStream_t s, const int* dev_ids, int k) {
++}
++void rows_route_log_capture(cudaStream_t s, const int* dev_ids, int k, int il) {
+     RowsRouteLog& st = rows_route_log_state();
+     if (st.h == nullptr) {
+         cudaHostAlloc(&st.h, 2 * 2 * 8 * sizeof(int), cudaHostAllocDefault);
+@@ -684,8 +688,8 @@ int rows_pred_pf_n() {
+                 if (r1[b] == r0[a]) { ++shared; break; }
+         }
+         std::fprintf(stderr,
+-                     "glm rows route: row0 [%d %d %d %d %d %d %d %d] row1 [%d %d %d %d %d %d %d %d] shared %d\n",
+-                     r0[0], r0[1], r0[2], r0[3], r0[4], r0[5], r0[6], r0[7],
++                     "glm rows route L%d: row0 [%d %d %d %d %d %d %d %d] row1 [%d %d %d %d %d %d %d %d] shared %d\n",
++                     il, r0[0], r0[1], r0[2], r0[3], r0[4], r0[5], r0[6], r0[7],
+                      r1[0], r1[1], r1[2], r1[3], r1[4], r1[5], r1[6], r1[7], shared);
+     }
+     cudaMemcpyAsync(st.h + st.round * 16 + (size_t) st.row * 8, dev_ids, 8 * sizeof(int),
+@@ -737,7 +741,7 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
+         if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
+         // the route log: this row's ids are still the plan's (the next row's route overwrites them); the copy is
+         // async and the line prints one step later, when the previous step's copies are done - nothing syncs
+-        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, F->md.plan_id, g.n_exp_used);
++        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, F->md.plan_id, g.n_exp_used, il);
+     }
+     return true;
+ }
+@@ -839,7 +843,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
+         fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
+                        row_at(S->plog, g.n_expert, i), pred_pf);
+         ++F->expected;
+-        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * i, K);
++        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * i, K, il);
+         if (empty) continue;
+         if (rows_pf == 1) {
+             cudaEventRecord(F->ev_pf, s);              // the route wrote this row's plan on the compute stream
