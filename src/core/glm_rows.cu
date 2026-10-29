@@ -210,6 +210,29 @@ void Glm5Model::rows_destroy() {
 }
 
 bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) {
+    if (rows_stream_ != nullptr) {
+        // The ladder's precedence, checked on the first pipelined bind.  FastState is NESTED in Glm5Model, so its
+        // members are not injected into this scope: the names must be qualified (FastState::PipeStage), which is what
+        // the first two attempts at this assertion got wrong.
+        static const bool ladder_ok = [] {
+            using S = FastState;
+            const S::PipeStage r[6] = {S::pipe_stage(true, true, true, true, true),
+                                       S::pipe_stage(false, true, true, true, true),
+                                       S::pipe_stage(false, false, true, true, true),
+                                       S::pipe_stage(false, false, false, true, true),
+                                       S::pipe_stage(false, false, false, false, true),
+                                       S::pipe_stage(false, false, false, false, false)};
+            const S::PipeStage w[6] = {S::kStageResident, S::kStageInFlight, S::kStageReorder,
+                                       S::kStageCpuLane,  S::kStageDisk,   S::kStageReorder};
+            for (int i = 0; i < 6; ++i)
+                if (r[i] != w[i]) return false;
+            return true;
+        }();
+        if (!ladder_ok) {
+            err = "glm rows: the demotion ladder's precedence is not monotone";
+            return false;
+        }
+    }
     // the pipeline's map: one cursor a row, starting at this part's first layer (docs/LAYER_PIPELINE.md, incr. 2)
     if (RowsState* RS = rows_) {
         for (int c = 0; c < 8; ++c) RS->cur[c] = RowsState::RowCursor{};
