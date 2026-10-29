@@ -310,3 +310,34 @@ on its own, no global order), or serialize the *routes* across rows with events 
 
 Everything remains behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`. Shipped path re-verified
 after each build (coherent output, probe answering).
+
+## Item zero, measured: the need_seq publication, isolated (2026-10-29, later)
+
+Three builds, one variable each, plain single-request prompt every time (`Explain what a ZFS block pointer stores`,
+greedy, 200 max tokens):
+
+| build | result |
+|---|---|
+| `130ef04` rebuilt untouched | **112 tok, finish=stop, 0 faults** (twice) |
+| + `MoeDev.need_seq` field + 64-byte pinned allocation + **device** write in `moe_route_kernel` | **fails**: `prompt layer 20 invalid expert ID or non-finite score (105 of 189 routes)` |
+| + field + allocation + **service-side** write (`need_seq_h[rq->ch] = next`), device write removed | **fails**, identical layer 20 |
+| + field + allocation, **no writes at all** | **112 tok, finish=stop, 0 faults** |
+
+So: **the pinned allocation and the new field are inert and safe; each of the two *writers* breaks the model on its
+own.** Aaron's guess (the d2h write in the shared route kernel) was right about the first, and the same failure
+survives when the write is moved to the host, which means it is not the d2h transfer - it is the **store itself**, and
+the mechanism is unexplained. Writing one 4-byte seq into that pinned block, from either side, ends at layer 20 with
+non-finite router scores.
+
+Unresolved hypotheses (cheap to test, in this order):
+1. the pinned block aliases something live (allocate 4 KiB with a guard, or `memcpy` from a stack copy, and see
+   whether the mere store still breaks it);
+2. `rq->ch` is not what we think for some route (a `MoeRequest` written by the older publish path) - the store would
+   then land on the wrong channel word, which is harmless in itself, unless the *value* read back by something else
+   matters;
+3. the store perturbs timing enough to expose a pre-existing layer-20 race. (Layer 20 is suspiciously specific and
+   appears in every failing build.)
+
+**Consequence:** `need_seq` stays field+allocation only - no writer - until (1)-(3) are separated. The readiness
+primitive is still unproven, so per the spec both the demotion ladder and the per-lane thread model stay blocked on
+it. That is the honest state, and it is one instrumented run away from being answerable.
