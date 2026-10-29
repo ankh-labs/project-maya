@@ -4003,7 +4003,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         if (tid == 0) {
             // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
             if (a.d.route_error != nullptr && *a.d.route_error == 0) *a.d.route_error = 4 * a.layer + bad;
-            *a.d.wait_seq = 0u;
+            *moe_wseq(a.d) = 0u;
             if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = 0u;
             *a.d.cpu_flag = 0;
             *a.d.pf_n = 0;
@@ -4020,6 +4020,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             rq->win = a.win;
             rq->win_n = a.win_n;
             rq->win_rows = a.win_rows;
+    rq->ch = a.d.wait_ch & 7;
             __threadfence_system();
             rq->seq = seq;
             __threadfence_system();
@@ -4189,7 +4190,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         const unsigned int seq = *a.d.seq + 1;
         *a.d.seq = seq;
         s_seq = seq;
-        *a.d.wait_seq = mask ? seq : 0u;
+        *moe_wseq(a.d) = mask ? seq : 0u;
         if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = cpu ? seq : 0u;
         *a.d.cpu_flag = 0;
     }
@@ -4223,7 +4224,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         q->win = a.win;
         q->win_n = a.win_n;
         q->win_rows = a.win_rows;
-        q->pad_ = 0;
+        q->ch = a.d.wait_ch & 7;
         q->skip_mask = s_skip;
         for (int i = 0; i < 8; ++i) {
             const bool on = i < a.k;   // (the entries past k as the host never reads them: zero)
@@ -4247,7 +4248,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __syncthreads();
     if (tid == 0) {
         __threadfence_system();
-        rq->seq = s_seq;
+        rq->ch = a.d.wait_ch & 7;
+    rq->seq = s_seq;
 #if defined(__HIPCC__)
         // The CPU polls this signal without a stream query. As in Strata #697,
         // publish the signal itself after publishing the request payload.
@@ -4259,10 +4261,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
 __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
     __shared__ unsigned int s_need;
     const int tid = threadIdx.x;
-    if (tid == 0) s_need = *d.wait_seq;
+    if (tid == 0) s_need = *moe_wseq(d);
     __syncthreads();
     if (s_need == 0) return;
-    const MoeResponse* r = (const MoeResponse*) d.resp;
+    const MoeResponse* r = moe_resp_ch(d);
     if (tid == 0) {
         // spin on the host's answer (bounded: a dead host must not hang the GPU forever - ~60 s)
         const long long t0 = clock64();
@@ -4426,13 +4428,13 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
     __shared__ unsigned long long s_src[8];
     const int tid = threadIdx.x;
     if (tid == 0) {
-        s_need = *(volatile unsigned int*) d.wait_seq;
+        s_need = *moe_wseq(d);
         __threadfence();   // (0 read after block 0's reset: its fetch_src writes are seen below)
     }
     __syncthreads();
     if (s_need != 0u) {
         if (blockIdx.x == 0) {
-            const MoeResponse* r = (const MoeResponse*) d.resp;
+            const MoeResponse* r = moe_resp_ch(d);
             if (tid == 0) {
                 const long long t0 = clock64();   // bounded like moe_wait (~60 s)
                 while (((volatile const MoeResponse*) r)->seq != s_need) {
@@ -4453,11 +4455,11 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
             }
             __threadfence();
             __syncthreads();
-            if (tid == 0) *(volatile unsigned int*) d.wait_seq = 0u;   // (the next route sets it again)
+            if (tid == 0) *moe_wseq(d) = 0u;   // (the next route sets it again)
         } else if (tid == 0) {
             // the grid is one block an SM, all resident at once: block 0 runs while the others spin
             const long long t0 = clock64();
-            while (*(volatile unsigned int*) d.wait_seq == s_need) {
+            while (*moe_wseq(d) == s_need) {
                 if (clock64() - t0 > (1ll << 36)) break;
             }
             __threadfence();

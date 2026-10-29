@@ -85,3 +85,41 @@ not "per-row launches vs batched launches", it is `x + y + z` serial against `ma
 
 Env flag `STRATA_GLM_LAYER_PIPE`, default off, so the existing path stays byte-identical until the gates pass.
 
+
+## Status (2026-10-29)
+
+| # | increment | state |
+|---|---|---|
+| 1 | `rows_layers(..., il_from, il_to)` - one layer issued on its own; `multi_rows` drives it per layer behind `STRATA_GLM_LAYER_PIPE` | **done** `cd3ed9f`, bit-identical gate passed (cold boot, greedy, one request) |
+| 2 | `RowsState::RowCursor cur[8]` - the map: per row its layer, stage, lead over the slowest row, done. Seeded in `rows_bind`, advanced as each layer finishes | **done** `d49c2f4`, no arithmetic effect (same 90 tokens as the pre-cursor build) |
+| 3a | **per-channel handshake**: `MoeDev.wait_ch`, `wait_seq[ch]`, `resp[ch]`, `MoeRequest.ch`; the host service answers into the requesting channel's buffer; the rows path gives row *i* channel *i* | **in** (this commit) |
+| 3b | per-row compute streams + per-token events | next |
+| 4 | the rotation scheduler with the VRAM lead bound | after 3b |
+
+### 3a - why the handshake had to change first
+
+`wait_seq` was **one** device word and `resp` was **one** host-mapped answer buffer, both shared by every waiter:
+
+```
+F->md.wait_seq = (unsigned int*) fa_take_b(at, 64);   // the arena take was 64 bytes, only word 0 used
+F->md.resp     = dp;                                  // one MoeResponse
+glm_fast.cu:4239  *a.d.wait_seq = mask ? seq : 0u;    // route sets it
+glm_fast.cu:4311  s_need = *d.wait_seq;               // waiter snapshots it
+glm_fast.cu:4440  *moe_wseq(d) = 0u;                  // fused kernel resets it
+```
+
+Two rows in flight would set, snapshot and reset the same word - a waiter can miss its own seq and spin to the
+~60 s bound. That is the same race that closed the `PF=1` structural arm, and it is why "add threads" alone does not
+work. Now `moe_wseq(d)` and `moe_resp_ch(d)` index by `d.wait_ch`, the route stamps `rq->ch`, and the service writes
+the answer into `resp_h[ch]`. Channel 0 is the lone token path, so a single request is unchanged by construction;
+`n` rows take channels `0..n-1` (the arena take is 8 words of usable room; `rows` is capped at 8).
+
+**Slot isolation was already correct** - expert slots are partitioned per layer (`slot_of[key]`, `spare_key(il, j)`,
+77-119 slots/layer of 4,104), so two rows at *different* layers never alias. The handshake was the only shared word
+that mattered.
+
+**Not yet done in 3a:** the service still processes the ring strictly in seq order, which is the right ordering for a
+single service thread and is what the per-channel answer buffers make safe. Whether one service thread is enough
+bandwidth to feed two pipelined rows is a measurement, not an assumption - the stage table says the service path (x,
+9.67 ms) plus the CPU lane (15.03 ms) is 24.7 ms of the 43.38 ms token, and the pipeline's prize is
+`max(x, y + z)` rather than `x + y + z`.
