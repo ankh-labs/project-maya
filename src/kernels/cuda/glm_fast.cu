@@ -3921,7 +3921,11 @@ struct RouteArgs {
     float miss_skip_w;          // STRATA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
                                 // weights is below this are left out like skip_from's, at any rank (0: none)
     int win_rows;               // win / win_n are a batched rows step's row and rows (STRATA_GLM_GROUP_EXPERTS)
-    float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
+    float affinity;
+    // STRATA_GLM_MISS_TO_CPU: an expert that is on disk only (no VRAM slot, no RAM blob) is handed to the CPU LANE
+    // instead of taking a VRAM spare + a PCIe move.  The lane's host side needs to read it from disk first - until that
+    // lands the lane refuses a null blob (fail closed, weight dropped) rather than dereferencing it.
+    int miss_to_cpu = 0;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
 };
 
@@ -4147,6 +4151,11 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                     // on disk only and ranked low: left out like a draft's miss (the expert kernels skip a null
                     // plan entry) - this token goes without it instead of waiting on a disk read
                     skip |= 1u << i;
+                } else if (a.miss_to_cpu != 0) {
+                    // disk only and the rule is on: the host computes it.  No spare is taken and nothing crosses PCIe,
+                    // which is the point - the spare pool and the link stay for the experts the GPU can use.
+                    cpu |= 1u << i;
+                    s_cs[i] = 0ull;
                 } else {
                     // not in VRAM: land it in a spare slot of this layer (it becomes resident: the table says so
                     // from here on) or, with none left, in this entry's scratch slot.  promote_min > 1: keep it
@@ -6476,7 +6485,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int win,
                unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w,
-               int win_rows) {
+               int win_rows, int miss_to_cpu) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
@@ -6487,6 +6496,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
+    a.miss_to_cpu = miss_to_cpu;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
