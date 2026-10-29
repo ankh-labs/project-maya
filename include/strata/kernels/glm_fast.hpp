@@ -308,6 +308,10 @@ struct MoeDev {
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
     int mt_T = 1;
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
+    // [8] HOST-mapped: the seq this channel just published, written by the SERVICE (a device write to host memory here
+    // broke the plain path - measured).  The waiter sets 0xFFFFFFFF before a route ("not yet taken").  LAST field on
+    // purpose: a new field in the middle moved every field after it.
+    unsigned int* need_seq = nullptr;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {

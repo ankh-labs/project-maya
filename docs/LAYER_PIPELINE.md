@@ -271,3 +271,73 @@ off PATH at the time of writing.)
 
 Everything stays behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`; the default and the shipped
 path are untouched and were re-verified after each build.
+
+### Two more real bugs, and the failure mode that replaced them
+
+Chasing the non-finite router input (log: `glm router: layer 19/20 decode invalid expert ID or non-finite score`)
+found two more classes, both now fixed:
+
+7. **`fast_moe_experts` ignored the row's MoeDev.** It rebuilt `md = F->md` (the GLOBAL plan / fetch_src / cpu-lane /
+   wait channel), so in a per-row drive every row shared one plan and one channel. The per-row MoeDev only ever
+   existed in `rows_moe_grouped`. Fixed by letting a pipeline row (n == 1, row_base_ > 0) use that path: the
+   `n < 2` gate is now `n < 2 && row_base_ == 0`, and its route passes the row as `win` with `win_n = 0`.
+8. **The residual mixing (mHC) used the token path's shared scratch.** `h.part = F->part`, `h.counter = F->counter`,
+   used on *every* row, and `hc_part`/`hc_ctr` were allocated only with `STRATA_GLM_ROWS_BATCH`. Two rows wrote one
+   residual buffer - a non-finite residual is exactly what the router then reported. Now per row (`R(i)`), allocated
+   unconditionally. Also `h.xq` still indexed by `i` rather than `R(i)`; fixed.
+
+Plus the stream bug behind the earlier chaos: `fast_moe_experts` and `fast_moe_route` hardcoded `F->cs`, so in a
+per-row drive the **experts ran on the engine stream while the layer's inputs were produced on the row's stream**,
+with no ordering between them.
+
+After these, one run of three produced a fully coherent answer ("# ZFS RAIDZ1 Parity Distribution A RAIDZ1 vdev
+protects against the failure of a single disk by ..."). The rest failed, but **differently**:
+
+> `the engine stopped itself because it had stopped making progress - a hang it caught`
+
+That is **head-of-line blocking between the two channels**, and it is structural, not a bug in the slicing:
+
+- the service answers the routing ring strictly in `seq` order;
+- the route kernels take that `seq` from one shared atomic counter, so the two rows' sequences interleave in
+  whatever order the GPU happens to run them;
+- `moe_wait` / `moe_wait_fetch` occupy one block per SM and spin. If row B's route publishes first and spins, row A's
+  route may never get an SM to publish the earlier sequence the service is waiting for. Deadlock, caught by the
+  watchdog.
+
+**So the next change is the protocol, not the buffers:** either a per-channel ring (the service answers each channel
+on its own, no global order), or serialize the *routes* across rows with events while leaving the computes overlapped
+- which is the shape originally proposed and is the cheaper of the two.
+
+Everything remains behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`. Shipped path re-verified
+after each build (coherent output, probe answering).
+
+## Item zero, measured: the need_seq publication, isolated (2026-10-29, later)
+
+Three builds, one variable each, plain single-request prompt every time (`Explain what a ZFS block pointer stores`,
+greedy, 200 max tokens):
+
+| build | result |
+|---|---|
+| `130ef04` rebuilt untouched | **112 tok, finish=stop, 0 faults** (twice) |
+| + `MoeDev.need_seq` field + 64-byte pinned allocation + **device** write in `moe_route_kernel` | **fails**: `prompt layer 20 invalid expert ID or non-finite score (105 of 189 routes)` |
+| + field + allocation + **service-side** write (`need_seq_h[rq->ch] = next`), device write removed | **fails**, identical layer 20 |
+| + field + allocation, **no writes at all** | **112 tok, finish=stop, 0 faults** |
+
+So: **the pinned allocation and the new field are inert and safe; each of the two *writers* breaks the model on its
+own.** Aaron's guess (the d2h write in the shared route kernel) was right about the first, and the same failure
+survives when the write is moved to the host, which means it is not the d2h transfer - it is the **store itself**, and
+the mechanism is unexplained. Writing one 4-byte seq into that pinned block, from either side, ends at layer 20 with
+non-finite router scores.
+
+Unresolved hypotheses (cheap to test, in this order):
+1. the pinned block aliases something live (allocate 4 KiB with a guard, or `memcpy` from a stack copy, and see
+   whether the mere store still breaks it);
+2. `rq->ch` is not what we think for some route (a `MoeRequest` written by the older publish path) - the store would
+   then land on the wrong channel word, which is harmless in itself, unless the *value* read back by something else
+   matters;
+3. the store perturbs timing enough to expose a pre-existing layer-20 race. (Layer 20 is suspiciously specific and
+   appears in every failing build.)
+
+**Consequence:** `need_seq` stays field+allocation only - no writer - until (1)-(3) are separated. The readiness
+primitive is still unproven, so per the spec both the demotion ladder and the per-lane thread model stay blocked on
+it. That is the honest state, and it is one instrumented run away from being answerable.
