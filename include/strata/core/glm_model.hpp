@@ -896,6 +896,10 @@ private:
 public:
     struct RowsState;
     RowsState* rows_ = nullptr;
+    // The row's slice in the 8-wide per-row buffers (RowsState's activations, the MoE group scratch).  0 for an ordinary
+    // call over n rows; a driver that runs ONE row per call sets it to that row's index so two rows in flight never
+    // share a slice (docs/LAYER_PIPELINE.md, increment 3b).
+    int row_base_ = 0;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
     void rows_destroy();
 
