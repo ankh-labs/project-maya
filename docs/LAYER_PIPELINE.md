@@ -154,3 +154,16 @@ Consequences for the next measurement:
 - An arm must be paired **within the same load window**, or taken when `live.active == 0`. Absolute tok/s across windows is not comparable on this box.
 - `live.active == 2` is the *interesting* regime (it is the pipeline's whole point), but it is also exactly when the fleet owns the GPU - so use the **per-request `decode_tok_s` in `/metrics.requests[]`** and pair arms by interleaving them, rather than wall-clock aggregates.
 - Cold-boot token equality gates are unaffected by load and remain valid (3a passed that way).
+
+### The alias I nearly missed: the row's own activation slices
+
+`row_at(S->x, E, i)` / `rowq_at(S->xq, E, i)` index `RowsState`'s buffers by **row position in the call**. A skewed drive calls `rows_layers(rw + r, 1, ...)`, so `i` is always 0 and *both* rows would use `S->x[0]`, `S->qq[0]`, `S->rlog[0]`... That is the same class of bug as the shared group window, one level up, and it would corrupt silently rather than fault.
+
+So the 3b change set is, in order:
+
+1. `row_base_` (the row's slot in the 8-wide buffers) and a `slice()` helper so `S->*` and `W.*` both take the row's own slice;
+2. `rows_stream_` (compute stream per row) - `rows_layers`/`rows_dsa`/`rows_moe` use it instead of `F->cs`, which is a one-line change each because the body already goes through one local `s`;
+3. the rotation: serialized routes, fetches on `F->ps`, per-row compute streams waiting on their own fetch event;
+4. then the timing, with paired arms (`/metrics.requests[].decode_tok_s`, interleaved) rather than wall-clock aggregates.
+
+Steps 1 and 2 are mechanical but wide (every `S->*` and `W.*` slice in the layer path). Step 3 is small. Nothing in 1-3 changes arithmetic, so the increment-1 bit-identity gate keeps its meaning: it must still pass afterwards, on `LEPIPE=1` with one row.
