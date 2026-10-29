@@ -592,7 +592,8 @@ public:
     // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
     // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
     void fast_moe_route(int il, const MoeIo& io, const strata::kernels::glmf::MoeDev& md, void* sh_hq, bool pred,
-                        int n_ah, const float* const* ah_bias, bool lane, int win = 0, int win_n = 0, int win_rows = 0);
+                        int n_ah, const float* const* ah_bias, bool lane, int win = 0, int win_n = 0, int win_rows = 0,
+                        const float* pred_logits = nullptr, int pred_pf_n = 0);
     // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
     // (glm_rows.cu); false with err empty: not here (the rows go one by one)
     bool rows_moe_grouped(int il, int n, std::string& err);
