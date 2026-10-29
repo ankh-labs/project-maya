@@ -870,6 +870,7 @@ struct Glm5Model::FastState {
     size_t pn = 0;
     std::map<std::string, double> pacc;
     uint64_t ptokens = 0;
+    mutable uint64_t prof_last = 0;   // (the token count pacc was last reported at: one report a request)
     void mark(const char* nm) {
         if (pn >= pev.size()) {
             cudaEvent_t e = nullptr;

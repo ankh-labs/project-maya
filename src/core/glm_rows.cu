@@ -287,7 +287,13 @@ bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::
     return true;
 }
 
-bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
+bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, int il_to) {
+    // il_from/il_to default (-1) to the whole part.  A caller may drive ONE layer at a time by passing
+    // [il, il+1): the loop below is the only place the bounds are used, and the Rc/Ro swap keys on the
+    // global l0_ (so the per-layer alternation stays correct across separate calls).  This is the seam a
+    // cross-token layer pipeline needs (docs/LAYER_PIPELINE.md, increment 1) and it is arithmetic-neutral.
+    const int ilf = il_from < 0 ? l0_ : std::max(l0_, il_from);
+    const int ilt = il_to < 0 ? l1_ : std::min(l1_, il_to);
     FastState* F = fast_;
     RowsState* S = rows_;
     const Glm5Geometry& g = g_;
@@ -312,7 +318,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     // (kda_layers is built for head_dim 128, as the window commit's replay: else the KDA one row at a time)
     const bool kda_batch = batch && !dup && g.kda_head_dim == 128;
     gf::HcArgs hb[gf::kMaxMvNt];
-    for (int il = l0_; il < l1_; ++il) {
+    for (int il = ilf; il < ilt; ++il) {
         const auto& Ly = F->L[(size_t) il];
         gf::HcArgs h;
         h.norm_eps = g.norm_eps;
@@ -1020,9 +1026,21 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     } prof_off{F, F->prof_on};
     F->prof_on = false;
     RowSeq rw[gf::kMaxMvNt];
-    if (!rows_bind(seqs, n, rw, err) || !rows_embed(rw, tokens, n, err) || !rows_layers(rw, n, err) ||
-        !rows_head(rw, sps, n, err))
+    if (!rows_bind(seqs, n, rw, err) || !rows_embed(rw, tokens, n, err)) return false;
+    // STRATA_GLM_LAYER_PIPE (docs/LAYER_PIPELINE.md, increment 1): drive the layers ONE AT A TIME through the same
+    // body, so the loop becomes something a cross-token pipeline can offset.  This arm only proves the split is
+    // arithmetic-neutral (bit-identical tokens against the default path); the schedule itself comes next.
+    static const bool layer_pipe = [] {
+        const char* v = getenv("STRATA_GLM_LAYER_PIPE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (layer_pipe) {
+        for (int il = l0_; il < l1_; ++il)
+            if (!rows_layers(rw, n, err, il, il + 1)) return false;
+    } else if (!rows_layers(rw, n, err)) {
         return false;
+    }
+    if (!rows_head(rw, sps, n, err)) return false;
     cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(S->ev_done, F->cs);
     // the step back (the service threads answer the routes' misses meanwhile)

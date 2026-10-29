@@ -905,7 +905,7 @@ private:
     bool mtpw_commit_part(const int* seqs, const int* counts, const int* keep, int n, std::string& err);
     bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
     bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
-    bool rows_layers(RowSeq* rw, int n, std::string& err);
+    bool rows_layers(RowSeq* rw, int n, std::string& err, int il_from = -1, int il_to = -1);
     bool rows_dsa(int il, RowSeq* rw, int n, std::string& err);   // (rows_layers' parts: a DSA mixer, a MoE FFN)
     bool rows_moe(int il, RowSeq* rw, int n, std::string& err);
     bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
