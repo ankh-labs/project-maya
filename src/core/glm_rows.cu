@@ -830,6 +830,9 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         m.cpu_part = W.mcpu_part + (size_t) E * i;
         m.cpu_flag = W.mcpu_flag + i;
         m.scratch = F->rows_scr + 8 * i;
+        // this row's OWN handshake channel: wait_seq[i] and resp[i].  Row 0 is channel 0, exactly the lone token
+        // path, so n = 1 is unchanged; n > 1 gives each waiter its own word and answer buffer.
+        m.wait_ch = i & 7;
         if (pred_on) {   // per-row prefetch staging: the token path's pf buffers hold one route's stage
             m.pf_src = S->pf_src + 8 * i;
             m.pf_dst = S->pf_dst + 8 * i;
