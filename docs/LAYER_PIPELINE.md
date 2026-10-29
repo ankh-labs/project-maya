@@ -167,3 +167,43 @@ So the 3b change set is, in order:
 4. then the timing, with paired arms (`/metrics.requests[].decode_tok_s`, interleaved) rather than wall-clock aggregates.
 
 Steps 1 and 2 are mechanical but wide (every `S->*` and `W.*` slice in the layer path). Step 3 is small. Nothing in 1-3 changes arithmetic, so the increment-1 bit-identity gate keeps its meaning: it must still pass afterwards, on `LEPIPE=1` with one row.
+
+## RETRACTION (2026-10-29): token-equality is not a valid gate on this engine
+
+Increments 1 and 3a were reported as "bit-identical" on the strength of one 90-token answer matching a stored
+answer. **That evidence was not sufficient and the claim is withdrawn.** Repeated runs of the *same binary*, same
+prompt, temperature 0, produce different answers every time:
+
+| condition | runs | result |
+|---|---|---|
+| default config, three cold boots | 3 | all three differ (first divergence at char 132 / 348 / 132 across different pairs) |
+| `STRATA_GLM_CPU_LANE=0` (no host float summation) | 3 | all three differ; one stopped at 46 tokens, two at 90 |
+| CPU lane off, warm tier (hit 0.634 -> 0.639), 4 sequential runs | 4 | lengths 409 / 416 / 413, none equal |
+| same, 3 more runs | 3 | lengths 409 / 416 / 413, none equal |
+
+So the divergence is not the CPU lane, not cold tier, and not my slice change: **it is a property of the engine as
+configured** (q4_0 latent KV, streaming experts with varying residency - the hit rate moves between runs, so the
+set of experts served from VRAM vs RAM differs, and those two paths do not produce bit-identical values).
+
+**Consequence: no future arm may be cleared on token equality.** What is still true and useful:
+
+- `row_base_` is an arithmetic **identity by construction** at 0 (`ptr + 8 * 0`); the branch that reads it is the
+  only one that changes. That is a code-level argument, verified by inspection, not a token comparison.
+- The gates that DO work: no faults (`illegal`/`misaligned`/`route_error`), coherent non-empty output, and the
+  next one to build - a **numeric parity harness**: log the top-k logits at fixed positions from both arms with
+  residency frozen, and compare those, not the sampled tokens.
+
+Until that harness exists, "the pipeline is correct" can only mean "it does not fault and its outputs look like the
+model's". That is weaker than what was claimed earlier in this document and is stated here so nobody quotes the old
+claims.
+
+### What increment 3b's slice work is, then
+
+Every per-row slice in the layer path goes through `R(i) = row_base_ + i` (~40 sites), and the group window's arrays
+(`mw.plan_ptr/plan_w/cpu_part/cpu_flag`, `grp_ptr/grp_start/grp_ent/n_groups`, `hq`, `part`, `wh`, `sh_hq`, `sh_out`)
+take the row's `[T * 8]` block. `row_base_` is 0 for an ordinary call, so behaviour is unchanged; the value is that a
+driver can now run one row per call without two rows sharing a slice.
+
+Still per-*call* (not per-row) and therefore still a hazard for concurrent rows: `S->aq` / `S->actx` (the MLA attention
+scratch, sized for one row's heads), `W.scr` (a 64-byte claim word), and `F->rows_scr`'s per-row 8 slots (indexed by
+`R(i)` already, but the *count* is per call). Those are the next mechanical step before streams.
