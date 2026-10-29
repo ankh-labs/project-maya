@@ -56,3 +56,6 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# watchdog crash dumps: binary noise in a branch that gets bisected
+*.dmp
