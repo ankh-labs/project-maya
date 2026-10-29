@@ -243,3 +243,31 @@ Therefore:
 Next, in order: (1) make the spare claim per row (a claim word per row, or serialize routes and let the computes
 overlap), (2) re-check `hc_part`/`hc_ctr` (allocated only with `STRATA_GLM_ROWS_BATCH`, and a per-row call reads
 `rows(S->hc_part, ..., R(i))`), (3) the numeric parity harness, (4) the timing.
+
+### Where the rotation actually stands (end of this pass)
+
+The bisect is the important result: **the same rotation with both rows on one stream produces correct output**
+("# ZFS RAIDZ1 Parity Distribution ## Variable-Stride Allocation Unlike traditional RAID 5..."). So the per-row
+slicing is right, and the remaining corruption is a **genuine concurrency race**, not a mis-addressed buffer.
+
+Six classes of per-CALL state were found and fixed on the way (all silent corruption, no faults):
+
+1. `F->conv[3]`/`F->g1`/`F->g2` - used whenever `n == 1`, i.e. every per-row call.
+2. 21 `MvJob` launches that started at row 0 whatever row the call was.
+3. `S->aq`, `S->actx` (one block, written at stride `ad`).
+4. `S->ascore`, `S->acells`, `S->aslot`, and - the one that hid behind `n == 1` - the whole `attn` predicate:
+   `attn = rows_attn_on() && n > 1 && ...` meant a per-row call silently took the token path's SHARED `F->score` /
+   `F->cells`. Fixed to `(n > 1 || row_base_ > 0)`.
+5. `S->apart` - `take_all`, one buffer for `attn_tokens` rows, indexed by token inside the call: `+ rb * part_floats`.
+6. `attn_q`'s q8 output in the batched path.
+
+**Still wrong under overlap**, and the symptom has changed shape - repeated degenerate tokens (`of the of the`,
+`((((((`, `RAID RAID RAID`) rather than word salad. That is a state crossing, not a bad pointer.
+
+**The next step is instrumentation, not another guess:** `compute-sanitizer --tool racecheck` on the overlapped arm,
+which names the buffers and lines with hazards. Six hypotheses by inspection have now been spent; one racecheck run
+is worth more than the seventh. (The sanitizer needs the CUDA toolkit's `bin` on PATH; the box had `compute-sanitizer`
+off PATH at the time of writing.)
+
+Everything stays behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`; the default and the shipped
+path are untouched and were re-verified after each build.
