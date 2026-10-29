@@ -565,7 +565,10 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     // over all their selections then (a resolve never evicts a block it names), not one a row - a row's resolve could
     // evict a block the row before it still has to read.  Rows of one conversation that are not consecutive: one by one
     const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora, nsm = g.n_sel_max();
-    bool attn = rows_attn_on() && n > 1 && S->apart != nullptr && g.v_head % 32 == 0 && gf::mla_rows_ok(g.kv_lora);
+    // n > 1 OR a per-row call (row_base_): a pipeline row runs alone, so n == 1, and without this it took the token
+    // path's shared score / cells buffers instead of its own
+    bool attn = rows_attn_on() && (n > 1 || row_base_ > 0) && S->apart != nullptr && g.v_head % 32 == 0 &&
+                gf::mla_rows_ok(g.kv_lora);
     int run0[gf::kMaxMvNt];   // the first row of each row's run of consecutive rows of its conversation
     for (int i = 0; i < n; ++i) {
         run0[i] = i > 0 && rw[i - 1].seq == rw[i].seq ? run0[i - 1] : i;
@@ -664,11 +667,13 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         }
         if (n_kr > 0) gf::glm_kv_resolve_rows(kr, n_kr, kr_row, kr_page, s);
         if (!gf::mla_attend_rows(S->aq + rb * ad, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
-                                 S->apart, S->apart_tokens, s, lat_q8_)) {
+                                 S->apart + (size_t) rb * gf::mla_rows_part_floats(g.n_head, g.kv_lora),
+                                 S->apart_tokens, s, lat_q8_)) {
             err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)
             return false;
         }
-        gf::mla_out(S->actx + rb * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
+        gf::mla_out(S->actx + rb * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n,
+                    rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, rb),
                     (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s, lat_q8_);
     }
     gf::MvJob o = {Ly.out.q, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, rb), nullptr, rows(S->mixer, E, rb), nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
@@ -1109,13 +1114,16 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
         // layers stay in order; the two streams are free to overlap.  One layer a row, one row per call - the slices and
         // the handshake channel both key off row_base_, so they cannot collide.
+        // BISECT: the same rotation with both rows on ONE stream separates a slicing bug (wrong output either way)
+        // from a genuine race (right output serial, wrong when overlapped).
+        static const bool serial = getenv("STRATA_GLM_PIPELINE_SERIAL") != nullptr;
         const int L = l1_ - l0_;
         for (int k = 0; k < L + n - 1; ++k) {
             for (int r = 0; r < n; ++r) {
                 const int il = l0_ + k - r;
                 if (il < l0_ || il >= l1_) continue;
                 row_base_ = r;
-                rows_stream_ = (r & 1) ? F->cs2 : F->cs;
+                rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
                     row_base_ = 0;
                     rows_stream_ = nullptr;
