@@ -44,12 +44,17 @@ struct Glm5Model::RowsState {
     // position and KV state live in its SeqCtx; this is only the progress through the layer stack, which is what lets
     // one request sit at layer L while another is at L-1.  Host-side on purpose: the scheduler reads and advances it
     // between launches, and nothing in a kernel needs it.
+    // the slot's phase (DEFUSED_SCHEDULER_SPEC): one owner per phase, so the per-layer path needs no mutex.  A slot is
+    // ROUTED when its request is published, FETCHING while its L+1 experts are in flight, READY when the transfer lane
+    // has them, COMPUTING while the ordered compute stream runs its layer.
+    enum SlotPhase : int { kEmpty = 0, kRouted = 1, kFetching = 2, kReady = 3, kComputing = 4 };
     struct RowCursor {
         int slot = -1;      // the row index in this step's set (-1: free)
         int il = 0;         // the layer it will run next
         int stage = 0;      // 0 x, 1 y, 2 z
         int lead = 0;       // layers ahead of the slowest row (the pipeline depth it is using)
         bool done = false;  // past l1_: nothing left for this token
+        int phase = kEmpty; // SlotPhase: the owner writes it, everyone else reads it between launches
     };
     RowCursor cur[8];
     int* pf_n = nullptr;
