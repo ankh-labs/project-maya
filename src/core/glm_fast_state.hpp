@@ -383,6 +383,7 @@ struct Glm5Model::FastState {
     // A SECOND compute stream, for the cross-token layer pipeline (docs/LAYER_PIPELINE.md): a row's layers stay in order
     // on their own stream, and two rows on cs and cs2 overlap.  Null unless the pipeline asks for it.
     cudaStream_t cs2 = nullptr;
+    unsigned int* need_seq_h = nullptr;   // [8] pinned: each channel's just-published seq (the route kernel writes it)
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};

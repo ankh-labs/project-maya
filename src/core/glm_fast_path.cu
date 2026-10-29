@@ -946,6 +946,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         return false;
     }
     std::memset(hp, 0, sizeof(gf::MoeResponse) * 8);
+    // [8] one per channel: "the seq I just published", in host memory (the pipeline's host-side readiness read)
+    if (cudaHostAlloc(&hp, 64, cudaHostAllocMapped) != cudaSuccess) {
+        err = "glm fast: the channel seq words did not allocate";
+        return false;
+    }
+    std::memset(hp, 0, 64);
+    F->need_seq_h = (unsigned int*) hp;
+    cudaHostGetDevicePointer(&dp, hp, 0);
+    F->md.need_seq = (unsigned int*) dp;
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
@@ -3947,6 +3956,7 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
+    if (F->need_seq_h) cudaFreeHost(F->need_seq_h);
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);
@@ -4266,6 +4276,10 @@ void Glm5Model::fast_service() {
     while (!F->quit.load(std::memory_order_relaxed)) {
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
         const unsigned int sq = rq->seq;
+        // the CHANNEL's published seq, in host memory: purely host-side (the device writing host memory broke the plain
+        // path), and it is the same fact the ring entry carries.  A host waiter polls this to learn what to wait for.
+        // ISOLATION TEST: the service write is disabled to separate it from the allocation.
+        // if (sq == next && F->need_seq_h != nullptr) F->need_seq_h[rq->ch & 7] = next;
         if (sq != next) {
             // an entry AHEAD of us means the device lapped the ring (only non-waiting routes can be lapped: a
             // disk miss parks the device until it is answered) - resync instead of waiting forever
