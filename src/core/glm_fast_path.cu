@@ -4122,6 +4122,26 @@ void Glm5Model::set_read_chunks(int n) {
 
 Glm5Model::FastStats Glm5Model::fast_stats() const {
     FastStats s;
+    // STRATA_GLM_PROF: report the per-token profile once a request's tokens are in (fast_destroy's table is the
+    // shutdown copy of this; here it lands per request, which is what makes the three numbers usable - expert
+    // transfer, expert compute, router - without a graceful stop).  Cumulative averages over the profiled tokens.
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        FastState* F = m->fast_;
+        if (F == nullptr || !F->prof_on || F->ptokens <= F->prof_last || F->pacc.empty()) continue;
+        F->prof_last = F->ptokens;
+        std::vector<std::pair<double, std::string>> v;
+        double tot = 0;
+        for (auto& kv : F->pacc) {
+            v.push_back({kv.second, kv.first});
+            tot += kv.second;
+        }
+        std::sort(v.rbegin(), v.rend());
+        std::fprintf(stderr, "glm fast prof CUDA%d (%llu tokens, %.2f ms/token of GPU stream time):\n", m->dev_,
+                     (unsigned long long) F->ptokens, tot / (double) F->ptokens);
+        for (auto& e : v)
+            std::fprintf(stderr, "  %-18s %7.3f ms/token  %5.1f%%\n", e.second.c_str(),
+                         e.first / (double) F->ptokens, 100.0 * e.first / tot);
+    }
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const FastState* F = m->fast_;
         if (F == nullptr) continue;
