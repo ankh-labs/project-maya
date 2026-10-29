@@ -377,6 +377,55 @@ int trunk_skip_from(int il);
 
 namespace gf = strata::kernels::glmf;
 
+// ---- the DE-FUSED RUNTIME (DEFUSED_SCHEDULER_SPEC, items 2/6/7): the three threads the design is built around.
+//
+//   SUBMIT   owns the layer loop and every launch (one ordered compute stream: A@L1 -> B@L1 -> A@L2)
+//   TRANSFER reads each slot's L+1 routing and fetches ahead on the copy stream
+//   RETIRE   polls events (cudaEventQuery only, never cudaEventSynchronize) and hands the token on
+//
+// Started only under STRATA_GLM_LAYER_PIPE >= 2.  Each thread carries a counter: a thread that never runs is then
+// visible at startup instead of silent, which is the failure this session has already hit twice (an unreachable gate,
+// and an assertion I removed rather than fixed).  The queues are not wired to layer work yet - that is the next piece -
+// but the runtime, its liveness proof and its shutdown path are real now.
+struct PipeRuntime {
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> n_submit{0}, n_transfer{0}, n_retire{0};
+    std::thread t_submit, t_transfer, t_retire;
+    std::mutex mu;
+    std::condition_variable cv;
+
+    void idle(std::atomic<uint64_t>& n) {
+        while (!stop.load(std::memory_order_acquire)) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait_for(lk, std::chrono::milliseconds(2));
+            }
+            n.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void start() {
+        t_submit = std::thread([this] { idle(n_submit); });
+        t_transfer = std::thread([this] { idle(n_transfer); });
+        t_retire = std::thread([this] { idle(n_retire); });
+    }
+
+    void shutdown() {
+        stop.store(true, std::memory_order_release);
+        { std::lock_guard<std::mutex> lk(mu); cv.notify_all(); }
+        std::thread* ts[3] = {&t_submit, &t_transfer, &t_retire};
+        for (auto* t : ts)
+            if (t->joinable()) t->join();
+    }
+
+    /// Liveness gate: every thread must have run at least once.  Checked at startup, so a thread that failed to start
+    // (or a future refactor that leaves one idle) is loud.
+    bool all_alive() const {
+        return n_submit.load(std::memory_order_acquire) > 0 && n_transfer.load(std::memory_order_acquire) > 0 &&
+               n_retire.load(std::memory_order_acquire) > 0;
+    }
+};
+
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
@@ -412,6 +461,7 @@ struct Glm5Model::FastState {
         if (can_disk) return kStageDisk;
         return kStageReorder;   // nothing is available: reorder is the only rung that cannot fail a token
     }
+    std::unique_ptr<PipeRuntime> pipe;   // the de-fused runtime (null unless STRATA_GLM_LAYER_PIPE >= 2)
     std::atomic<bool> pipe_active{false};
     std::atomic<int> pipe_floor{-1};
     int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
