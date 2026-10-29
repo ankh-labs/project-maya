@@ -34,6 +34,10 @@ struct Glm5Model::RowsState {
     float *q = nullptr, *iq = nullptr;
     uint8_t *qr_q = nullptr, *attn_q = nullptr;
     float *rlog = nullptr, *sh_g = nullptr, *sh_u = nullptr, *dg = nullptr, *du = nullptr;
+    float* plog = nullptr;                  // STRATA_GLM_ROWS_PRED_PF: each row's next-layer prediction logits
+    unsigned long long* pf_src = nullptr;  // ... per-row prefetch staging (glm_fast.cu's pred block writes these)
+    unsigned long long* pf_dst = nullptr;
+    int* pf_n = nullptr;
     uint8_t* dhq = nullptr;
     float* head_x = nullptr;
     uint8_t* head_xq = nullptr;

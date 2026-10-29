@@ -5641,7 +5641,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
 }
 
 void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, void* sh_hq, bool pred, int n_ah,
-                               const float* const* ah_bias, bool lane, int win, int win_n, int win_rows) {
+                               const float* const* ah_bias, bool lane, int win, int win_n, int win_rows,
+                               const float* pred_logits, int pred_pf_n) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
@@ -5660,8 +5661,9 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
                   g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
-                  pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
-                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
+                  pred ? (pred_logits != nullptr ? pred_logits : F->plog) : nullptr,
+                  pred ? F->L[(size_t) il + 1].router_bias : nullptr,
+                  pred ? (pred_pf_n > 0 ? pred_pf_n : F->max_pf) : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
                   il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
                   pf_rank, near_n, win, nullptr, win_n, il == mtp_il_ ? 8 : F->disk_skip_from,
                   il == mtp_il_ ? 0.0f : F->disk_skip_w, il == mtp_il_ ? 0.0f : [&] {
