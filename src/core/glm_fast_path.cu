@@ -664,6 +664,22 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->ram_resident = getenv("STRATA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("STRATA_GLM_RAM_RESIDENT")) != 0;
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
+    {
+        static const int pipe_mode = [] {
+            const char* v = getenv("STRATA_GLM_LAYER_PIPE");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
+        if (pipe_mode >= 2) {
+            F->pipe.reset(new PipeRuntime());
+            F->pipe->start();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const bool live = F->pipe->all_alive();
+            std::fprintf(stderr, "glm pipe: CUDA%d runtime up: submit=%llu transfer=%llu retire=%llu %s\n", dev_,
+                         (unsigned long long) F->pipe->n_submit.load(), (unsigned long long) F->pipe->n_transfer.load(),
+                         (unsigned long long) F->pipe->n_retire.load(),
+                         live ? "(all three threads ran)" : "(A THREAD NEVER RAN - the runtime is not usable)");
+        }
+    }
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->cs2, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
@@ -4004,6 +4020,7 @@ void Glm5Model::fast_destroy() {
     if (F->ev_pf) cudaEventDestroy(F->ev_pf);
     if (F->ev_pf_prev) cudaEventDestroy(F->ev_pf_prev);
     if (F->cs) cudaStreamDestroy(F->cs);
+    if (F->pipe) { F->pipe->shutdown(); F->pipe.reset(); }
     if (F->cs2) cudaStreamDestroy(F->cs2);
     if (F->copy) cudaStreamDestroy(F->copy);
     if (F->ps) cudaStreamDestroy(F->ps);
