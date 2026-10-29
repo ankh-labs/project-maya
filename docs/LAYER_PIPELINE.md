@@ -207,3 +207,39 @@ driver can now run one row per call without two rows sharing a slice.
 Still per-*call* (not per-row) and therefore still a hazard for concurrent rows: `S->aq` / `S->actx` (the MLA attention
 scratch, sized for one row's heads), `W.scr` (a 64-byte claim word), and `F->rows_scr`'s per-row 8 slots (indexed by
 `R(i)` already, but the *count* is per call). Those are the next mechanical step before streams.
+
+## Increments 3b/4 (2026-10-29): streams, rotation, and the four alias classes it exposed
+
+Landed in code (all behind `STRATA_GLM_LAYER_PIPE`, default off):
+
+- `FastState::cs2` - a second compute stream; `rows_stream_` on the model, used by `rows_layers`, `rows_dsa`,
+  `rows_moe`, `rows_moe_grouped`, `rows_head` (`s = rows_stream_ ? rows_stream_ : F->cs`).
+- **the rotation** in `multi_rows`: for k in 0 .. L+n-2, row r runs layer k-r on its own stream, so row 1 is a layer
+  behind row 0. `row_base_` = r for the call, `cudaStreamSynchronize(cs2)` before `rows_head`.
+
+Getting it to *run* exposed four alias classes that a lockstep drive never touched. Fixed:
+
+| what | how it showed | fix |
+|---|---|---|
+| `F->conv[3]`, `F->g1`, `F->g2` (KDA mixer) | used whenever `n == 1`, i.e. every per-row call - the token path's single scratch | per-row `kconv`/`kg1`/`kg2` allocated unconditionally and taken by any per-row call (`per_row_bufs`) |
+| 21 n-row launches (`MvJob` for the KDA/DSA/FFN/head projections) | started at row 0 whatever row the call was | every base argument now `rows(S->X, stride, rb)` / `rows_q(...)` |
+| `S->aq`, `S->actx` | one block per call, written at stride `ad` | `+ rb * ad` |
+| `S->ascore`, `S->acells`, `S->aslot` (DSA score/selection) | base-0 | `R(i)`; these only exist with `STRATA_GLM_ROWS_ATTN=1`, so the rotation **requires** it and refuses otherwise |
+
+Symptom of each: no fault, no `route_error`, coherent-looking but wrong text ("Ex4x.. I, ..s... la1....zaca.."), then
+"# ZFS RAIDZZ1 Parityi" once most of them were fixed. Silent corruption, which is why they had to be found by design
+review rather than by a test.
+
+**Still shared, so the rotation is NOT certified:** the expert **spare claims** and the route counters (`tab`, `dcnt`,
+the per-layer spare pools) are claimed per *call*, and two rows at different layers route concurrently - their claims
+can collide, and a collided claim hands one row's blob to the other's plan. That is the corruption still visible.
+
+Therefore:
+
+- `STRATA_GLM_LAYER_PIPE=2` alone now **does nothing but say so** and runs the layers one at a time;
+- `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1` runs the rotation for development;
+- the shipped path (no flag) is unchanged - verified after every step: coherent output, 0 faults.
+
+Next, in order: (1) make the spare claim per row (a claim word per row, or serialize routes and let the computes
+overlap), (2) re-check `hc_part`/`hc_ctr` (allocated only with `STRATA_GLM_ROWS_BATCH`, and a per-row call reads
+`rows(S->hc_part, ..., R(i))`), (3) the numeric parity harness, (4) the timing.
