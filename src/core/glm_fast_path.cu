@@ -5538,7 +5538,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     }();
     static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
-                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
+                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, (rows_stream_ != nullptr ? rows_stream_ : F->cs),
                   pred ? (pred_logits != nullptr ? pred_logits : F->plog) : nullptr,
                   pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? (pred_pf_n > 0 ? pred_pf_n : F->max_pf) : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
@@ -5555,7 +5555,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
                                  bool& pf_pending, std::string& err, bool rows) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline row: its own stream)
     const auto& Ly = F->L[(size_t) il];
     const int FFs = g.n_ff_exp * g.n_shared;
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
@@ -5566,7 +5566,10 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     md.pf_n = F->pf_n_buf[il & 1];
     // the CPU lane splits this layer's RAM-tier experts when the CPU has a dot product for its types
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
-    fast_moe_route(il, io, md, F->sh_hq, pred, n_ah, ah_bias, lane);
+    // a per-row pipeline call passes the row as `win` (the service answers the CPU lane into that row's slot) with
+    // win_n 0, so the routes are answered on their own rather than merged as one layer's window
+    const int row_win = rows_stream_ != nullptr ? row_base_ : 0;
+    fast_moe_route(il, io, md, F->sh_hq, pred, n_ah, ah_bias, lane, row_win, 0, 0);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:

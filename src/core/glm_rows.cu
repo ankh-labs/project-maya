@@ -149,11 +149,11 @@ bool Glm5Model::rows_alloc(std::string& err) {
         for (auto& p : S->kconv) p = f32(DI);
         S->kg1 = f32(DI);
         S->kg2 = f32(DI);
-        if (rows_batch_on()) {
-            S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
-            S->hc_part = f32(S->hc_part_n);
-            S->hc_ctr = take(64);
-        }
+        // the residual mixing's (mHC) scratch: the batched path AND a pipeline row need their own - a per-row call used
+        // the token path's shared F->part / F->counter, which two rows then wrote at once (a non-finite residual)
+        S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
+        S->hc_part = f32(S->hc_part_n);
+        S->hc_ctr = take(64);
         if (attn) {   // (STRATA_GLM_ROWS_ATTN's buffers: none with the setting off)
             S->aq = f32((int64_t) g.n_head * g.kv_lora);
             S->actx = f32((int64_t) g.n_head * g.kv_lora);
@@ -346,8 +346,8 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.hc_eps = g.hc_eps;
         h.iters = g.sinkhorn_iters;
         h.n_embd = E;
-        h.part = F->part;
-        h.counter = F->counter;
+        h.part = per_row_bufs ? nullptr : F->part;        // (per row: set in hc_row)
+        h.counter = per_row_bufs ? nullptr : F->counter;
         const auto hc_row = [&](int i, const float* block_out) {
             h.block_out = block_out;
             h.R_old = rw[i].Rc;
@@ -358,14 +358,16 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             h.post = rows(S->post, 8, R(i));
             h.comb = rows(S->comb, 16, R(i));
             h.x = rows(S->x, E, R(i));
-            h.xq = rows_q(S->xq, E, i);
+            h.xq = rows_q(S->xq, E, R(i));
+            if (per_row_bufs) {
+                h.part = rows(S->hc_part, S->hc_part_n, R(i));
+                h.counter = (unsigned int*) (S->hc_ctr + (size_t) R(i) * 64);   // (take(64): 64 bytes a row)
+            }
             if (!batch) {
                 gf::hc(h, s);
                 return;
             }
             hb[i] = h;   // (launched for all the rows at once: hc_rows)
-            hb[i].part = rows(S->hc_part, S->hc_part_n, R(i));
-            hb[i].counter = (unsigned int*) (S->hc_ctr + (size_t) R(i) * 64);   // (take(64): 64 bytes a row)
         };
         // ---- the attention-side read (fused with the previous FFN's write), per row
         h.w_fn = Ly.hc_attn_fn;
@@ -819,7 +821,10 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, K = g.n_exp_used;
-    if (n < 2) return false;
+    // n == 1 is fine when a pipeline driver runs one row per call: this is the path that builds a per-ROW MoeDev
+    // (plan / fetch_src / cpu_lane / wait channel).  The rows_moe fallback below uses the GLOBAL F->md, so every row
+    // shared one plan and one channel - the non-finite router input this produced at layer 19.
+    if (n < 2 && row_base_ == 0) return false;
     const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (STRATA_GLM_MULTI_MTP)
     if ((n > F->rows_group && !wide) || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
         (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
@@ -873,13 +878,15 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         m.scratch = F->rows_scr + 8 * R(i);
         // this row's OWN handshake channel: wait_seq[i] and resp[i].  Row 0 is channel 0, exactly the lone token
         // path, so n = 1 is unchanged; n > 1 gives each waiter its own word and answer buffer.
-        m.wait_ch = i & 7;
+        // keyed on the ROW's slot, not the call's position: a per-row call always has i == 0, so `i & 7` put every
+        // pipeline row on channel 0 - the very race the channels exist to prevent
+        m.wait_ch = R(i) & 7;
         if (pred_on) {   // per-row prefetch staging: the token path's pf buffers hold one route's stage
             m.pf_src = S->pf_src + 8 * R(i);
             m.pf_dst = S->pf_dst + 8 * R(i);
             m.pf_n = S->pf_n + i;
         }
-        if (i > 0 && md.cpu_seq != nullptr) {
+        if (R(i) > 0 && md.cpu_seq != nullptr) {
             m.cpu_seq = W.cpu_seq_w + 16 * R(i);
             m.cpu_ans = W.ans_d[R(i)];
         }
@@ -897,7 +904,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         const gf::MoeDev m = row_dev(i);
         const MoeIo io = {row_at(S->x, E, R(i)), rowq_at(S->xq, E, R(i)), row_at(S->rlog, g.n_expert, R(i)),
                           row_at(S->sh_g, FFs, R(i)), row_at(S->sh_u, FFs, R(i)), row_at(S->ffn, E, R(i))};
-        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) R(i) * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
+        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) R(i) * W.sh_hq_s, pred_on, 0, no_bias, lane,
+                       rb > 0 ? R(i) : i, rb > 0 ? 0 : n, rb > 0 ? 0 : 1,
                        row_at(S->plog, g.n_expert, R(i)), pred_pf);
         ++F->expected;
         if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * R(i), K);

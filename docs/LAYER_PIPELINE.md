@@ -271,3 +271,42 @@ off PATH at the time of writing.)
 
 Everything stays behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`; the default and the shipped
 path are untouched and were re-verified after each build.
+
+### Two more real bugs, and the failure mode that replaced them
+
+Chasing the non-finite router input (log: `glm router: layer 19/20 decode invalid expert ID or non-finite score`)
+found two more classes, both now fixed:
+
+7. **`fast_moe_experts` ignored the row's MoeDev.** It rebuilt `md = F->md` (the GLOBAL plan / fetch_src / cpu-lane /
+   wait channel), so in a per-row drive every row shared one plan and one channel. The per-row MoeDev only ever
+   existed in `rows_moe_grouped`. Fixed by letting a pipeline row (n == 1, row_base_ > 0) use that path: the
+   `n < 2` gate is now `n < 2 && row_base_ == 0`, and its route passes the row as `win` with `win_n = 0`.
+8. **The residual mixing (mHC) used the token path's shared scratch.** `h.part = F->part`, `h.counter = F->counter`,
+   used on *every* row, and `hc_part`/`hc_ctr` were allocated only with `STRATA_GLM_ROWS_BATCH`. Two rows wrote one
+   residual buffer - a non-finite residual is exactly what the router then reported. Now per row (`R(i)`), allocated
+   unconditionally. Also `h.xq` still indexed by `i` rather than `R(i)`; fixed.
+
+Plus the stream bug behind the earlier chaos: `fast_moe_experts` and `fast_moe_route` hardcoded `F->cs`, so in a
+per-row drive the **experts ran on the engine stream while the layer's inputs were produced on the row's stream**,
+with no ordering between them.
+
+After these, one run of three produced a fully coherent answer ("# ZFS RAIDZ1 Parity Distribution A RAIDZ1 vdev
+protects against the failure of a single disk by ..."). The rest failed, but **differently**:
+
+> `the engine stopped itself because it had stopped making progress - a hang it caught`
+
+That is **head-of-line blocking between the two channels**, and it is structural, not a bug in the slicing:
+
+- the service answers the routing ring strictly in `seq` order;
+- the route kernels take that `seq` from one shared atomic counter, so the two rows' sequences interleave in
+  whatever order the GPU happens to run them;
+- `moe_wait` / `moe_wait_fetch` occupy one block per SM and spin. If row B's route publishes first and spins, row A's
+  route may never get an SM to publish the earlier sequence the service is waiting for. Deadlock, caught by the
+  watchdog.
+
+**So the next change is the protocol, not the buffers:** either a per-channel ring (the service answers each channel
+on its own, no global order), or serialize the *routes* across rows with events while leaving the computes overlapped
+- which is the shape originally proposed and is the cheaper of the two.
+
+Everything remains behind `STRATA_GLM_LAYER_PIPE=2` + `STRATA_GLM_PIPELINE_UNCERTIFIED=1`. Shipped path re-verified
+after each build (coherent output, probe answering).
