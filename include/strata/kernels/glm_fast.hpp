@@ -290,6 +290,8 @@ struct MoeDev {
     int* pf_n = nullptr;                       // ... and how many (the side-stream fetch kernel reads these)
     unsigned int* seq = nullptr;               // the device's request counter
     unsigned int* wait_seq = nullptr;          // the seq the wait kernel must see answered (0 = none)
+    int wait_ch = 0;                           // WHICH channel: wait_seq[ch] + resp[ch].  One a concurrent row
+                                               // (docs/LAYER_PIPELINE.md); 0 is the lone token path, unchanged.
     void* ring = nullptr;                      // host-mapped request ring (device pointer)
     const void* resp = nullptr;                // host-mapped response (device pointer)
     float* cpu_part = nullptr;                 // n_embd: the host's contribution (misses computed off-GPU)
@@ -339,7 +341,9 @@ struct MoeRequest {
     int win;                     // ... and the answer slot they go to: a verify window's token (0: the lone answer)
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
     int win_rows;                // ... a batched rows step's group instead (STRATA_GLM_GROUP_EXPERTS): win the row,
-    int pad_;                    //     win_n the rows; their CPU lanes merged on this part's own pool
+    int ch;                      // the waiting row's channel: the answer goes to resp[ch], not resp[0]
+                                 //     (this slot was pad_: the head is copied as 8-byte words, and
+                                 //     offsetof(x) must stay 8-aligned - so ch lives HERE, not before x)
     float x[4096];               // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.
@@ -360,6 +364,14 @@ struct MoeResponse {
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
     float cpu_part[4096];
 };
+
+/// The channel's wait word and answer buffer.  wait_seq is 8 words (a 64-byte arena take); channel 0 is the lone
+/// token path, so a single request is bit-for-bit what it was.  Two rows in flight use channels 1..n-1 and cannot see
+/// each other's handshake - the thing that made a second concurrent waiter unsafe (docs/LAYER_PIPELINE.md).
+__device__ __forceinline__ unsigned int* moe_wseq(const MoeDev& d) { return d.wait_seq + (d.wait_ch & 7); }
+__device__ __forceinline__ const MoeResponse* moe_resp_ch(const MoeDev& d) {
+    return ((const MoeResponse*) d.resp) + (d.wait_ch & 7);
+}
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan
 /// lookup in `tab`, the request publish, and the shared expert's swiglu + q8_1.
 void moe_route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w,

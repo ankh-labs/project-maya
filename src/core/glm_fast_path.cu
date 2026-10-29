@@ -951,6 +951,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->md.plan_id = (int*) fa_take(at, 8);
     F->md.seq = (unsigned int*) fa_take_b(at, 64);
     F->md.wait_seq = (unsigned int*) fa_take_b(at, 64);
+    // 8 channels of handshake (docs/LAYER_PIPELINE.md): channel 0 is the lone token path; a concurrent row takes its
+    // own word and its own answer buffer below, so two waiters cannot consume or reset one another's seq.
+    if (!glmfast::cuda_ok(cudaMemset(F->md.wait_seq, 0, 64), "GLM wait channel reset", err)) return false;
     F->md.cpu_part = fa_take(at, E);
     F->md.cpu_flag = (int*) fa_take_b(at, 64);
     if ((size_t) (at - (uint8_t*) F->arena) > need) {
@@ -986,11 +989,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: the route error flag did not allocate";
         return false;
     }
-    if (cudaHostAlloc(&hp, sizeof(gf::MoeResponse), cudaHostAllocMapped) != cudaSuccess) {
+    if (cudaHostAlloc(&hp, sizeof(gf::MoeResponse) * 8, cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the routing response did not allocate";
         return false;
     }
-    std::memset(hp, 0, sizeof(gf::MoeResponse));
+    std::memset(hp, 0, sizeof(gf::MoeResponse) * 8);
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
@@ -4652,7 +4655,7 @@ void Glm5Model::fast_service() {
                     return v == nullptr || std::atoi(v) != 0;
                 }();
                 const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
-                gf::MoeResponse* Rp = F->resp_h;
+                gf::MoeResponse* Rp = F->resp_h + (size_t) (rq->ch & 7);   // the waiter's own buffer
                 if (stream) {
                     static bool said = false;
                     if (!said) {
