@@ -665,6 +665,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&F->cs2, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
@@ -3993,6 +3994,7 @@ void Glm5Model::fast_destroy() {
     if (F->ev_pf) cudaEventDestroy(F->ev_pf);
     if (F->ev_pf_prev) cudaEventDestroy(F->ev_pf_prev);
     if (F->cs) cudaStreamDestroy(F->cs);
+    if (F->cs2) cudaStreamDestroy(F->cs2);
     if (F->copy) cudaStreamDestroy(F->copy);
     if (F->ps) cudaStreamDestroy(F->ps);
     delete F;

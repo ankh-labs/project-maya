@@ -143,10 +143,13 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->head_xq = q8(E);
         S->logits = f32(g.n_vocab);
         S->tok = (int*) take(sizeof(int));
-        if (rows_batch_on()) {   // (STRATA_GLM_ROWS_BATCH's own per-row scratch: none with the setting off)
-            for (auto& p : S->kconv) p = f32(DI);
-            S->kg1 = f32(DI);
-            S->kg2 = f32(DI);
+        // the KDA mixer's per-row scratch: the batched path (STRATA_GLM_ROWS_BATCH) AND the layer pipeline need it - a
+        // row run on its own stream must not share the token path's F->conv / F->g1 / F->g2, which is what it used when
+        // n == 1 (two pipelined rows then wrote the same buffers: coherent-looking garbage, no fault)
+        for (auto& p : S->kconv) p = f32(DI);
+        S->kg1 = f32(DI);
+        S->kg2 = f32(DI);
+        if (rows_batch_on()) {
             S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
             S->hc_part = f32(S->hc_part_n);
             S->hc_ctr = take(64);
@@ -309,12 +312,13 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     const Glm5Geometry& g = g_;
     const int E = g.n_embd, DI = g.d_inner();
     cudaSetDevice(dev_);
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline driver gives a row its own)
     auto& rows = row_at;
     auto& rows_q = rowq_at;
     // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
     // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
     // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const int rb = row_base_;   // this row's block of every n-row buffer below
     const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
@@ -331,6 +335,9 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     const bool batch = rows_batch_on() && n > 1;
     // (kda_layers is built for head_dim 128, as the window commit's replay: else the KDA one row at a time)
     const bool kda_batch = batch && !dup && g.kda_head_dim == 128;
+    // a pipeline call runs ONE row, so `batch` is false for it, but it still needs per-row buffers rather than the token
+    // path's single set (docs/LAYER_PIPELINE.md)
+    const bool per_row_bufs = batch || row_base_ > 0;
     gf::HcArgs hb[gf::kMaxMvNt];
     for (int il = ilf; il < ilt; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -368,18 +375,18 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         for (int i = 0; i < n; ++i) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, R(i)));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
-            if (rows_ != nullptr && i < 8) rows_->cur[i].il = il + 1;   // (the map: this row is one layer on)
+            if (rows_ != nullptr && row_base_ + i < 8) rows_->cur[row_base_ + i].il = il + 1;   // (the map: this row is one layer on)
         }
         if (batch) gf::hc_rows(hb, n, s);
 
         if (Ly.recr) {
             gf::MvJob j[6];
-            j[0] = {Ly.q.q, S->xq, S->x, S->proj[0], nullptr, 1.0f, Ly.q.type, E, DI};
-            j[1] = {Ly.k.q, S->xq, S->x, S->proj[1], nullptr, 1.0f, Ly.k.type, E, DI};
-            j[2] = {Ly.v.q, S->xq, S->x, S->proj[2], nullptr, 1.0f, Ly.v.type, E, DI};
-            j[3] = {Ly.f_a, nullptr, S->x, S->fa, nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
-            j[4] = {Ly.g_a, nullptr, S->x, S->ga, nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
-            j[5] = {Ly.beta, nullptr, S->x, S->beta, nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
+            j[0] = {Ly.q.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->proj[0], DI, rb), nullptr, 1.0f, Ly.q.type, E, DI};
+            j[1] = {Ly.k.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->proj[1], DI, rb), nullptr, 1.0f, Ly.k.type, E, DI};
+            j[2] = {Ly.v.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->proj[2], DI, rb), nullptr, 1.0f, Ly.v.type, E, DI};
+            j[3] = {Ly.f_a, nullptr, rows(S->x, E, rb), rows(S->fa, g.kda_head_dim, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
+            j[4] = {Ly.g_a, nullptr, rows(S->x, E, rb), rows(S->ga, g.kda_head_dim, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
+            j[5] = {Ly.beta, nullptr, rows(S->x, E, rb), rows(S->beta, g.n_head, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
             if (keep_in) {   // (STRATA_GLM_MULTI_MTP: the window rows' inputs, for the commit's replay)
                 gf::KdaGatherArgs ga;
@@ -408,7 +415,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
                 for (int c = 0; c < 3; ++c) {
                     k.proj[c] = rows(S->proj[c], DI, R(i));
                     k.conv_w[c] = Ly.conv[c];
-                    k.out[c] = kda_batch ? rows(S->kconv[c], DI, R(i)) : F->conv[c];
+                    k.out[c] = per_row_bufs ? rows(S->kconv[c], DI, R(i)) : F->conv[c];
                 }
                 k.conv_state = rw[i].state + (*rw[i].kda_conv)[(size_t) il];
                 k.fa = rows(S->fa, g.kda_head_dim, R(i));
@@ -418,8 +425,8 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
                 k.dt_bias = Ly.dt_bias;
                 k.ssm_a = Ly.ssm_a;
                 k.lower_bound = g.kda_lb;
-                k.g1 = kda_batch ? rows(S->kg1, DI, R(i)) : F->g1;
-                k.g2 = kda_batch ? rows(S->kg2, DI, R(i)) : F->g2;
+                k.g1 = per_row_bufs ? rows(S->kg1, DI, R(i)) : F->g1;
+                k.g2 = per_row_bufs ? rows(S->kg2, DI, R(i)) : F->g2;
                 k.n_head = g.n_head;
                 k.head_dim = g.kda_head_dim;
                 k.d_conv = g.d_conv;
@@ -433,17 +440,21 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
                     kr[i].state = rw[i].state + (*rw[i].kda_S)[(size_t) il];
                     kr[i].g2 = k.g2;
                     kr[i].norm_w = Ly.ssm_norm;
-                    kr[i].out = rows_q(S->gated_q, DI, i);
+                    kr[i].out = rows_q(S->gated_q, DI, R(i));
                     continue;
                 }
                 gf::kda_prep(k, s);
-                gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, rows(S->beta, g.n_head, R(i)),
-                            rw[i].state + (*rw[i].kda_S)[(size_t) il], F->g2, Ly.ssm_norm, g.norm_eps, g.n_head,
-                            g.kda_head_dim, rows_q(S->gated_q, DI, i), s);
+                gf::kda_rec(per_row_bufs ? rows(S->kconv[0], DI, R(i)) : F->conv[0],
+                            per_row_bufs ? rows(S->kconv[1], DI, R(i)) : F->conv[1],
+                            per_row_bufs ? rows(S->kconv[2], DI, R(i)) : F->conv[2],
+                            per_row_bufs ? rows(S->kg1, DI, R(i)) : F->g1, rows(S->beta, g.n_head, R(i)),
+                            rw[i].state + (*rw[i].kda_S)[(size_t) il],
+                            per_row_bufs ? rows(S->kg2, DI, R(i)) : F->g2, Ly.ssm_norm, g.norm_eps, g.n_head,
+                            g.kda_head_dim, rows_q(S->gated_q, DI, R(i)), s);
             }
             for (int i0 = 0; kda_batch && i0 < n; i0 += gf::kKdaLayers)
                 gf::kda_layers(kp + i0, kr + i0, std::min(gf::kKdaLayers, n - i0), g.norm_eps, s);
-            gf::MvJob o = {Ly.out.q, S->gated_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, DI, E};
+            gf::MvJob o = {Ly.out.q, rows_q(S->gated_q, DI, rb), nullptr, rows(S->mixer, E, rb), nullptr, 1.0f, Ly.out.type, DI, E};
             if (!mv(&o, 1, "kda output")) return false;
         } else {
             if (!rows_dsa(il, rw, n, err)) return false;
@@ -462,13 +473,13 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
 
         if (!Ly.moe) {
             gf::MvJob j[2];
-            j[0] = {Ly.ffn_gate.q, S->xq, S->x, S->dg, nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
-            j[1] = {Ly.ffn_up.q, S->xq, S->x, S->du, nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
+            j[0] = {Ly.ffn_gate.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->dg, g.n_ff_dense, rb), nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
+            j[1] = {Ly.ffn_up.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->du, g.n_ff_dense, rb), nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
             if (!mv(j, 2, "dense ffn")) return false;
             for (int i = 0; i < n; ++i)
                 gf::swiglu_q8(rows(S->dg, g.n_ff_dense, R(i)), rows(S->du, g.n_ff_dense, R(i)), g.swiglu_shexp,
-                              g.n_ff_dense, rows_q(S->dhq, g.n_ff_dense, i), s);
-            gf::MvJob dn = {Ly.ffn_down.q, S->dhq, nullptr, S->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                              g.n_ff_dense, rows_q(S->dhq, g.n_ff_dense, R(i)), s);
+            gf::MvJob dn = {Ly.ffn_down.q, rows_q(S->dhq, g.n_ff_dense, rb), nullptr, rows(S->ffn, E, rb), nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
                             E};
             if (!mv(&dn, 1, "dense ffn down")) return false;
         } else {
@@ -492,13 +503,14 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     const Glm5Geometry& g = g_;
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared;
     (void) FFs;
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline driver gives a row its own)
     auto& rows = row_at;
     auto& rows_q = rowq_at;
     // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
     // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
     // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
     const auto R = [&](int k) { return row_base_ + k; };
+    const int rb = row_base_;   // this row's block of aq / actx (ad floats each)
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -507,11 +519,11 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     const auto& Ly = F->L[(size_t) il];
     const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
     gf::MvJob j[5];
-    j[0] = {Ly.q_a.q, S->xq, S->x, S->qr_raw, nullptr, 1.0f, Ly.q_a.type, E, g.q_lora};
-    j[1] = {Ly.kv_a.q, S->xq, S->x, S->kv_raw, nullptr, 1.0f, Ly.kv_a.type, E, g.kv_lora};
-    j[2] = {Ly.idx_k, nullptr, S->x, S->ik_raw, nullptr, 1.0f, gf::kTypeBF16, E, g.idx_key};
-    j[3] = {Ly.idx_gate, nullptr, S->x, S->ig_raw, nullptr, 1.0f, gf::kTypeBF16, E, g.idx_key};
-    j[4] = {Ly.idx_proj, nullptr, S->x, S->iw, nullptr, prescale, gf::kTypeBF16, E, g.idx_heads};
+    j[0] = {Ly.q_a.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->qr_raw, g.q_lora, rb), nullptr, 1.0f, Ly.q_a.type, E, g.q_lora};
+    j[1] = {Ly.kv_a.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->kv_raw, g.kv_lora, rb), nullptr, 1.0f, Ly.kv_a.type, E, g.kv_lora};
+    j[2] = {Ly.idx_k, nullptr, rows(S->x, E, rb), rows(S->ik_raw, g.idx_key, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.idx_key};
+    j[3] = {Ly.idx_gate, nullptr, rows(S->x, E, rb), rows(S->ig_raw, g.idx_key, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.idx_key};
+    j[4] = {Ly.idx_proj, nullptr, rows(S->x, E, rb), rows(S->iw, g.idx_heads, rb), nullptr, prescale, gf::kTypeBF16, E, g.idx_heads};
     if (!mv(j, 5, "dsa projections")) return false;
     for (int i = 0; i < n; ++i) {
         gf::DsaPrepArgs d;
@@ -541,11 +553,11 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         gf::dsa_prep(d, s);
     }
     gf::MvJob j2[2];
-    j2[0] = {Ly.q_b.q, S->qr_q, S->qr, S->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
+    j2[0] = {Ly.q_b.q, rows_q(S->qr_q, g.q_lora, rb), rows(S->qr, g.q_lora, rb), rows(S->q, g.n_head * g.qk_nope, rb), nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
     j2[1] = Ly.idx_q_b_x.q != nullptr   // (an EXL3 pack quantizes the indexer's q_b)
-                ? gf::MvJob{Ly.idx_q_b_x.q, S->qr_q, S->qr, S->iq, nullptr, 1.0f, Ly.idx_q_b_x.type, g.q_lora,
+                ? gf::MvJob{Ly.idx_q_b_x.q, rows_q(S->qr_q, g.q_lora, rb), rows(S->qr, g.q_lora, rb), rows(S->iq, g.idx_heads * (int64_t) g.idx_key, rb), nullptr, 1.0f, Ly.idx_q_b_x.type, g.q_lora,
                             g.idx_heads * g.idx_key}
-                : gf::MvJob{Ly.idx_q_b, nullptr, S->qr, S->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
+                : gf::MvJob{Ly.idx_q_b, nullptr, rows(S->qr, g.q_lora, rb), rows(S->iq, g.idx_heads * (int64_t) g.idx_key, rb), nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!mv(j2, 2, "dsa q")) return false;
     // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
@@ -570,7 +582,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     const uint16_t* a_lat[gf::kMaxMvNt];
     const int* a_cells[gf::kMaxMvNt];
     int a_nsel[gf::kMaxMvNt];
-    if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq, ad, s);
+    if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq + rb * ad, ad, s);
     gf::DsaSelectRows sr;   // (with the rows' attention: the rows' selections in one launch, then each one resolved)
     int n_sr = 0;
     const bool small = attn && rows_small_on();   // (STRATA_GLM_ROWS_SMALL: the rows' scores in one launch too)
@@ -616,7 +628,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
         gf::mla(rows(S->q, qd, R(i)), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
-                g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
+                g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, R(i)), s,
                 lat_q8_, nullptr, true);   // (a decode row: the token path's kernels)
     }
     if (attn) {
@@ -651,15 +663,15 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             i += len;
         }
         if (n_kr > 0) gf::glm_kv_resolve_rows(kr, n_kr, kr_row, kr_page, s);
-        if (!gf::mla_attend_rows(S->aq, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
+        if (!gf::mla_attend_rows(S->aq + rb * ad, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
                                  S->apart, S->apart_tokens, s, lat_q8_)) {
             err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)
             return false;
         }
-        gf::mla_out(S->actx, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
+        gf::mla_out(S->actx + rb * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
                     (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s, lat_q8_);
     }
-    gf::MvJob o = {Ly.out.q, S->attn_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
+    gf::MvJob o = {Ly.out.q, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, rb), nullptr, rows(S->mixer, E, rb), nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
                    E};
     if (!mv(&o, 1, "dsa output")) return false;
     return true;
@@ -730,7 +742,7 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     const Glm5Geometry& g = g_;
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared;
     (void) FFs;
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline driver gives a row its own)
     auto& rows = row_at;
     auto& rows_q = rowq_at;
     // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
@@ -814,7 +826,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         }
         return false;
     }
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline driver gives a row its own)
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
     const bool skip_empty = glmfast::skip_empty_on();
     const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
@@ -1020,12 +1032,13 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
     cudaSetDevice(dev_);
-    cudaStream_t s = F->cs;
+    cudaStream_t s = rows_stream_ != nullptr ? rows_stream_ : F->cs;   // (a pipeline driver gives a row its own)
     auto& rows = row_at;
     auto& rows_q = rowq_at;
     // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
     // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
     // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const int rb = row_base_;   // this row's block of head_x / head_xq / logits
     const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
@@ -1037,7 +1050,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
         gf::head_prep(rw[i].res, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, R(i)),
                       rows_q(S->head_xq, E, i), s);
     const WSlot& ow = ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    gf::MvJob o = {ow.q, rows_q(S->head_xq, E, rb), rows(S->head_x, E, rb), rows(S->logits, g.n_vocab, rb), nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (!mv(&o, 1, "output head")) return false;
     for (int i = 0; i < n; ++i) {
@@ -1076,11 +1089,54 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     // STRATA_GLM_LAYER_PIPE (docs/LAYER_PIPELINE.md, increment 1): drive the layers ONE AT A TIME through the same
     // body, so the loop becomes something a cross-token pipeline can offset.  This arm only proves the split is
     // arithmetic-neutral (bit-identical tokens against the default path); the schedule itself comes next.
-    static const bool layer_pipe = [] {
+    static const int pipe_mode = [] {
         const char* v = getenv("STRATA_GLM_LAYER_PIPE");
-        return v != nullptr && std::atoi(v) != 0;
+        return v != nullptr ? std::atoi(v) : 0;
     }();
-    if (layer_pipe) {
+    // The rotation is NOT certified: two rows still share state that is claimed per CALL, not per row - the expert
+    // spare claims and the route counters, which the two routes take concurrently.  It stays unreachable without an
+    // explicit acknowledgement so that no run can mistake its output for the model's (docs/LAYER_PIPELINE.md).
+    static const bool uncertified = getenv("STRATA_GLM_PIPELINE_UNCERTIFIED") != nullptr;
+    if (pipe_mode >= 2 && !uncertified) {
+        static std::atomic<bool> told_unc{false};
+        if (!told_unc.exchange(true))
+            std::fprintf(stderr, "glm rows: CUDA%d STRATA_GLM_LAYER_PIPE=2 is not certified (per-row spare claims are "
+                                 "still shared) - running the layers one at a time; set STRATA_GLM_PIPELINE_UNCERTIFIED=1 "
+                                 "to run the rotation anyway\n", dev_);
+    }
+    if (pipe_mode >= 2 && uncertified && n >= 2 && F->cs2 != nullptr && S->aq != nullptr) {
+        // ---- the rotation (docs/LAYER_PIPELINE.md, increment 4): row r runs the layer k - r while row 0 runs k, so one
+        // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
+        // layers stay in order; the two streams are free to overlap.  One layer a row, one row per call - the slices and
+        // the handshake channel both key off row_base_, so they cannot collide.
+        const int L = l1_ - l0_;
+        for (int k = 0; k < L + n - 1; ++k) {
+            for (int r = 0; r < n; ++r) {
+                const int il = l0_ + k - r;
+                if (il < l0_ || il >= l1_) continue;
+                row_base_ = r;
+                rows_stream_ = (r & 1) ? F->cs2 : F->cs;
+                if (!rows_layers(rw + r, 1, err, il, il + 1)) {
+                    row_base_ = 0;
+                    rows_stream_ = nullptr;
+                    return false;
+                }
+            }
+        }
+        row_base_ = 0;
+        rows_stream_ = nullptr;
+        // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
+        cudaStreamSynchronize(F->cs2);
+    } else if (pipe_mode >= 2) {
+        // the per-row DSA score/selection buffers only exist with STRATA_GLM_ROWS_ATTN=1; without them the rows would
+        // share F->score / F->cells, so the pipeline refuses rather than corrupting (said once)
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "glm rows: CUDA%d the layer pipeline needs STRATA_GLM_ROWS_ATTN=1 (per-row DSA buffers) - "
+                                 "running the layers one at a time\n", dev_);
+        for (int il = l0_; il < l1_; ++il)
+            if (!rows_layers(rw, n, err, il, il + 1)) return false;
+    } else if (pipe_mode >= 1) {
         for (int il = l0_; il < l1_; ++il)
             if (!rows_layers(rw, n, err, il, il + 1)) return false;
     } else if (!rows_layers(rw, n, err)) {

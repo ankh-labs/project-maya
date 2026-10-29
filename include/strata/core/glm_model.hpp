@@ -916,6 +916,9 @@ public:
     // call over n rows; a driver that runs ONE row per call sets it to that row's index so two rows in flight never
     // share a slice (docs/LAYER_PIPELINE.md, increment 3b).
     int row_base_ = 0;
+    // The stream the layer path runs on; nullptr = the engine's compute stream.  A pipeline driver sets a row's own
+    // stream before enqueueing its layers, so two rows' layers overlap (docs/LAYER_PIPELINE.md).
+    cudaStream_t rows_stream_ = nullptr;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
     void rows_destroy();
 
