@@ -391,6 +391,27 @@ struct Glm5Model::FastState {
     // overloading an int with -1 as "no pipeline" makes the guard's `>= 0` test FALSE exactly during spin-up, when the
     // floor arithmetic (l0_ + k - (n-1)) is still below the first layer - i.e. the invariant was inert at the moment
     // slots are most tightly packed.
+    // ---- the DEMOTION LADDER (DEFUSED_SCHEDULER_SPEC, item 5).  A slot that cannot be served from where it wants has
+    // to fall to the next rung, never stall and never fail.  The first rung is the one the skew invariant creates: with
+    // floor clamped to l0_, the early rounds of a step have NO evictable layer, so a miss there has no spare and no
+    // candidate - that case must demote.
+    enum PipeStage : int {
+        kStageResident = 0,      // already in a VRAM slot
+        kStageInFlight = 1,      // its fetch has landed, the slot is there for it
+        kStageReorder = 2,       // not ready now: run another slot's layer first and come back
+        kStageCpuLane = 3,       // compute it on the host (a RAM-tier blob exists)
+        kStageDisk = 4           // read it off disk (models that do not fit; the lane's disk->host read)
+    };
+    /// The ladder: the first rung that is available wins, in this order.  Pure, so it costs nothing to call and nothing
+    /// to test - the caller decides availability, this decides precedence.
+    static PipeStage pipe_stage(bool resident, bool in_flight, bool can_reorder, bool can_cpu, bool can_disk) {
+        if (resident) return kStageResident;
+        if (in_flight) return kStageInFlight;
+        if (can_reorder) return kStageReorder;
+        if (can_cpu) return kStageCpuLane;
+        if (can_disk) return kStageDisk;
+        return kStageReorder;   // nothing is available: reorder is the only rung that cannot fail a token
+    }
     std::atomic<bool> pipe_active{false};
     std::atomic<int> pipe_floor{-1};
     int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
