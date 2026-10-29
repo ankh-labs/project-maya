@@ -4767,6 +4767,11 @@ void Glm5Model::fast_service() {
                     if (F->helper.owns(key)) {
                         helper_keys[hn] = key;
                         helper_w[hn++] = rq->w[i];
+                    } else if (rq->cpu_src[i] == 0ull) {
+                        // STRATA_GLM_MISS_TO_CPU classified this expert to the lane but the host has no bytes for it yet
+                        // (the disk->host read is not implemented): fail closed and drop its weight rather than crash.
+                        static std::atomic<uint64_t> no_blob{0};
+                        no_blob.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         blob[ne] = (const uint8_t*) rq->cpu_src[i];
                         w[ne++] = rq->w[i];
@@ -5679,6 +5684,17 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
     return ok;
 }
 
+int Glm5Model::miss_to_cpu() {
+    // STRATA_GLM_MISS_TO_CPU=1: an expert that is on disk only is computed by the CPU LANE instead of taking a VRAM
+    // spare and a PCIe move (CPU compute 0.214 ms vs an NVMe fetch 2.98 ms).  Default OFF: the lane's host side still
+    // needs the disk->host read, and until that lands it fails closed (drops the weight) rather than dereferencing.
+    static const int on = [] {
+        const char* v = getenv("STRATA_GLM_MISS_TO_CPU");
+        return v != nullptr && std::atoi(v) != 0 ? 1 : 0;
+    }();
+    return on;
+}
+
 void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, void* sh_hq, bool pred, int n_ah,
                                const float* const* ah_bias, bool lane, int win, int win_n, int win_rows,
                                const float* pred_logits, int pred_pf_n) {
@@ -5709,7 +5725,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                       const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
                       const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
                       return il >= from ? w : 0.0f;
-                  }(), win_rows);
+                  }(), win_rows, miss_to_cpu());
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,

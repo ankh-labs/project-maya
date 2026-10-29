@@ -591,6 +591,7 @@ public:
                         const float* pred_logits = nullptr, int pred_pf_n = 0);
     // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
     // (glm_rows.cu); false with err empty: not here (the rows go one by one)
+    static int miss_to_cpu();   // STRATA_GLM_MISS_TO_CPU: disk-only experts go to the CPU lane
     bool rows_moe_grouped(int il, int n, std::string& err);
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
