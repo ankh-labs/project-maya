@@ -210,7 +210,13 @@ void Glm5Model::rows_destroy() {
 }
 
 bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) {
-    if (rows_stream_ != nullptr) {
+    // Gate on the FLAG, not on rows_stream_: rows_bind runs BEFORE the rotor sets rows_stream_, so gating on the stream
+    // made the check unreachable (it silently never ran).
+    static const bool pipe_flag_on = [] {
+        const char* v = getenv("STRATA_GLM_LAYER_PIPE");
+        return v != nullptr && std::atoi(v) >= 2;
+    }();
+    if (pipe_flag_on) {
         // The ladder's precedence, checked on the first pipelined bind.  FastState is NESTED in Glm5Model, so its
         // members are not injected into this scope: the names must be qualified (FastState::PipeStage), which is what
         // the first two attempts at this assertion got wrong.
