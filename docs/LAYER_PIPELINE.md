@@ -367,3 +367,43 @@ What survives:
 
 Method rule for whoever picks this up: **n >= 5 runs per build, and report the count**, or the comparison is noise.
 This is the same lesson as the token-equality retraction, in a different place.
+
+### Baseline flake rate (2026-10-29, `1d45044`, no rebuild, n = 12)
+
+12 identical-shape prompts, each with a unique "(variant k)" suffix so **prefill is not cached** (identical prompts
+would reuse the KV and never re-exercise the failing path):
+
+    clean 12 / 12      nan-guard lines added: 0      tokens 80/80/80/80/80/80/80/80/80/80/80/80
+
+So the committed build does **not** flake in this sample. Rule of three: with 0/12 the 95% upper bound on the per-run
+failure rate is ~22%, which is not tight enough to call it zero - but it is enough to interpret the earlier builds.
+
+**Re-reading the earlier builds against this baseline.** Counts of *clean runs observed* (this is the honest way to
+state it, since several were n=1):
+
+| build | observed | implication |
+|---|---|---|
+| field + allocation, no writer | **19 / 19 clean** (n=2, 1, 6, 12 across four boots) | consistent with the baseline |
+| any build with a *writer* present | **0 / 4 clean** | at a 22% upper-bound per-run rate, 4/4 failures have p < 0.3% - the writers are implicated |
+
+But the mechanism is **not** "the store executes and stomps memory": build 5 carried the writer *and* a first-store
+counter, printed neither, and failed anyway. What every failing build had that the clean ones lack is the
+**8-byte bigger `MoeDev`** (the field) *plus* a build in which something touches it. Builds 4 and 6 have the field and
+are clean, so the field alone is not it either.
+
+That leaves the two classes the instrumentation can distinguish, and neither has been ruled out:
+
+1. **the store executes and perturbs timing** (the field is 8 bytes, the block is 16 sectors from the ring) - build 5
+   would then be an instance where the store ran without its print, not one where it didn't run;
+2. **the presence of the writer changes the service loop's code enough to reorder the handshake** - the same class as
+   the fprintf finding, one step weaker.
+
+Both are timing, not spatial. The n=12 baseline is what makes that statement testable: a writer build at n >= 12 either
+shows ~0/12 (the writer is innocent and the earlier 4/4 was something else) or roughly 12/12 (it is decisive).
+
+### Method rules this bought (both were already paid for once)
+
+- **n >= 5 per build, report the count.** One run per build is noise; the four-build table was withdrawn for this.
+- **No I/O inside the service loop.** Two function-local atomics are nearly free; an `fprintf` is a syscall and a lock,
+  and it reordered a race by enough to change the layer from 20 to 11. Counters only, one dump at the end of a run.
+- **Vary the prompt when measuring prefill.** Identical prompts reuse the KV and skip the path under test.
