@@ -436,3 +436,23 @@ default-off knob whose only argument is pool preservation on a path we have not 
 needed, no lane choice takes the SSD tier off the critical path. The only levers are fetching it earlier (prefetch
 depth - the scheduler, which needs the primitive) or not needing it (lossy skip). **The disk tier is a scheduler
 problem**, and the spec's "N = 5-8 of cover to hide a 2.98 ms miss" is the honest statement of what that costs.
+
+### Fix: `-1` was overloaded, and it disabled the guard during spin-up (`f789a85` -> this commit)
+
+The publish was `floor = l0_ + k - (n-1)` with the guard `if (pipe_f >= 0 && il >= pipe_f)`. At k = 0 with n = 3 that is
+**-2**, so the guard's `>= 0` test failed and **every layer stayed evictable** while slots were live at layers
+0..n-2 - the invariant was inert exactly when the slots are most tightly packed, because "no pipeline" and "the floor
+arithmetic is still below the first layer" shared a sentinel.
+
+Fixed: `pipe_active` is its own atomic, `floor` is clamped to `std::max(l0_, l0_ + k - (n-1))`, and the boundary tests
+`pipe_on && il >= pipe_f`. The flag is cleared on **both** exits of the rotor, including the error return.
+
+**Consequence, and it is the ladder's first case.** With the clamp, the early rounds have *no* evictable layers at all -
+`il < floor` is empty at k = 0, and with n = 2 it stays empty through k = 1. That is semantically right (only layers
+this step has finished with may be given up) but it means a miss in those rounds has no spare and no eviction
+candidate. **That must demote, not fail.** So the ladder's first case is "no spare available -> demote", and its
+acceptance test is sharper than the tiny-pool run: **force a miss at layer 0 with a full pool and confirm it demotes.**
+
+**`S = n-1` is right, not a fudge** - the rotor's skew *is* the lead, so the cover window and the invariant's slack are
+the same quantity by construction. The pin set is therefore `S x N x 8` slots = **1 x 2 x 8 x 8.80 MB = 141 MB at n = 2**
+(0.45% of the 31.17 GB pool), not the 281 MB the spec originally estimated.
