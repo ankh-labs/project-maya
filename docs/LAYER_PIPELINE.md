@@ -341,3 +341,29 @@ Unresolved hypotheses (cheap to test, in this order):
 **Consequence:** `need_seq` stays field+allocation only - no writer - until (1)-(3) are separated. The readiness
 primitive is still unproven, so per the spec both the demotion ladder and the per-lane thread model stay blocked on
 it. That is the honest state, and it is one instrumented run away from being answerable.
+
+### CORRECTION to the "four builds" table above (same day, later)
+
+The table said the store was the trigger. **That is withdrawn.** Two later builds disprove it:
+
+- A build with the service write present **plus** a "first store" print and an out-of-range counter printed
+  **neither** line - the store never executed - and it failed anyway, at a **different layer** (`layer 11`,
+  63 of 189 routes) than the earlier failures (`layer 20`, 105 of 189).
+- The committed build (`2b1d1c4`, field + allocation, no writers) then ran **6/6 clean**, 0 nan-guard lines.
+
+So: the failing layer moves between builds and runs (11 vs 20), the store that "caused" it never ran in one failing
+build, and the only differences in that build were two function-local `std::atomic`s and one `fprintf` in the service
+loop. The instrumentation perturbed the outcome. **This is a Heisenbug, and single-run comparisons across builds are
+not admissible for it** - every statement above that rests on one run per build is now suspect, including the
+"130ef04 is clean" baseline (n=2).
+
+What survives:
+
+- the committed build has been clean 6/6 on identical prompts;
+- the failure, when it happens, is a **prefill** non-finite at a variable layer with a large fraction of invalid
+  routes (63-105 of 189), i.e. a whole layer's routing going bad, not one expert;
+- it is **not** spatial (the layer moves), **not** the index (both store sites are masked to `[0,8)`), and **not** the
+  store (it failed without one).
+
+Method rule for whoever picks this up: **n >= 5 runs per build, and report the count**, or the comparison is noise.
+This is the same lesson as the token-equality retraction, in a different place.
