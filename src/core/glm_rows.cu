@@ -1129,6 +1129,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // floor starts at the first layer and only moves forward; a slot may not run past floor + S.  The leader is
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
+        F->pipe_active.store(true, std::memory_order_release);   // from here the boundary's eviction rule applies
         // The rotor's skew IS the lead: row r runs layer k - r, so the spread is exactly n - 1.  S must be at least that
         // or the invariant would forbid the very advance it is meant to allow; the pin set is S x N x 8 slots.
         if (F->pipe_lead < n - 1) F->pipe_lead = n - 1;
@@ -1138,20 +1139,24 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (il < l0_ || il >= l1_) continue;
                 // floor = the lowest layer an active slot sits at; monotone within the step.  Published for the retire
                 // path and (later) the eviction rule "layers below floor only".
-                floor = l0_ + k - (n - 1);
+                // floor is clamped to the first layer: "everything is at or above l0_" is the honest answer during
+                // spin-up, where l0_ + k - (n-1) is still negative and no layer has finished yet.
+                floor = std::max(l0_, l0_ + k - (n - 1));
                 if (il > floor + F->pipe_lead) continue;   // unreachable while S >= n-1: the rotor cannot overshoot
                 row_base_ = r;
                 rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
                     row_base_ = 0;
                     rows_stream_ = nullptr;
+                    F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
             }
         }
         row_base_ = 0;
         rows_stream_ = nullptr;
-        F->pipe_floor.store(-1, std::memory_order_release);   // no pipeline in flight once the step's layers are done
+        F->pipe_active.store(false, std::memory_order_release);   // the step's layers are done: the fused rule resumes
+        F->pipe_floor.store(-1, std::memory_order_release);
         // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
         cudaStreamSynchronize(F->cs2);
     } else if (pipe_mode >= 2) {

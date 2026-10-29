@@ -387,6 +387,11 @@ struct Glm5Model::FastState {
     // within a step; no slot may advance past floor + S, and eviction may only consider layers strictly below floor.
     // -1 = no pipeline running (the fused path never sets it).  A single atomic: the rotor writes it, the retire and
     // boundary paths read it.
+    // pipe_active says a pipeline is running; pipe_floor is then always >= l0_ (clamped).  Keeping them apart matters:
+    // overloading an int with -1 as "no pipeline" makes the guard's `>= 0` test FALSE exactly during spin-up, when the
+    // floor arithmetic (l0_ + k - (n-1)) is still below the first layer - i.e. the invariant was inert at the moment
+    // slots are most tightly packed.
+    std::atomic<bool> pipe_active{false};
     std::atomic<int> pipe_floor{-1};
     int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
     unsigned int* need_seq_h = nullptr;   // [8] pinned: each channel's just-published seq (the route kernel writes it)

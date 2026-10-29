@@ -5251,9 +5251,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
             // so taking one there is the "advanced slot evicts what a lagging slot needs" hazard, and this is the line
             // that makes it unreachable rather than merely unlikely.  pipe_floor is -1 when no pipeline runs, so the
             // fused path is unaffected.
+            const bool pipe_on = F->pipe_active.load(std::memory_order_acquire);
             const int pipe_f = F->pipe_floor.load(std::memory_order_acquire);
             for (int il = l0_; il < lt_; ++il) {
-                if (pipe_f >= 0 && il >= pipe_f) continue;
+                if (pipe_on && il >= pipe_f) continue;
                 if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
                 const auto& P = F->lp[(size_t) il];
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
