@@ -37,6 +37,21 @@ struct Glm5Model::RowsState {
     float* plog = nullptr;                  // STRATA_GLM_ROWS_PRED_PF: each row's next-layer prediction logits
     unsigned long long* pf_src = nullptr;  // ... per-row prefetch staging (glm_fast.cu's pred block writes these)
     unsigned long long* pf_dst = nullptr;
+    // ---- the cross-token layer pipeline's map (docs/LAYER_PIPELINE.md, increment 2)
+    //
+    // One cursor a row: which request it is, which layer it is about to run, and which stage of that layer it is in
+    // (x = fetch the layer's experts, y = execute against them, z = route the NEXT layer's set).  The row's own
+    // position and KV state live in its SeqCtx; this is only the progress through the layer stack, which is what lets
+    // one request sit at layer L while another is at L-1.  Host-side on purpose: the scheduler reads and advances it
+    // between launches, and nothing in a kernel needs it.
+    struct RowCursor {
+        int slot = -1;      // the row index in this step's set (-1: free)
+        int il = 0;         // the layer it will run next
+        int stage = 0;      // 0 x, 1 y, 2 z
+        int lead = 0;       // layers ahead of the slowest row (the pipeline depth it is using)
+        bool done = false;  // past l1_: nothing left for this token
+    };
+    RowCursor cur[8];
     int* pf_n = nullptr;
     uint8_t* dhq = nullptr;
     float* head_x = nullptr;
