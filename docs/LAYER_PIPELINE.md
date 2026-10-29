@@ -123,3 +123,34 @@ single service thread and is what the per-channel answer buffers make safe. Whet
 bandwidth to feed two pipelined rows is a measurement, not an assumption - the stage table says the service path (x,
 9.67 ms) plus the CPU lane (15.03 ms) is 24.7 ms of the 43.38 ms token, and the pipeline's prize is
 `max(x, y + z)` rather than `x + y + z`.
+
+### 3b - what the skew needs, found by mapping it
+
+Three things are per row *already*, and one is not.
+
+| shared thing | per row? | why it matters |
+|---|---|---|
+| expert slots (`slot_of[key]`, `spare_key(il, j)`) | **yes, per layer** | two rows at different layers never alias |
+| plan / fetch_src / cpu_part / cpu_flag / cpu_seq | **yes** (`mplan_ptr + 8 i`, ...) | the rows path splits them in `row_dev` |
+| `wait_seq`, `resp`, `rq->ch` | **yes now** (3a) | was the blocking race |
+| **group scratch: `W.whq`, `W.wpart`, `W.wh`, `W.grp_ptr`, `W.grp_start`, `W.grp_ent`** | **NO** | one window indexed by *row position in the call* (`tmax * 8`). Two rows on two streams both land in slice 0 |
+
+So 3b needs a `row_base_` that offsets those windows (they are already `8` slices wide per row; a per-row call should take the slice the row owns, not slice 0), plus a stream parameter on the layer path, plus two compute streams.
+
+**And there is one more hazard the code already warns about** (`glm_rows.cu:846`): the tier tables (`tab`, the promo counters) are touched by the *route* kernels and by the host service. Two rows routing on two streams concurrently would write `tab` concurrently. The route is cheap (2.24 ms of 43.38) and the fetch is the long pole (9.67 ms), so the shape that avoids this is:
+
+- **routes stay in global order** (serialized, one at a time - they are short),
+- **fetches run on the transfer lane** `F->ps`,
+- **computes run on per-row streams** and wait only on their own fetch event.
+
+That gives the overlap the scheme is for (`fetch(BN) || compute(AN)`) without concurrent `tab` mutation. Serializing the *computes* would give nothing; serializing the *routes* costs ~2 ms a row and buys the whole transfer window.
+
+### Measurement is blocked on the box, not the code (2026-10-29)
+
+The gates ran during live fleet load (`active=2`, GPU 98%, 147 W of 300, and the request log showing 100k/245k-token conversations being restored and decoded at ~10-12 tok/s each). My first concurrent timing read **1.7 tok/s aggregate** and the warm pair read 6.5 concurrent vs 5.9 sequential - both are measurements of the workers' queue, not of the change, so neither is quoted as a result.
+
+Consequences for the next measurement:
+
+- An arm must be paired **within the same load window**, or taken when `live.active == 0`. Absolute tok/s across windows is not comparable on this box.
+- `live.active == 2` is the *interesting* regime (it is the pipeline's whole point), but it is also exactly when the fleet owns the GPU - so use the **per-request `decode_tok_s` in `/metrics.requests[]`** and pair arms by interleaving them, rather than wall-clock aggregates.
+- Cold-boot token equality gates are unaffected by load and remain valid (3a passed that way).
