@@ -1,0 +1,127 @@
+diff --git a/src/core/glm_rows.cu b/src/core/glm_rows.cu
+index 2c3f928..9366950 100644
+--- a/src/core/glm_rows.cu
++++ b/src/core/glm_rows.cu
+@@ -636,6 +636,53 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
+     return true;
+ }
+ 
++// STRATA_GLM_ROWS_ROUTE_LOG=1 (the cross-slot shared-expert count's input): both rows' routed experts, one line a
++// step.  The ids go to a pinned double buffer on the part's stream; the previous step's line prints here once its
++// copies are done (cudaEventQuery - nothing in the decode syncs).  Part 0 only: the state is process-wide and the
++// split's parts run on their own threads.
++namespace {
++struct RowsRouteLog {
++    int* h = nullptr;               // [2 rounds][2 rows][8 ids]
++    cudaEvent_t ev[2] = {};          // the round's copies are done
++    int round = 0, row = 0;
++};
++RowsRouteLog& rows_route_log_state() { static RowsRouteLog st; return st; }
++bool rows_route_log_on() {
++    static const bool on = [] {
++        const char* v = getenv("STRATA_GLM_ROWS_ROUTE_LOG");
++        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
++    }();
++    return on;
++}
++void rows_route_log_capture(cudaStream_t s, const int* dev_ids, int k) {
++    RowsRouteLog& st = rows_route_log_state();
++    if (st.h == nullptr) {
++        cudaHostAlloc(&st.h, 2 * 2 * 8 * sizeof(int), cudaHostAllocDefault);
++        for (int e = 0; e < 2; ++e) cudaEventCreateWithFlags(&st.ev[e], cudaEventDisableTiming);
++    }
++    if (st.row == 0 && cudaEventQuery(st.ev[st.round ^ 1]) == cudaSuccess) {
++        const int* r0 = st.h + (st.round ^ 1) * 16;
++        const int* r1 = r0 + 8;
++        int shared = 0;
++        for (int a = 0; a < k; ++a) {
++            for (int b = 0; b < k; ++b)
++                if (r1[b] == r0[a]) { ++shared; break; }
++        }
++        std::fprintf(stderr,
++                     "glm rows route: row0 [%d %d %d %d %d %d %d %d] row1 [%d %d %d %d %d %d %d %d] shared %d\n",
++                     r0[0], r0[1], r0[2], r0[3], r0[4], r0[5], r0[6], r0[7],
++                     r1[0], r1[1], r1[2], r1[3], r1[4], r1[5], r1[6], r1[7], shared);
++    }
++    cudaMemcpyAsync(st.h + st.round * 16 + (size_t) st.row * 8, dev_ids, 8 * sizeof(int),
++                    cudaMemcpyDeviceToHost, s);
++    if (++st.row == 2) {
++        cudaEventRecord(st.ev[st.round], s);
++        st.round ^= 1;
++        st.row = 0;
++    }
++}
++}  // namespace
++
+ // a MoE layer's FFN for the rows (S->x / S->xq in, S->ffn out)
+ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
+     FastState* F = fast_;
+@@ -671,6 +718,9 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
+         const MoeIo io = {rows(S->x, E, i), rows_q(S->xq, E, i), rows(S->rlog, g.n_expert, i),
+                           rows(S->sh_g, FFs, i), rows(S->sh_u, FFs, i), rows(S->ffn, E, i)};
+         if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
++        // the route log: this row's ids are still the plan's (the next row's route overwrites them); the copy is
++        // async and the line prints one step later, when the previous step's copies are done - nothing syncs
++        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, F->md.plan_id, g.n_exp_used);
+     }
+     return true;
+ }
+@@ -730,20 +780,46 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
+         return m;
+     };
+     const float* no_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
++    // STRATA_GLM_ROWS_PF=1 (de-fused fetch): each row's fetch crosses PCIe on the side stream, issued right after
++    // its route, so it runs beside the next row's route GEMVs - but the tier tables are shared device state both
++    // streams then touch concurrently (tab, wait_seq, the counters): measure before trusting this mode.  =2: every
++    // row routed first, then the fetches, which then overlap only the shared expert's down below - no shared-state
++    // concurrency.  The grouped experts wait for the fetches on the compute stream (below, before the launches
++    // that read the slots).  The addresses are exact: every row is routed into its own plan before the first
++    // fetch runs.
++    static const int rows_pf = [] {
++        const char* v = getenv("STRATA_GLM_ROWS_PF");
++        return v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
++    }();
+     for (int i = 0; i < n; ++i) {
+         const gf::MoeDev m = row_dev(i);
+         const MoeIo io = {row_at(S->x, E, i), rowq_at(S->xq, E, i), row_at(S->rlog, g.n_expert, i),
+                           row_at(S->sh_g, FFs, i), row_at(S->sh_u, FFs, i), row_at(S->ffn, E, i)};
+         fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, false, 0, no_bias, lane, i, n, 1);
+         ++F->expected;
++        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * i, K);
+         if (empty) continue;
+-        if (skip_empty) {
++        if (rows_pf == 1) {
++            cudaEventRecord(F->ev_pf, s);              // the route wrote this row's plan on the compute stream
++            cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
++            gf::moe_wait(m, E, F->ps);
++            gf::moe_fetch(m, K, Ly.blob, F->ps);
++        } else if (skip_empty) {
+             gf::moe_wait_fetch(m, E, K, Ly.blob, s);
+         } else {
+             gf::moe_wait(m, E, s);
+             gf::moe_fetch(m, K, Ly.blob, s);
+         }
+     }
++    if (rows_pf == 2 && !empty) {   // every route is on the compute stream: the fetches follow it, on the side stream
++        cudaEventRecord(F->ev_pf, s);
++        cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
++        for (int i = 0; i < n; ++i) {
++            const gf::MoeDev m = row_dev(i);
++            gf::moe_wait(m, E, F->ps);
++            gf::moe_fetch(m, K, Ly.blob, F->ps);
++        }
++    }
+     const float* sh_out = nullptr;
+     if (Ly.sh_down.q != nullptr) {
+         gf::MvJob sd = {Ly.sh_down.q, W.sh_hq, nullptr, W.sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs, E};
+@@ -753,6 +829,10 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
+         }
+         sh_out = W.sh_out;
+     }
++    if (rows_pf > 0 && !empty) {   // the grouped experts read the slots: every fetch must have landed
++        cudaEventRecord(F->ev_pf_prev, F->ps);
++        cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
++    }
+     gf::MoeWin mw;
+     mw.plan_ptr = W.mplan_ptr;
+     mw.plan_w = W.mplan_w;
