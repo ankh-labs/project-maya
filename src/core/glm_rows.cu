@@ -207,6 +207,16 @@ void Glm5Model::rows_destroy() {
 }
 
 bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) {
+    // the pipeline's map: one cursor a row, starting at this part's first layer (docs/LAYER_PIPELINE.md, incr. 2)
+    if (RowsState* RS = rows_) {
+        for (int c = 0; c < 8; ++c) RS->cur[c] = RowsState::RowCursor{};
+        for (int c = 0; c < n && c < 8; ++c) {
+            RS->cur[c].slot = c;
+            RS->cur[c].il = l0_;
+            RS->cur[c].stage = 0;
+            RS->cur[c].done = false;
+        }
+    }
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
     for (int i = 0; i < n; ++i) {
@@ -354,6 +364,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         for (int i = 0; i < n; ++i) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
+            if (rows_ != nullptr && i < 8) rows_->cur[i].il = il + 1;   // (the map: this row is one layer on)
         }
         if (batch) gf::hc_rows(hb, n, s);
 
