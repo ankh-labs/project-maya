@@ -312,6 +312,10 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     cudaStream_t s = F->cs;
     auto& rows = row_at;
     auto& rows_q = rowq_at;
+    // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
+    // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
+    // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -341,20 +345,20 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             h.block_out = block_out;
             h.R_old = rw[i].Rc;
             h.R_new = rw[i].Ro;
-            h.post_in = rows(S->post, 8, i);
-            h.comb_in = rows(S->comb, 16, i);
-            h.pre = rows(S->pre, 8, i);
-            h.post = rows(S->post, 8, i);
-            h.comb = rows(S->comb, 16, i);
-            h.x = rows(S->x, E, i);
+            h.post_in = rows(S->post, 8, R(i));
+            h.comb_in = rows(S->comb, 16, R(i));
+            h.pre = rows(S->pre, 8, R(i));
+            h.post = rows(S->post, 8, R(i));
+            h.comb = rows(S->comb, 16, R(i));
+            h.x = rows(S->x, E, R(i));
             h.xq = rows_q(S->xq, E, i);
             if (!batch) {
                 gf::hc(h, s);
                 return;
             }
             hb[i] = h;   // (launched for all the rows at once: hc_rows)
-            hb[i].part = rows(S->hc_part, S->hc_part_n, i);
-            hb[i].counter = (unsigned int*) (S->hc_ctr + (size_t) i * 64);   // (take(64): 64 bytes a row)
+            hb[i].part = rows(S->hc_part, S->hc_part_n, R(i));
+            hb[i].counter = (unsigned int*) (S->hc_ctr + (size_t) R(i) * 64);   // (take(64): 64 bytes a row)
         };
         // ---- the attention-side read (fused with the previous FFN's write), per row
         h.w_fn = Ly.hc_attn_fn;
@@ -362,7 +366,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.w_base = Ly.hc_attn_base;
         h.norm_w = Ly.attn_norm;
         for (int i = 0; i < n; ++i) {
-            hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
+            hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, R(i)));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
             if (rows_ != nullptr && i < 8) rows_->cur[i].il = il + 1;   // (the map: this row is one layer on)
         }
@@ -402,20 +406,20 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             for (int i = 0; i < n; ++i) {
                 gf::KdaPrepArgs k;
                 for (int c = 0; c < 3; ++c) {
-                    k.proj[c] = rows(S->proj[c], DI, i);
+                    k.proj[c] = rows(S->proj[c], DI, R(i));
                     k.conv_w[c] = Ly.conv[c];
-                    k.out[c] = kda_batch ? rows(S->kconv[c], DI, i) : F->conv[c];
+                    k.out[c] = kda_batch ? rows(S->kconv[c], DI, R(i)) : F->conv[c];
                 }
                 k.conv_state = rw[i].state + (*rw[i].kda_conv)[(size_t) il];
-                k.fa = rows(S->fa, g.kda_head_dim, i);
-                k.ga = rows(S->ga, g.kda_head_dim, i);
+                k.fa = rows(S->fa, g.kda_head_dim, R(i));
+                k.ga = rows(S->ga, g.kda_head_dim, R(i));
                 k.f_b = Ly.f_b;
                 k.g_b = Ly.g_b;
                 k.dt_bias = Ly.dt_bias;
                 k.ssm_a = Ly.ssm_a;
                 k.lower_bound = g.kda_lb;
-                k.g1 = kda_batch ? rows(S->kg1, DI, i) : F->g1;
-                k.g2 = kda_batch ? rows(S->kg2, DI, i) : F->g2;
+                k.g1 = kda_batch ? rows(S->kg1, DI, R(i)) : F->g1;
+                k.g2 = kda_batch ? rows(S->kg2, DI, R(i)) : F->g2;
                 k.n_head = g.n_head;
                 k.head_dim = g.kda_head_dim;
                 k.d_conv = g.d_conv;
@@ -425,7 +429,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
                     kr[i].k = k.out[1];
                     kr[i].v = k.out[2];
                     kr[i].g1 = k.g1;
-                    kr[i].beta_raw = rows(S->beta, g.n_head, i);
+                    kr[i].beta_raw = rows(S->beta, g.n_head, R(i));
                     kr[i].state = rw[i].state + (*rw[i].kda_S)[(size_t) il];
                     kr[i].g2 = k.g2;
                     kr[i].norm_w = Ly.ssm_norm;
@@ -433,7 +437,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
                     continue;
                 }
                 gf::kda_prep(k, s);
-                gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, rows(S->beta, g.n_head, i),
+                gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, rows(S->beta, g.n_head, R(i)),
                             rw[i].state + (*rw[i].kda_S)[(size_t) il], F->g2, Ly.ssm_norm, g.norm_eps, g.n_head,
                             g.kda_head_dim, rows_q(S->gated_q, DI, i), s);
             }
@@ -451,7 +455,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.w_base = Ly.hc_ffn_base;
         h.norm_w = Ly.ffn_norm;
         for (int i = 0; i < n; ++i) {
-            hc_row(i, rows(S->mixer, E, i));
+            hc_row(i, rows(S->mixer, E, R(i)));
             std::swap(rw[i].Rc, rw[i].Ro);
         }
         if (batch) gf::hc_rows(hb, n, s);
@@ -462,7 +466,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             j[1] = {Ly.ffn_up.q, S->xq, S->x, S->du, nullptr, 1.0f, Ly.ffn_up.type, E, g.n_ff_dense};
             if (!mv(j, 2, "dense ffn")) return false;
             for (int i = 0; i < n; ++i)
-                gf::swiglu_q8(rows(S->dg, g.n_ff_dense, i), rows(S->du, g.n_ff_dense, i), g.swiglu_shexp,
+                gf::swiglu_q8(rows(S->dg, g.n_ff_dense, R(i)), rows(S->du, g.n_ff_dense, R(i)), g.swiglu_shexp,
                               g.n_ff_dense, rows_q(S->dhq, g.n_ff_dense, i), s);
             gf::MvJob dn = {Ly.ffn_down.q, S->dhq, nullptr, S->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
                             E};
@@ -473,7 +477,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     for (int i = 0; i < n; ++i) {
-        gf::hc_post(rows(S->ffn, E, i), rw[i].Rc, rows(S->post, 8, i), rows(S->comb, 16, i), E, rw[i].Ro, s);
+        gf::hc_post(rows(S->ffn, E, R(i)), rw[i].Rc, rows(S->post, 8, R(i)), rows(S->comb, 16, R(i)), E, rw[i].Ro, s);
         if (rw[i].Ro != rw[i].res)
             cudaMemcpyAsync(rw[i].res, rw[i].Ro, (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
     }
@@ -491,6 +495,10 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     cudaStream_t s = F->cs;
     auto& rows = row_at;
     auto& rows_q = rowq_at;
+    // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
+    // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
+    // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -507,21 +515,21 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     if (!mv(j, 5, "dsa projections")) return false;
     for (int i = 0; i < n; ++i) {
         gf::DsaPrepArgs d;
-        d.qr_raw = rows(S->qr_raw, g.q_lora, i);
+        d.qr_raw = rows(S->qr_raw, g.q_lora, R(i));
         d.q_a_norm = Ly.q_a_norm;
-        d.qr = rows(S->qr, g.q_lora, i);
+        d.qr = rows(S->qr, g.q_lora, R(i));
         d.qr_q = rows_q(S->qr_q, g.q_lora, i);
         d.q_lora = g.q_lora;
-        d.kv_raw = rows(S->kv_raw, g.kv_lora, i);
+        d.kv_raw = rows(S->kv_raw, g.kv_lora, R(i));
         d.kv_norm = Ly.kv_a_norm;
         kv_prep_targets(rw[i].kv, il, (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]), d);
         d.kv_lora = g.kv_lora;
         d.lat_q8 = lat_q8_;
-        d.ik_raw = rows(S->ik_raw, g.idx_key, i);
+        d.ik_raw = rows(S->ik_raw, g.idx_key, R(i));
         d.k_norm_w = Ly.k_norm_w;
         d.k_norm_b = Ly.k_norm_b;
         d.ik_cache = rw[i].state + (*rw[i].dsa_ik)[(size_t) il];
-        d.ig_raw = rows(S->ig_raw, g.idx_key, i);
+        d.ig_raw = rows(S->ig_raw, g.idx_key, R(i));
         d.ig_cache = rw[i].state + (*rw[i].dsa_ig)[(size_t) il];
         d.ape = Ly.ape;
         d.pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
@@ -557,7 +565,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             if (run0[i] == i && i + 1 < n && run0[i + 1] == i && kv_streamed(rw[i].kv, il)) {
                 int len = 1;
                 while (i + len < n && run0[i + len] == i) ++len;
-                cudaMemsetAsync(S->acells + (size_t) i * nsm, 0xff, (size_t) len * nsm * sizeof(int), s);
+                cudaMemsetAsync(S->acells + (size_t) R(i) * nsm, 0xff, (size_t) len * nsm * sizeof(int), s);
             }
     const uint16_t* a_lat[gf::kMaxMvNt];
     const int* a_cells[gf::kMaxMvNt];
@@ -573,20 +581,20 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
         const float* pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
-        float* const score = attn ? S->ascore + (size_t) i * S->ascore_n : F->score;
+        float* const score = attn ? S->ascore + (size_t) R(i) * S->ascore_n : F->score;
         if (pool_done > 0 && !all && small) {
-            sc.iq[n_sc] = rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i);
+            sc.iq[n_sc] = rows(S->iq, (int64_t) g.idx_heads * g.idx_key, R(i));
             sc.pooled[n_sc] = pooled;
-            sc.iw[n_sc] = rows(S->iw, g.idx_heads, i);
+            sc.iw[n_sc] = rows(S->iw, g.idx_heads, R(i));
             sc.score[n_sc] = score;
             sc.n_pools[n_sc++] = pool_done;
         } else if (pool_done > 0 && !all) {
-            gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i), pooled,
-                          rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, score, s, true);   // (a decode row)
+            gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, R(i)), pooled,
+                          rows(S->iw, g.idx_heads, R(i)), g.idx_key, g.idx_heads, pool_done, score, s, true);   // (a decode row)
         }
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-        int* const sel = attn ? S->acells + (size_t) i * nsm : F->cells;
+        int* const sel = attn ? S->acells + (size_t) R(i) * nsm : F->cells;
         uint16_t* const lat = (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]);
         if (attn) {
             if (all) {
@@ -607,7 +615,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
         else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
-        gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
+        gf::mla(rows(S->q, qd, R(i)), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
                 lat_q8_, nullptr, true);   // (a decode row: the token path's kernels)
     }
@@ -629,15 +637,15 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 kr.m[n_kr] = K->map[(size_t) il];
                 kr.host[n_kr] = K->host[(size_t) il];
                 kr.slots[n_kr] = (uint8_t*) a_lat[i];
-                kr.cells[n_kr] = S->acells + (size_t) i * nsm;
-                kr.slot_cells[n_kr] = S->aslot + (size_t) i * nsm;
+                kr.cells[n_kr] = S->acells + (size_t) R(i) * nsm;
+                kr.slot_cells[n_kr] = S->aslot + (size_t) R(i) * nsm;
                 kr.n_sel[n_kr++] = cnt;
                 kr_row = K->row_bytes;
                 kr_page = K->page;
                 for (int k = 0; k < len; ++k) a_cells[i + k] = S->aslot + (size_t) (i + k) * nsm;
             } else {
-                const int* c = kv_attend_cells(K, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm, cnt,
-                                               S->aslot + (size_t) i * nsm, s);
+                const int* c = kv_attend_cells(K, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) R(i) * nsm, cnt,
+                                               S->aslot + (size_t) R(i) * nsm, s);
                 for (int k = 0; k < len; ++k) a_cells[i + k] = c + (size_t) k * nsm;
             }
             i += len;
@@ -725,6 +733,10 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     cudaStream_t s = F->cs;
     auto& rows = row_at;
     auto& rows_q = rowq_at;
+    // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
+    // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
+    // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -737,9 +749,15 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     // the router and the shared expert's gate / up for every row, then each row's routed experts (and the
     // shared expert's down, which rides their launch) through the token path's own code
     gf::MvJob j[3];
-    j[0] = {Ly.router, nullptr, S->x, S->rlog, nullptr, 1.0f, gf::kTypeBF16, E, g.n_expert};
-    j[1] = {Ly.sh_gate.q, S->xq, S->x, S->sh_g, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
-    j[2] = {Ly.sh_up.q, S->xq, S->x, S->sh_u, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
+    // these three GEMVs run over n rows from ONE base: a driver running a single row per call must start at that row's
+    // slice (row_base_ 0 leaves them exactly as they were)
+    const int rb = row_base_;
+    j[0] = {Ly.router, nullptr, rows(S->x, E, rb), rows(S->rlog, g.n_expert, rb), nullptr, 1.0f, gf::kTypeBF16, E,
+            g.n_expert};
+    j[1] = {Ly.sh_gate.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->sh_g, FFs, rb), nullptr, 1.0f,
+            Ly.sh_gate.type, E, FFs};
+    j[2] = {Ly.sh_up.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->sh_u, FFs, rb), nullptr, 1.0f,
+            Ly.sh_up.type, E, FFs};
     if (!mv(j, 3, "router / shared expert")) return false;
     // its own error string: `err` is the scheduler's, and a cancelled or failed prompt leaves its text there
     // until the next prompt - read here, it failed every running request (with the setting off too)
@@ -749,12 +767,13 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     // grouped failed here: the previous layer's prefetch is still pending, and this layer's experts read its slots
     if (rows_pred_pf_n() > 0 && !grouped) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     for (int i = 0; !grouped && i < n; ++i) {
-        const MoeIo io = {rows(S->x, E, i), rows_q(S->xq, E, i), rows(S->rlog, g.n_expert, i),
-                          rows(S->sh_g, FFs, i), rows(S->sh_u, FFs, i), rows(S->ffn, E, i)};
+        const MoeIo io = {rows(S->x, E, R(i)), rows_q(S->xq, E, R(i)), rows(S->rlog, g.n_expert, R(i)),
+                          rows(S->sh_g, FFs, R(i)), rows(S->sh_u, FFs, R(i)), rows(S->ffn, E, R(i))};
         if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
         // the route log: this row's ids are still the plan's (the next row's route overwrites them); the copy is
         // async and the line prints one step later, when the previous step's copies are done - nothing syncs
-        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, F->md.plan_id, g.n_exp_used);
+        if (rows_route_log_on() && l0_ == 0 && i < 2 && rb == 0)
+            rows_route_log_capture(s, F->md.plan_id, g.n_exp_used);   // (the token path's shared plan)
     }
     return true;
 }
@@ -775,6 +794,11 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     FastState* F = fast_;
     RowsState* S = rows_;
     auto& W = F->win;
+    // The row's OWN slice (row_base_ 0 = an ordinary call, so this is an identity) and the group window's block for that
+    // row: without them a driver running one row per call would put every row in slice 0 of the activations and of the
+    // grouping arrays - silent corruption rather than a fault (docs/LAYER_PIPELINE.md).
+    const auto R = [&](int k) { return row_base_ + k; };
+    const int rb = row_base_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, K = g.n_exp_used;
@@ -823,24 +847,24 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     }
     const auto row_dev = [&](int i) {   // (fast_moe_window's tok_dev, and the row's own scratch slots)
         gf::MoeDev m = md;
-        m.plan_ptr = W.mplan_ptr + 8 * i;
-        m.plan_w = W.mplan_w + 8 * i;
-        m.plan_id = W.mplan_id + 8 * i;
-        m.fetch_src = W.mfetch + 8 * i;
-        m.cpu_part = W.mcpu_part + (size_t) E * i;
-        m.cpu_flag = W.mcpu_flag + i;
-        m.scratch = F->rows_scr + 8 * i;
+        m.plan_ptr = W.mplan_ptr + 8 * R(i);
+        m.plan_w = W.mplan_w + 8 * R(i);
+        m.plan_id = W.mplan_id + 8 * R(i);
+        m.fetch_src = W.mfetch + 8 * R(i);
+        m.cpu_part = W.mcpu_part + (size_t) E * R(i);
+        m.cpu_flag = W.mcpu_flag + R(i);
+        m.scratch = F->rows_scr + 8 * R(i);
         // this row's OWN handshake channel: wait_seq[i] and resp[i].  Row 0 is channel 0, exactly the lone token
         // path, so n = 1 is unchanged; n > 1 gives each waiter its own word and answer buffer.
         m.wait_ch = i & 7;
         if (pred_on) {   // per-row prefetch staging: the token path's pf buffers hold one route's stage
-            m.pf_src = S->pf_src + 8 * i;
-            m.pf_dst = S->pf_dst + 8 * i;
+            m.pf_src = S->pf_src + 8 * R(i);
+            m.pf_dst = S->pf_dst + 8 * R(i);
             m.pf_n = S->pf_n + i;
         }
         if (i > 0 && md.cpu_seq != nullptr) {
-            m.cpu_seq = W.cpu_seq_w + 16 * i;
-            m.cpu_ans = W.ans_d[i];
+            m.cpu_seq = W.cpu_seq_w + 16 * R(i);
+            m.cpu_ans = W.ans_d[R(i)];
         }
         return m;
     };
@@ -854,12 +878,12 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     // fetch runs.
     for (int i = 0; i < n; ++i) {
         const gf::MoeDev m = row_dev(i);
-        const MoeIo io = {row_at(S->x, E, i), rowq_at(S->xq, E, i), row_at(S->rlog, g.n_expert, i),
-                          row_at(S->sh_g, FFs, i), row_at(S->sh_u, FFs, i), row_at(S->ffn, E, i)};
-        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
-                       row_at(S->plog, g.n_expert, i), pred_pf);
+        const MoeIo io = {row_at(S->x, E, R(i)), rowq_at(S->xq, E, R(i)), row_at(S->rlog, g.n_expert, R(i)),
+                          row_at(S->sh_g, FFs, R(i)), row_at(S->sh_u, FFs, R(i)), row_at(S->ffn, E, R(i))};
+        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) R(i) * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
+                       row_at(S->plog, g.n_expert, R(i)), pred_pf);
         ++F->expected;
-        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * i, K);
+        if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * R(i), K);
         if (empty) continue;
         if (rows_pf == 1) {
             cudaEventRecord(F->ev_pf, s);              // the route wrote this row's plan on the compute stream
@@ -891,8 +915,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
         for (int i = 0; i < n; ++i) {
             gf::MoeDev m = md;
-            m.pf_src = S->pf_src + 8 * i;
-            m.pf_dst = S->pf_dst + 8 * i;
+            m.pf_src = S->pf_src + 8 * R(i);
+            m.pf_dst = S->pf_dst + 8 * R(i);
             m.pf_n = S->pf_n + i;
             gf::moe_prefetch(m, F->L[(size_t) il + 1].blob, F->ps);
         }
@@ -900,26 +924,30 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     }
     const float* sh_out = nullptr;
     if (Ly.sh_down.q != nullptr) {
-        gf::MvJob sd = {Ly.sh_down.q, W.sh_hq, nullptr, W.sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs, E};
+        gf::MvJob sd = {Ly.sh_down.q, (uint8_t*) W.sh_hq + (size_t) rb * W.sh_hq_s, nullptr,
+                        W.sh_out + (size_t) E * rb, nullptr, 1.0f,
+                        Ly.sh_down.type, FFs, E};
         if (!gf::mv_nt(&sd, 1, n, s)) {
             err = "glm rows: the grouped shared expert's down";
             return false;
         }
-        sh_out = W.sh_out;
+        sh_out = W.sh_out + (size_t) E * rb;
     }
     if (rows_pf > 0 && !empty) {   // the grouped experts read the slots: every fetch must have landed
         cudaEventRecord(F->ev_pf_prev, F->ps);
         cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     }
     gf::MoeWin mw;
-    mw.plan_ptr = W.mplan_ptr;
-    mw.plan_w = W.mplan_w;
-    mw.cpu_part = W.mcpu_part;
-    mw.cpu_flag = W.mcpu_flag;
-    mw.grp_ptr = W.grp_ptr;
-    mw.grp_start = W.grp_start;
-    mw.grp_ent = W.grp_ent;
-    mw.n_groups = W.n_groups;
+    // the group window's arrays are [T * 8] (glm_window.cu): a per-row call takes THIS row's block, so two rows in
+    // flight never group into one another's plans.  rb (above) is 0 for an ordinary call, so nothing moves by default.
+    mw.plan_ptr = W.mplan_ptr + 8 * rb;
+    mw.plan_w = W.mplan_w + 8 * rb;
+    mw.cpu_part = W.mcpu_part + (size_t) E * rb;
+    mw.cpu_flag = W.mcpu_flag + rb;
+    mw.grp_ptr = W.grp_ptr + 8 * rb;
+    mw.grp_start = W.grp_start + 8 * rb;
+    mw.grp_ent = W.grp_ent + 8 * rb;
+    mw.n_groups = W.n_groups + 8 * rb;
     mw.T = n;
     mw.k = K;
     mw.n_embd = E;
@@ -928,17 +956,17 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     if (Ly.exl3) {
         gf::moe_win_group(mw, s, rows_small_on());
         x3::WinArgs xa;
-        xa.grp_ptr = W.grp_ptr;
-        xa.grp_start = W.grp_start;
-        xa.grp_ent = W.grp_ent;
-        xa.n_groups = W.n_groups;
-        xa.plan_ptr = W.mplan_ptr;
-        xa.plan_w = W.mplan_w;
-        xa.cpu_part = W.mcpu_part;
-        xa.cpu_flag = W.mcpu_flag;
+        xa.grp_ptr = W.grp_ptr + 8 * rb;
+        xa.grp_start = W.grp_start + 8 * rb;
+        xa.grp_ent = W.grp_ent + 8 * rb;
+        xa.n_groups = W.n_groups + 8 * rb;
+        xa.plan_ptr = W.mplan_ptr + 8 * rb;
+        xa.plan_w = W.mplan_w + 8 * rb;
+        xa.cpu_part = W.mcpu_part + (size_t) E * rb;
+        xa.cpu_flag = W.mcpu_flag + rb;
         xa.x = S->x;
         xa.x_stride = (size_t) E;
-        xa.h = W.wh;
+        xa.h = W.wh + (size_t) 8 * rb * g.n_ff_exp;
         xa.part = W.wpart;
         xa.sh_out = sh_out;
         xa.out = S->ffn;
@@ -956,8 +984,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     } else {
         mw.xq = S->xq;
         mw.xq_stride = (size_t) (E / 32) * kQ8;
-        mw.hq = W.whq;
-        mw.part = W.wpart;
+        mw.hq = (uint8_t*) W.whq + (size_t) 8 * rb * ((size_t) g.n_ff_exp / 32 * kQ8);
+        mw.part = W.wpart + (size_t) 8 * rb * E;
         mw.sh_out = sh_out;
         mw.out = S->ffn;
         mw.out_stride = (size_t) E;
@@ -979,7 +1007,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             const gf::MoeDev m = row_dev(i);
             cw.seq[i] = m.cpu_seq;
             cw.ans[i] = m.cpu_ans;
-            cw.out[i] = row_at(S->ffn, E, i);
+            cw.out[i] = row_at(S->ffn, E, R(i));
         }
         gf::moe_cpu_wait_rows(cw, n, E, s);
     }
@@ -995,6 +1023,10 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     cudaStream_t s = F->cs;
     auto& rows = row_at;
     auto& rows_q = rowq_at;
+    // the row's OWN slice of the 8-wide per-row buffers.  row_base_ is 0 for an ordinary call, so this is an identity
+    // unless a driver runs one row per call - in which case the row must take the slice it owns, not slice 0, or two
+    // concurrent rows write the same activation (docs/LAYER_PIPELINE.md).
+    const auto R = [&](int k) { return row_base_ + k; };
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -1002,14 +1034,14 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     };
     // ---- the head: one read of the output matrix for every row, then each row's draw
     for (int i = 0; i < n; ++i)
-        gf::head_prep(rw[i].res, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
+        gf::head_prep(rw[i].res, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, R(i)),
                       rows_q(S->head_xq, E, i), s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (!mv(&o, 1, "output head")) return false;
     for (int i = 0; i < n; ++i) {
-        const float* lg = rows(S->logits, g.n_vocab, i);
+        const float* lg = rows(S->logits, g.n_vocab, R(i));
         if (strata::core::rows_pick_argmax(sps[i]))
             gf::argmax(lg, g.n_vocab, S->tok + i, s);
         else
