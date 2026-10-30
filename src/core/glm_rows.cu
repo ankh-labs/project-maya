@@ -857,7 +857,19 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     // n == 1 is fine when a pipeline driver runs one row per call: this is the path that builds a per-ROW MoeDev
     // (plan / fetch_src / cpu_lane / wait channel).  The rows_moe fallback below uses the GLOBAL F->md, so every row
     // shared one plan and one channel - the non-finite router input this produced at layer 19.
-    if (n < 2 && row_base_ == 0) return false;
+    // n == 1 IS a pipeline row when the rotor drives one row per call (rows_per_row_) - including row 0, whose INDEX is
+    // 0.  `row_base_ == 0` cannot tell "the lone token call" from "row 0", so row 0 was refused the per-row MoeDev and
+    // fell back to the GLOBAL F->md: one plan, one fetch_src, one wait channel for both rows.  Fourth time on this branch
+    // that an index carried a boolean.  STRATA_GLM_PIPE_ROW0_FALLBACK=1 restores the old refusal so it can be COUNTED.
+    static const bool admit_row0 = getenv("STRATA_GLM_PIPE_ROW0_FALLBACK") == nullptr;
+    if (n < 2 && row_base_ == 0 && !(rows_per_row_ && admit_row0)) {
+        if (rows_per_row_) {   // a per-row call reaching the global MoeDev is the bug, not a mode
+            F->md_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            int expect = -1;
+            F->md_fallback_first_il.compare_exchange_strong(expect, il, std::memory_order_relaxed);
+        }
+        return false;
+    }
     const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (STRATA_GLM_MULTI_MTP)
     if ((n > F->rows_group && !wide) || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
         (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
@@ -1304,6 +1316,11 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
             {
                 static std::atomic<bool> told{false};
+                const uint64_t fb = F->md_fallbacks.load(std::memory_order_relaxed);
+                if (fb > 0)
+                    std::fprintf(stderr, "glm pipe: CUDA%d per-row calls fell back to the GLOBAL MoeDev %llu time(s), "
+                                         "first at layer %d\n", dev_, (unsigned long long) fb,
+                                 F->md_fallback_first_il.load(std::memory_order_relaxed));
                 const uint64_t fv = F->floor_violations.load(std::memory_order_relaxed);
                 const uint64_t ss = F->spare_steals.load(std::memory_order_relaxed);
                 if (fv > 0 || ss > 0)
