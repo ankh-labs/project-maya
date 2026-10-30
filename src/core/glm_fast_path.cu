@@ -1012,6 +1012,22 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.ring = dp;
     F->route_error_h = (volatile int*) (F->ring_h + gf::kRingSize);
+    {   // the device's publish mark: one pinned word, written by the route kernel at the publish itself
+        void* ph = nullptr;
+        void* pd = nullptr;
+        if (cudaHostAlloc(&ph, sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
+            err = "glm fast: the publish mark did not allocate";
+            return false;
+        }
+        if (cudaHostGetDevicePointer(&pd, ph, 0) != cudaSuccess) {
+            err = "glm fast: the publish mark has no device pointer";
+            return false;
+        }
+        F->dev_pub_h = (unsigned long long*) ph;
+        F->dev_pub_d = (unsigned long long*) pd;
+        F->md.dev_pub = F->dev_pub_d;
+        *F->dev_pub_h = 0ull;
+    }
     F->md.route_error = (volatile int*) ((gf::MoeRequest*) dp + gf::kRingSize);
     if (cudaMalloc((void**) &F->md.route_err_d, 64) != cudaSuccess || cudaMemset(F->md.route_err_d, 0, 64) != cudaSuccess) {
         err = "glm fast: the route error flag did not allocate";
@@ -4442,18 +4458,30 @@ void Glm5Model::fast_service() {
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
             } else {
-                // FAIL CLOSED ON A LAP (2026-10-30).  The slot we are parked on holds an OLDER sequence, so the device
-                // published more than a whole ring ahead and this entry is gone for good - the resync above only
-                // recognises being behind-but-unlapped.  Polling here is how an arithmetic fault (a ring sized for one
-                // row) hid as a 20 s "drain timeout" for a day.  seq == 0 is an empty slot, not a lap.
-                if (sq != 0u && (int) (sq - next) <= 0) {
-                    static std::atomic<bool> told_lap{false};
-                    if (!told_lap.exchange(true))
-                        std::fprintf(stderr,
-                                     "glm pipe: CUDA%d LAPPED: the service waits for seq %u and its slot holds %u "
-                                     "(%d slots) - the device published a full ring ahead; this sequence is unrecoverable\n",
-                                     dev_, next, sq, gf::kRingSize);
-                    F->svc_lapped.store(true, std::memory_order_relaxed);
+                // A STALL, NOT A LAP (2026-10-30; the lap reading was WRONG and is withdrawn).  `sq < next` on this slot
+                // is the COMMON case of an entry that has not been published yet: the slot still holds its occupant from
+                // one lap ago, so it reads next - kRingSize.  That offset is arithmetic, not evidence - it tracked the
+                // ring size in every measurement because it is forced to.  A genuine lap is the opposite (sq > next),
+                // which the resync branch above already handles and which has never been observed on this path.
+                // What is worth failing on is the producer STOPPING, so say that, with the two numbers that separate a
+                // launch that never ran from a service that is merely slow.
+                {
+                    static thread_local unsigned int stall_seq = 0;
+                    static thread_local std::chrono::steady_clock::time_point stall_t0{};
+                    const auto now = std::chrono::steady_clock::now();
+                    if (stall_seq != next) {
+                        stall_seq = next;
+                        stall_t0 = now;
+                    } else if (now - stall_t0 > std::chrono::seconds(5)) {
+                        static std::atomic<bool> told_stall{false};
+                        if (!told_stall.exchange(true))
+                            std::fprintf(stderr,
+                                         "glm pipe: CUDA%d service STALLED >5 s on seq %u: its slot holds %u (the "
+                                         "previous occupant, so no entry arrived); host has handed out %llu launch(es), "
+                                         "the device last published %llu\n",
+                                         dev_, next, sq, (unsigned long long) F->seq_h,
+                                         (unsigned long long) (F->dev_pub_h != nullptr ? *F->dev_pub_h : 0ull));
+                    }
                 }
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
                 // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits

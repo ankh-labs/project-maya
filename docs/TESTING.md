@@ -72,6 +72,26 @@ directly, which is the fact the last three boots could only infer from silence.
 
 ## 2026-10-30 — the lap: kRingSize was a single-row constant
 
+> **CORRECTION (same day, later) — THERE WAS NO LAP, AND THE LAP CLAIM IS WITHDRAWN.**
+>
+> `next - kRingSize` in the parked slot is its **previous occupant**: that is what an entry that has *not yet been
+> published* looks like, by construction. A genuine lap is the opposite — the device would have written something
+> **newer** into that slot, so it would hold `N`, or `N + R`, or anything `> N`. Both readings here (`-64` at 64 slots,
+> `-256` at 256) therefore say the same thing: **the producer stopped publishing.** The offset tracked `kRingSize`
+> because arithmetic forces it to, not because the ring size mattered — which is also why the larger ring stalled at
+> seq 257 instead of 2773: a bigger ring changes which seq is in flight when the producer dies, not whether it laps.
+>
+> Consequences, recorded so they are not re-derived:
+> - **No lap has ever been observed on this path.** A true lap is `(int)(sq - next) > 0`, which the pre-existing resync
+>   branch at `glm_fast_path.cu` already handles.
+> - **Backpressure is NOT the fix and is deliberately unwritten.** It bounds a producer that runs ahead; ours stops.
+> - `kRingSize = 256` stays on its own merits (`n_rows x layers` headroom, 4.3 MB pinned) but it is a sizing change,
+>   not a fix, and the failure point moving 64 -> 256 is the evidence that it is not one.
+> - The `LAPPED` guard written here was a **false positive generator** (`sq < next` is the ordinary unpublished case)
+>   and has been replaced by a stall report that quotes the two numbers which actually separate the cases: the host's
+>   hand-out count and the **device's own publish mark** (`MoeDev::dev_pub`). Their difference is the number of launches
+>   that never published — the answer, with no inference left in it.
+
 The ring quote settled it in all three boots, as a uniform negative offset rather than a lost request:
 
 | boot | service waiting for | its slot holds | difference |

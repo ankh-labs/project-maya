@@ -321,6 +321,10 @@ struct MoeDev {
     // the service consumes strictly in seq order - a device spinning for a later answer and a service waiting for an
     // earlier entry that was queued behind that spinner.  Host order == the order the service consumes, by construction.
     unsigned int hseq = 0;
+    // THE DEVICE'S OWN PUBLISH MARK (2026-10-30): the seq of the last ring entry this device actually wrote, stored into
+    // pinned host memory at the publish.  Compared against the host's hand-out count it answers, with no inference, "how
+    // many launches never published" - the question the published-vs-answered counters narrowed to.
+    unsigned long long* dev_pub = nullptr;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {

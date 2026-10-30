@@ -1315,8 +1315,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // request queued behind it on both channels.  Reading the slot the service is parked on separates that from a
         // service thread blocked elsewhere: an old seq in that slot is a kernel that never ran; the right seq there is a
         // consumer that is not consuming.
-        if (F->svc_lapped.load(std::memory_order_relaxed))
-            out += "; SERVICE WAS LAPPED: the device published more than a full ring ahead";
+        // THE UNANSWERED-LAUNCH COUNT, with no inference in it: host hand-outs against the device's own publish mark.
+        if (F->dev_pub_h != nullptr) {
+            const unsigned long long hh = (unsigned long long) F->seq_h;
+            const unsigned long long dd = *F->dev_pub_h;
+            out += "; host handed out seq " + std::to_string(hh) + ", device last published " + std::to_string(dd);
+            if (hh > dd) out += " (" + std::to_string(hh - dd) + " launch(es) never published)";
+        }
         if (F->ring_h != nullptr) {
             const unsigned sn = F->svc_next.load(std::memory_order_relaxed);
             out += "; service waiting for seq " + std::to_string(sn) + " (next in ring:";
