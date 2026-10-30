@@ -1354,8 +1354,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // share F->score / F->cells, so the pipeline refuses rather than corrupting (said once)
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
-            std::fprintf(stderr, "glm rows: CUDA%d the layer pipeline needs STRATA_GLM_ROWS_ATTN=1 (per-row DSA buffers) - "
-                                 "running the layers one at a time\n", dev_);
+            // NAME EVERY DECLINED CONDITION.  This message used to report only the aq case, so a null cs2 or a wrong
+            // row count read as 'set STRATA_GLM_ROWS_ATTN=1' - the same one-message-for-two-faults error that cost a
+            // day on the router, in the gate rather than the kernel.
+            std::fprintf(stderr, "glm rows: CUDA%d the layer pipeline declined (uncertified=%d, n=%d, cs2=%s, aq=%s) - "
+                                 "running the layers one at a time\n",
+                         dev_, (int) uncertified, n, F->cs2 != nullptr ? "set" : "NULL",
+                         S->aq != nullptr ? "set" : "NULL");
         for (int il = l0_; il < l1_; ++il)
             if (!rows_layers(rw, n, err, il, il + 1)) return false;
     } else if (pipe_mode >= 1) {
