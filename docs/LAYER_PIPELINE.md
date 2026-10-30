@@ -628,3 +628,29 @@ it costs.  The row-vs-row overlap was doing this job all along.
 
 Default off.  The copy lane would need a workload where the rows do not already cover each other - the disk-tier case
 this design kept in - or a fetch that is a large fraction of a layer, which 1-1.5 experts/row is not.
+
+## 2026-10-30 (gate) — where opening the rotation actually stands
+
+1. The certification gate is retired: `STRATA_GLM_PIPELINE_UNCERTIFIED` is gone with its comment and warning, because its
+   stated reason (shared per-row spare claims) was the per-row MoeDev bug and `floor_violations` / `spare_steals` read
+   zero.  `pipe_mode` now defaults to 2 via `glmfast::layer_pipe_mode()`.
+
+2. The rotation still cannot run on the default config: it needs the per-row DSA buffers, which are behind
+   `STRATA_GLM_ROWS_ATTN`.  Making that flag follow the rotation, or allocating the buffers without the flag, both crash
+   with illegal accesses in `mv` / `mla_q_abs` / `dsa_select_all` / `kv stream resolve` / `kv_q4`, because the flag is
+   consulted OUTSIDE the rotor (prefill, the fused path).  That refactor is parked: 22 MB of the rows' 31 MB and a
+   changed attention shape is a VRAM decision, not a cleanup.
+
+3. With `STRATA_GLM_ROWS_ATTN=1` delivered from the config's own `env` block (live config is `maya-v3q-q4.json`, the one
+   the launcher names), the engine's announcement confirms the gate opens: no 'rotation declined', the DSA line, and
+   'rotor entered (n=2, layers 0..45)'.  That boot then died with the same illegal accesses.
+
+4. Two hypotheses for that death were tested and FALSIFIED:
+   - **k = 7 interaction**: shell `ROWS_ATTN=1 LAYER_PIPE=2 MAYA_GLM_EXPERT_USED=7` runs clean - 32+32 tokens, 4.4 s,
+     0 errors, rotor on steps 1 and 2.
+   - **config-env vs shell-env delivery**: `child_env()` is `dict(os.environ)` updated by `cfg["env"]`, and both spawn
+     paths pass it (`Popen(..., env=env)`), so the two boots provably delivered the same values.
+
+5. Remaining hypothesis, and it fits the engine's own last words ("exit code 1 ... the usual cause is running out of
+   RAM"): the machine was downloading 156 GB and hashing it (Maya-L) at the time.  A repeatability run of four
+   identical boots is in progress; if any of them crashes under an idle box, load is not the explanation either.
