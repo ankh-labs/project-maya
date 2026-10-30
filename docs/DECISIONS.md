@@ -78,3 +78,13 @@ file. Any helper that auto-resolves must **refuse when either side contains a de
 Second rule from the same episode: a conflict that compiles is not evidence. A union that duplicates a statement with
 balanced braces compiles perfectly and is silently wrong. Audit by **count** against the last verified build — every
 marker line must appear as often as it did there; up is a union artefact, down is a lost edit.
+
+### The count audit's stated limit (2026-10-30)
+
+The count audit verifies **occurrences, not placement or correctness**. It catches union artefacts (a duplicated
+statement) and lost edits (a missing one) — and nothing else. Six sites in `glm_fast.cu` read `d.wait_seq` / `d.resp`
+raw, bypassing `moe_wseq(d)` / `moe_resp_ch(d)` and so reading channel 0 unconditionally; they are byte-identical in
+`15ff4f1`, so no count could have flagged them, and they were only ever harmless because `wait_ch` was always 0.
+
+Use the audit as the post-rebase gate it was built for, and do not mistake a clean audit for evidence that the code is
+right. Correctness needs a run; the audit only proves the merge did not silently add or drop something.
