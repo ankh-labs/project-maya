@@ -960,8 +960,10 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         }
     }
     // TRANSFER's marker: this layer's fills are on this stream, so the event completes when the last of them lands.
-    if (rows_per_row_ && !empty && il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr)
+    if (rows_per_row_ && !empty && il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr) {
+        if (il < (int) F->ev_fill_gen.size()) F->ev_fill_gen[(size_t) il] = F->step_seq;   // stamp BEFORE the record
         cudaEventRecord(F->ev_fill[(size_t) il], s);
+    }
     if (pred_on && !empty) {   // the claims are staged: the side stream copies them while this layer computes
         cudaEventRecord(F->ev_pf, s);
         cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
@@ -1160,6 +1162,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // The embed, the bind and the boundary all ran on F->cs; row 1 computes on F->cs2, and on one stream that
         // ordering was implicit.  Without this the second row's first layer can read its x before the embed that writes
         // it has run - a sporadic non-finite score a layer or two in, i.e. arithmetic, not an index fault.
+        ++F->step_seq;   // every arrival answer below is about THIS step
         gf::nonfinite_reset();
         cudaEventRecord(F->ev_hop, F->cs);
         cudaStreamWaitEvent(F->cs2, F->ev_hop, 0);
@@ -1188,6 +1191,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             F->ev_fill.resize((size_t) l1_, nullptr);
             for (size_t i = hadf; i < F->ev_fill.size(); ++i)
                 cudaEventCreateWithFlags(&F->ev_fill[i], cudaEventDisableTiming);
+            F->ev_fill_gen.resize((size_t) l1_, 0u);
         }
         // Safety net only: with one deferral per row between runs the schedule cannot exceed roughly 2L, and the cap
         // turns a scheduler bug into a visible short step instead of a spin.
@@ -1220,8 +1224,11 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 // assigned; the fill may still be copying (on this row's stream or, after another row ran the layer,
                 // on the other one).  RETIRE answers that with cudaEventQuery - never a synchronise in the loop.
                 cudaStream_t srow = (serial || (r & 1) == 0) ? F->cs : F->cs2;
-                bool filling = false;
-                if (il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr) {
+                // FAIL CLOSED: an event that was never recorded this step is not evidence of arrival, and neither is
+                // one still holding a previous step's record.  Only gen == step_seq makes the query an answer.
+                bool filling = true;
+                if (il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr &&
+                    il < (int) F->ev_fill_gen.size() && F->ev_fill_gen[(size_t) il] == F->step_seq) {
                     filling = cudaEventQuery(F->ev_fill[(size_t) il]) == cudaErrorNotReady;
                     (void) cudaGetLastError();   // NotReady is not an error to leave set
                 }
