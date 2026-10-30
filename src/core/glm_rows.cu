@@ -813,6 +813,12 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     j[2] = {Ly.sh_up.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->sh_u, FFs, rb), nullptr, 1.0f,
             Ly.sh_up.type, E, FFs};
     if (!mv(j, 3, "router / shared expert")) return false;
+    // Inside the FFN block: the router's logits and the shared expert's gate/up, so a divergence here separates a
+    // routing/input fault from the shared path and from the routed experts (which the post-FFN stage covers).
+    if (rows_per_row_) {
+        gf::pipe_probe(rows(S->rlog, g.n_expert, rb), g.n_expert, 1024 + il * 4 + 1, s);
+        gf::pipe_probe(rows(S->sh_u, FFs, rb), (int) FFs, 1024 + il * 4 + 2, s);
+    }
     // its own error string: `err` is the scheduler's, and a cancelled or failed prompt leaves its text there
     // until the next prompt - read here, it failed every running request (with the setting off too)
     std::string gerr;
