@@ -1137,6 +1137,61 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     gf::MvJob o = {ow.q, rows_q(S->head_xq, E, rb), rows(S->head_x, E, rb), rows(S->logits, g.n_vocab, rb), nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (!mv(&o, 1, "output head")) return false;
+    // THE DRAW, HASHED (2026-10-30).  A residual that changes while the token does not leaves two suspects: the head not
+    // reading this row, or the draw degenerating.  A hash separates them; the magnitude and the gap to second place say
+    // WHICH degeneracy, because a saturated or uniform row of logits draws the same token forever without being corrupt.
+    // The stride print is the other half: mv_nt replicates activations by advancing xq n_in/32 blocks and xf n_in floats,
+    // so if the per-row stride here is padded to anything else, activation 1 reads the wrong memory while 0 is perfect -
+    // the exact asymmetry under investigation.
+    if (n > 1 || getenv("STRATA_GLM_TOK_ID_LOG") != nullptr) {
+        {
+            static std::atomic<bool> stride_told{false};
+            if (!stride_told.exchange(true)) {
+                const char* p0 = (const char*) rows(S->head_x, E, 0);
+                const char* p1 = (const char*) rows(S->head_x, E, 1);
+                const char* q0 = (const char*) rows_q(S->head_xq, E, 0);
+                const char* q1 = (const char*) rows_q(S->head_xq, E, 1);
+                const char* l0 = (const char*) rows(S->logits, g.n_vocab, 0);
+                const char* l1 = (const char*) rows(S->logits, g.n_vocab, 1);
+                std::fprintf(stderr,
+                             "glm rows: head strides CUDA%d E=%d n_vocab=%d: head_x %lld (want %lld), head_xq %lld "
+                             "(want %lld), logits %lld (want %lld)\n",
+                             dev_, E, g.n_vocab, (long long) (p1 - p0), (long long) ((int64_t) E * 4),
+                             (long long) (q1 - q0), (long long) ((int64_t) (E / 32) * kQ8),
+                             (long long) (l1 - l0), (long long) ((int64_t) g.n_vocab * 4));
+            }
+        }
+        std::vector<float> lg((size_t) g.n_vocab);
+        for (int i = 0; i < n; ++i) {
+            const float* src = rows(S->logits, g.n_vocab, R(i));
+            cudaMemcpyAsync(lg.data(), src, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            unsigned long long h = 1469598103934665603ull;
+            int i1 = 0, i2 = 0;
+            float v1 = lg[0], v2 = lg[0];
+            for (int k = 0; k < g.n_vocab; ++k) {
+                uint32_t b;
+                std::memcpy(&b, &lg[(size_t) k], sizeof b);
+                h = (h ^ b) * 1099511628211ull;
+                const float v = lg[(size_t) k];
+                if (v > v1) {
+                    v2 = v1;
+                    i2 = i1;
+                    v1 = v;
+                    i1 = k;
+                } else if (v > v2 && k != i1) {
+                    v2 = v;
+                    i2 = k;
+                }
+            }
+            std::fprintf(stderr,
+                         "glm rows: head CUDA%d row %d logits %016llx top1 %d %.6f top2 %d %.6f gap %.6f\n", dev_, i, h,
+                         i1, (double) v1, i2, (double) v2, (double) (v1 - v2));
+        }
+    }
     for (int i = 0; i < n; ++i) {
         const float* lg = rows(S->logits, g.n_vocab, R(i));
         if (strata::core::rows_pick_argmax(sps[i]))
