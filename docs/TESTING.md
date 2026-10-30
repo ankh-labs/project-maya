@@ -147,3 +147,36 @@ What is now established:
 the same wrong assumption about in-flight size. The form that does not cost pipeline latency: before the rotor hands out
 a seq, require the service to be within a window - `F->seq_h - F->processed < kRingSize / 2` - yielding only while that
 window is closed. When the service keeps up it never binds; when it falls behind it stops the producer instead of lapping.
+
+## 2026-10-30 — the producer/consumer framing is dead; the waiter's release condition is the question
+
+Boot 1's arithmetic killed it. `pub_ch` counts **host hand-outs** (`md_h.hseq = ++F->seq_h`), not device publishes:
+
+```
+ch0 published 2268 + ch1 84 = 2352 = H (host hand-outs)
+ch0 answered  2255 + ch1 70 = 2325
+service waiting for seq 2326   (2325 + 1)
+```
+
+So the `BEHIND 13/14` read all day was **the host's enqueue lead over device execution**, not a service backlog. The
+service has consumed every request that reached the ring and is parked on the next one, which no kernel has published.
+
+`H - T` (host hand-outs vs highest seq in the ring) therefore cannot discriminate: a stream is in-order, so once a
+kernel wedges, every launch the host enqueued behind it has not run either. `H - T` is forced non-zero in any stall and
+zero in none. It was built, measured once (`H = 2352`, ring top `2352`, i.e. zero — a boot whose step died before the
+next hand-out) and removed rather than carried.
+
+A publish-mark word written by the kernel was also tried and **removed**: it read 0 in a boot that had answered 2255
+requests, and an illegal memory access appeared in the same build. A diagnostic that can fault is not worth its reading.
+
+**What is left, and it is narrow:** a device-side waiter (row 1, layer 31/32 on `cs2`) blocked although everything it
+could be waiting for has already been answered. The release is not "the answer arrived" — it is `*moe_wseq(d)`
+**changing**: `moe_wait` reads `s_need = *moe_wseq(d)`, block 0 watches for the response and clears the word to 0, and
+every other block spins on `while (*moe_wseq(d) == s_need)`. A waiter therefore sits forever if the word it polls is not
+the word that gets cleared - a per-channel indexing question between the publish (`*moe_wseq(a.d) = mask ? seq : 0u`)
+and the clear.
+
+Instrument: at a stall, dump the eight `wait_seq` words against the eight `resp[ch].seq` values, beside the parked
+`next`. `wait_seq[1]` holding a seq whose `resp[1].seq` already matches it means the answer landed and the clear never
+happened. The `wait_seq` read is issued on its own stream and polled for at most 2 s, because a blocking host sync is
+the deadlock the diagnostics note warns about; if it cannot complete the line says so.

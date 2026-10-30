@@ -4445,6 +4445,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         __threadfence_system();
         rq->ch = a.d.wait_ch & 7;
     rq->seq = s_seq;
+        // (2026-10-30: the publish mark that stood here is REMOVED.  It read 0 in a boot with 2255 answered requests - the
+        // mapped write is not reliable enough to count launches - and a new illegal memory access appeared in the same
+        // build.  The ring already records what it measured: the highest seq present in it IS the highest published seq.)
 #if defined(__HIPCC__)
         // The CPU polls this signal without a stream query. As in Strata #697,
         // publish the signal itself after publishing the request payload.

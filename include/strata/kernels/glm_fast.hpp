@@ -321,10 +321,14 @@ struct MoeDev {
     // the service consumes strictly in seq order - a device spinning for a later answer and a service waiting for an
     // earlier entry that was queued behind that spinner.  Host order == the order the service consumes, by construction.
     unsigned int hseq = 0;
-    // THE DEVICE'S OWN PUBLISH MARK (2026-10-30): the seq of the last ring entry this device actually wrote, stored into
-    // pinned host memory at the publish.  Compared against the host's hand-out count it answers, with no inference, "how
-    // many launches never published" - the question the published-vs-answered counters narrowed to.
-    unsigned long long* dev_pub = nullptr;
+    // THE DEVICE'S OWN PUBLISH MARK (2026-10-30): one word PER CHANNEL, the seq of the last ring entry this channel
+    // actually wrote, stored into pinned host memory at the publish.  Per channel, not one word, because two rows publish
+    // concurrently and a single word is last-writer-wins, not a maximum: row 1 publishing 100 then row 0 publishing 99
+    // would read 99 with both landed, and a phantom gap of one is exactly the shape that would be misread as "a launch
+    // never published".  Within a channel the writes ARE ordered - a row's route kernels execute in its own stream's
+    // order - so the last writer per channel is that channel's highest seq, and no atomic is needed.  (atomicMax on
+    // mapped host memory is not available here anyway: x86 hosts do not support device system-wide atomics.)
+    unsigned long long* dev_pub = nullptr;   // [8]: one publish mark a channel
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {

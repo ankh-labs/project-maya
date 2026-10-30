@@ -1315,13 +1315,9 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // request queued behind it on both channels.  Reading the slot the service is parked on separates that from a
         // service thread blocked elsewhere: an old seq in that slot is a kernel that never ran; the right seq there is a
         // consumer that is not consuming.
-        // THE UNANSWERED-LAUNCH COUNT, with no inference in it: host hand-outs against the device's own publish mark.
-        if (F->dev_pub_h != nullptr) {
-            const unsigned long long hh = (unsigned long long) F->seq_h;
-            const unsigned long long dd = *F->dev_pub_h;
-            out += "; host handed out seq " + std::to_string(hh) + ", device last published " + std::to_string(dd);
-            if (hh > dd) out += " (" + std::to_string(hh - dd) + " launch(es) never published)";
-        }
+        // (the ring-scan that stood here is REMOVED: a CUDA stream is in-order, so once one kernel wedges every launch
+        // the host enqueued behind it has not run either - H - T would be the host's enqueue lead by construction, not a
+        // fault, and would read non-zero in every stalled boot.  It cannot discriminate, so it is not measured.)
         if (F->ring_h != nullptr) {
             const unsigned sn = F->svc_next.load(std::memory_order_relaxed);
             out += "; service waiting for seq " + std::to_string(sn) + " (next in ring:";
@@ -1714,6 +1710,47 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                         why += "; row " + std::to_string(r2) + " at il " + std::to_string(S->cur[r2].il) + " on cs" +
                                (((serial || (r2 & 1) == 0)) ? "" : "2");
                     why += ch_delta();
+                    // THE WAIT WORDS (2026-10-30).  The waiter's release is not "the answer arrived" - it is
+                    // *moe_wseq(d) CHANGING: moe_wait reads s_need = *moe_wseq(d), block 0 watches for the response and
+                    // clears that word to 0, and every other block spins on while (*moe_wseq(d) == s_need).  So a waiter
+                    // can sit forever with its answer lying in resp[ch] if the word it polls is not the word that gets
+                    // cleared.  Reading wait_seq against resp[ch].seq separates exactly that.  Read WITHOUT a blocking
+                    // sync (a host sync here is the deadlock the diagnostics note warns about): the copy goes on its own
+                    // stream and is polled for at most 2 s, and the line says so if it could not complete.
+                    {
+                        static cudaStream_t ds = nullptr;
+                        if (ds == nullptr) {
+                            if (cudaStreamCreateWithFlags(&ds, cudaStreamNonBlocking) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                ds = nullptr;
+                            }
+                        }
+                        unsigned int wq[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        bool got = false;
+                        if (ds != nullptr && F->md.wait_seq != nullptr) {
+                            cudaMemcpyAsync(wq, F->md.wait_seq, sizeof(wq), cudaMemcpyDeviceToHost, ds);
+                            for (int t = 0; t < 2000; ++t) {
+                                const cudaError_t q3 = cudaStreamQuery(ds);
+                                if (q3 == cudaSuccess) {
+                                    got = true;
+                                    break;
+                                }
+                                (void) cudaGetLastError();
+                                if (q3 != cudaErrorNotReady) break;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                        }
+                        why += "; wait_seq";
+                        if (got)
+                            for (int c2 = 0; c2 < 8; ++c2)
+                                why += " " + std::to_string(c2) + "=" + std::to_string(wq[c2]);
+                        else
+                            why += " (unreadable without a blocking sync)";
+                        why += "; resp.seq";
+                        for (int c2 = 0; c2 < 8; ++c2)
+                            why += " " + std::to_string(c2) + "=" +
+                                   std::to_string(F->resp_h != nullptr ? (unsigned) F->resp_h[c2].seq : 0u);
+                    }
                     err = why;
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;

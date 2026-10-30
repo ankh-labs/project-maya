@@ -1015,7 +1015,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     {   // the device's publish mark: one pinned word, written by the route kernel at the publish itself
         void* ph = nullptr;
         void* pd = nullptr;
-        if (cudaHostAlloc(&ph, sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
+        if (cudaHostAlloc(&ph, 8 * sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
             err = "glm fast: the publish mark did not allocate";
             return false;
         }
@@ -1026,7 +1026,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->dev_pub_h = (unsigned long long*) ph;
         F->dev_pub_d = (unsigned long long*) pd;
         F->md.dev_pub = F->dev_pub_d;
-        *F->dev_pub_h = 0ull;
+        for (int c = 0; c < 8; ++c) F->dev_pub_h[c] = 0ull;
     }
     F->md.route_error = (volatile int*) ((gf::MoeRequest*) dp + gf::kRingSize);
     if (cudaMalloc((void**) &F->md.route_err_d, 64) != cudaSuccess || cudaMemset(F->md.route_err_d, 0, 64) != cudaSuccess) {
