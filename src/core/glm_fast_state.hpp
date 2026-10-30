@@ -524,6 +524,16 @@ struct Glm5Model::FastState {
     // path the two were the same because the copy and the compute shared a stream.  This is the arrival state, and it is
     // what makes kStageInFlight reachable at all.
     std::vector<cudaEvent_t> ev_fill;
+    // A slot_of / spare mutation that touches a layer the rotor still needs.  The floor guard sits at ONE of the five
+    // writers (fast_boundary's eviction); a guard on one writer is a special case, not an invariant.  Counted first, so
+    // that one run says whether the trailing row's fault is this or just the stale start-of-token layer_res snapshot.
+    bool floor_locked(int il) const {
+        if (!pipe_active.load(std::memory_order_acquire)) return false;
+        const int f = pipe_floor.load(std::memory_order_acquire);
+        return f >= 0 && il >= f;
+    }
+    std::atomic<uint64_t> floor_violations{0};
+    std::atomic<uint64_t> spare_steals{0};
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
