@@ -5866,6 +5866,44 @@ void mv_nt_launch(const MvJob* jobs, int n, bool typed, bool* done, cudaStream_t
 }
 }  // namespace
 
+// Three decode sites take their GEMV input straight from a producer that writes q8_1 and never the floats: the
+// DSA and KDA attn_output (mla() and kda_rec() write "the q8_1 of the ... output") and the shared expert's down
+// (the shared gate/up write the h as q8_1).  A GGUF that keeps those projections BF16 - v3q does - therefore has
+// no xf to hand the BF16 GEMV, and mv_inputs_ok refuses the job.  Rather than make three kernels emit a second
+// copy of their output, dequantize the q8_1 row into a scratch float row here: the weights stay BF16 (only the
+// activation carries q8_1's rounding, which the quantized path this engine normally runs already accepts), and
+// the branch is reachable only where the job is refused today, so it cannot change a path that already worked.
+static constexpr size_t kMvXfScratchBytes = 8u << 20;   // 16 columns x 16384 floats is 1 MiB; 8 is headroom
+
+__global__ static void q8_1_to_float_kernel(const block_q8_1* __restrict__ x, float* __restrict__ y, long long n,
+                                            int n_in, long long src_cstride_blocks) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long col = i / n_in, k = i % n_in;
+    const block_q8_1* b = x + col * src_cstride_blocks + k / QK8_1;
+    y[i] = (float) b->qs[k % QK8_1] * __half2float(__low2half(b->ds));
+}
+
+static void q8_1_to_float(const block_q8_1* x, float* y, long long n, int n_in, long long src_cstride_blocks,
+                          cudaStream_t s) {
+    const int threads = 256;
+    const long long blocks = (n + threads - 1) / threads;
+    q8_1_to_float_kernel<<<(unsigned) blocks, threads, 0, s>>>(x, y, n, n_in, src_cstride_blocks);
+}
+
+static float* mv_xf_scratch() {
+    static std::atomic<void*> slot{nullptr};
+    void* p = slot.load(std::memory_order_acquire);
+    if (p == nullptr) {
+        void* want = nullptr;
+        if (cudaMalloc(&want, kMvXfScratchBytes) != cudaSuccess) return nullptr;
+        void* expect = nullptr;
+        if (!slot.compare_exchange_strong(expect, want, std::memory_order_acq_rel)) cudaFree(want);
+        p = slot.load(std::memory_order_acquire);
+    }
+    return (float*) p;
+}
+
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     if (nt <= 1) return mv(jobs, n, s);
     if (n <= 0 || n > kMaxMvJobs || nt > kMaxMvNt) return false;
