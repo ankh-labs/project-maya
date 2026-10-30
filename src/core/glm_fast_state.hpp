@@ -533,6 +533,11 @@ struct Glm5Model::FastState {
     // still holds that step's completion.  Both report "the bytes landed" for a fill that has not been issued yet, which
     // is how a stale answer reached the ladder.  The event is believed only for the step that recorded it; a generation
     // mismatch means NOT ARRIVED (fail closed - a spurious wait costs overlap, a spurious proceed costs correctness).
+    // THE COPY LANE's ordering, one event a layer: recorded on the compute stream when the layer's plan is written,
+    // waited on by the copy stream, then recorded there and waited on by the compute stream before the experts read
+    // the slots.  Per layer is enough because no two rows occupy one layer; a single shared event would be the ev_pf
+    // collision again.
+    std::vector<cudaEvent_t> ev_copy;
     std::vector<unsigned int> ev_fill_gen;   // the step_seq that recorded ev_fill[il] (0 = never)
     unsigned int step_seq = 0;
     // A slot_of / spare mutation that touches a layer the rotor still needs.  The floor guard sits at ONE of the five

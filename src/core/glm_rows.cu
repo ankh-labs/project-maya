@@ -1265,6 +1265,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             for (size_t i = hadf; i < F->ev_fill.size(); ++i)
                 cudaEventCreateWithFlags(&F->ev_fill[i], cudaEventDisableTiming);
             F->ev_fill_gen.resize((size_t) l1_, 0u);
+            const size_t hadc = F->ev_copy.size();
+            F->ev_copy.resize((size_t) l1_, nullptr);
+            for (size_t i = hadc; i < F->ev_copy.size(); ++i)
+                cudaEventCreateWithFlags(&F->ev_copy[i], cudaEventDisableTiming);
         }
         // Safety net only: with one deferral per row between runs the schedule cannot exceed roughly 2L, and the cap
         // turns a scheduler bug into a visible short step instead of a spin.

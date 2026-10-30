@@ -5897,10 +5897,29 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // STRATA_GLM_SKIP_EMPTY=1, a batched step's row (glm_rows.cu - the token path's launches are its graphs'): the
     // same per layer (FastState::layer_res: a layer whose every expert is in VRAM), and elsewhere the wait and the
     // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
+    // STRATA_GLM_COPY_LANE=1: issue the fetch on the copy stream.  MEASURED WORSE in absolute terms (both arms ~8%
+    // slower) because the copy stream is shared by the rows and each fetch now costs two event round trips - but the
+    // ROW-vs-ROW margin widened (paired +2.6 tok/s, 6/6, against +1.2 before).  Off by default until a design that
+    // does not serialise the rows' copies through one stream exists.
+    static const bool copy_lane = getenv("STRATA_GLM_COPY_LANE") != nullptr;
     const bool skip_empty = rows && glmfast::skip_empty_on();
     const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
     if (!empty && skip_empty) {
         gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
+    } else if (!empty && rows_per_row_ && copy_lane && F->ps != nullptr && il < (int) F->ev_copy.size() &&
+               F->ev_copy[(size_t) il] != nullptr) {
+        // THE COPY LANE (the spec's TRANSFER): the fetch is issued on the copy stream, ordered after this layer's plan
+        // (the route writes it on the compute stream) and before the experts that read the slots.  This is what makes
+        // copy and compute actually overlap; everything before it only overlapped row with row.
+        cudaEvent_t ec = F->ev_copy[(size_t) il];
+        cudaEventRecord(ec, s);
+        cudaStreamWaitEvent(F->ps, ec, 0);
+        gf::moe_wait(md, g.n_embd, F->ps);
+        if (F->prof_on) F->mark("moe_wait(copy)");
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, F->ps);
+        if (F->prof_on) F->mark("moe_fetch(copy)");
+        cudaEventRecord(ec, F->ps);
+        cudaStreamWaitEvent(s, ec, 0);
     } else if (!empty) {
         gf::moe_wait(md, g.n_embd, s);
         if (F->prof_on) F->mark("moe_wait");

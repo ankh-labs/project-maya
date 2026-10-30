@@ -555,3 +555,23 @@ runs in the same boot: +1.23, +1.00, +1.17, +2.21, +2.70, +0.39 tok/s - overlap 
 delta about +1.2 tok/s (~+4%).  The n=2 reading of +11% was optimistic; the direction survives, the magnitude halves.
 
 Baseline to judge the copy move against: **serial median 31.36, overlap median 33.37, paired +1.2 (+4%), n=6.**
+
+## 2026-10-30 (copy lane) — the fetch moved to the copy stream, and it is slower
+
+`STRATA_GLM_COPY_LANE=1` issues a per-row step's fetch on the copy stream (`F->ps`), ordered by one event a layer on
+each side (plan written -> copy -> experts read).  Correct: 0 non-finite, 0 drain errors, coherent output.
+
+Same method as the baseline: one boot, alternating arm, n=6 valid each, paired deltas.
+
+    serial   min 26.91  median 28.86  max 29.53  mean 28.66      (baseline: median 31.36, mean 31.82)
+    overlap  min 29.15  median 29.76  max 32.89  mean 30.88      (baseline: median 33.37, mean 33.26)
+
+    paired deltas (overlap - serial): +0.82 +4.27 +2.61 +2.66 +0.04 +2.92   6/6 positive, median ~ +2.6
+
+Both arms are ~8% SLOWER in absolute terms, while the row-vs-row margin widened from +1.2 to +2.6 tok/s (6/6 both
+times).  Read: the copy lane serialises the two rows' fetches through one shared stream and adds two event round trips
+per layer, and the overlap it buys back is smaller than that cost.  The spec's hoped-for copy/compute win did NOT
+appear on this design - a null-to-negative result, which was a legitimate outcome given the copy had to share `F->ps`.
+
+Default OFF; the code stays for the next attempt, which needs a copy lane per row (or a queue with priorities) rather
+than one shared stream.
