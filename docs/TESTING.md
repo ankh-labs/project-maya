@@ -557,3 +557,31 @@ coherent output, 3/3 boots), so Aaron's disk-spill rung starts there whenever he
 
 If someone does want the split later: re-enable rerere for the forward direction, do the replay as a deliberate task with
 a decision recorded per commit, and verify each with the arm (build, three boots, rotor count) - not as a bisect step.
+
+## Handover: the one category never examined (for whenever this resumes)
+
+Every other shape has now been excluded by measurement: dropped lines (the audit found the four reverts and the family is
+swept clean), upstream's new code (the shared-state filter is clean, and both rotor-adjacent features are 0/3 under their
+own flags), memory errors (memcheck clean with the rotor engaged), and protocol faults (the wait-word dump, the both-stream
+poll and the channel counters all cleared it).
+
+What remains is **a resolution that compiles and is semantically wrong**. Six sites are where our code met upstream's and
+something chose: the five hand-resolved conflicts, plus the union-mangled hunk repaired afterwards. Those resolutions were
+checked against the compiler, not against what our side actually did at `cd52717` - and a wrong one adds or removes
+nothing, so no count audit could see it.
+
+The three repair commits name the files and the two poles of each:
+
+```
+935a22b  rebase: restore the BF16 fallbacks the v1.1.40 merge dropped, and make the q() error name its cause
+73f08ab  rebase onto v1.1.40: port the q8_1->float scratch helpers the merge dropped
+56ced70  rebase onto v1.1.41: repair the three hunks the union helper mangled (by text, not concatenation)
+```
+
+`56ced70` is the least verified of the six: its hunks were fixed until the compiler stopped complaining, which is exactly
+the "does it build" test this category defeats. Start there.
+
+For each site, read three versions side by side - `git show cd52717:<file>`, `git show c18d67f:<file>` (or `8d9979f`),
+and what the replay produced - and ask only one question: **does our side still do what it did at `cd52717`?** The pattern
+that has paid out four times tonight is per-row behaviour quietly reduced to per-call (`R(i)` -> `i`, per-row buffer ->
+shared, gated allocation). Bounded at six sites, no boots, and it needs no rebuild to read.
