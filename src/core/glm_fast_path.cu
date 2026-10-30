@@ -5758,8 +5758,12 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
     static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
+    // SUBMISSION ORDER, not GPU order: the service consumes the ring strictly in seq order, so the seq has to be the
+    // one the host handed out when it launched this route.
+    auto md_h = md;   // (this route's own copy: the caller holds md by const ref)
+    md_h.hseq = (unsigned int) ++F->seq_h;
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
-                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
+                  g.n_embd, md_h, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, (rows_stream_ != nullptr ? rows_stream_ : F->cs),
                   pred ? (pred_logits != nullptr ? pred_logits : F->plog) : nullptr,
                   pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? (pred_pf_n > 0 ? pred_pf_n : F->max_pf) : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,

@@ -1147,6 +1147,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
         const uint64_t expected0 = F->expected;
+        gf::moe_wait_fetch_set_rows(n);   // N rows: N wait kernels can be resident at once
         rows_per_row_ = true;   // every layer below is ONE row of the pipeline
         if (F->pipe) F->pipe->watch_active.store(1, std::memory_order_release);   // arm the independent watchdog
         F->pipe_active.store(true, std::memory_order_release);   // from here the boundary's eviction rule applies
@@ -1207,6 +1208,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 else all_done = false;
             }
         }
+        gf::moe_wait_fetch_set_rows(1);
         row_base_ = 0;
         rows_stream_ = nullptr;
         rows_per_row_ = false;
