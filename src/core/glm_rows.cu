@@ -1165,35 +1165,44 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // The rotor's skew IS the lead: row r runs layer k - r, so the spread is exactly n - 1.  S must be at least that
         // or the invariant would forbid the very advance it is meant to allow; the pin set is S x N x 8 slots.
         if (F->pipe_lead < n - 1) F->pipe_lead = n - 1;
-        for (int k = 0; k < L + n - 1; ++k) {
+        // The round index k is a ROUND, not a layer.  Driving the layer off `l0_ + k - r` meant a row that postponed a
+        // layer silently skipped it - the displaced layer was never run by anyone, so the row computed its token with a
+        // hole in the stack and the rotor kept submitting layers while nothing completed.  Each row now owns a cursor
+        // (`cur[r].il`), advanced only when its layer actually ran, so a deferral postpones instead of dropping.
+        for (int r = 0; r < n; ++r) {
+            S->cur[r].il = l0_;
+            S->cur[r].deferred = 0;
+            S->cur[r].done = false;
+        }
+        // Safety net only: with one deferral per row between runs the schedule cannot exceed roughly 2L, and the cap
+        // turns a scheduler bug into a visible short step instead of a spin.
+        const int round_cap = 4 * L + 64;
+        bool all_done = false;
+        for (int k = 0; k < round_cap && !all_done; ++k) {
+            all_done = true;
             for (int r = 0; r < n; ++r) {
-                int il = l0_ + k - r;
-                if (il < l0_ || il >= l1_) continue;
-                // A deferred layer runs before this round's own: order per row is preserved because the slot only ever
-                // holds the layer it was about to run.
-                const int want = S->cur[r].defer_il >= 0 ? S->cur[r].defer_il : il;
-                if (S->cur[r].defer_il < 0 && want != il) continue;
-                il = want;
-                // THE LADDER, with real residency: is this layer already wholly in VRAM?  If not and nothing is in
-                // flight, Reorder says run another slot's layer first and come back - that is the decision this loop
-                // acts on.  A slot that would defer twice runs anyway (livelock guard).
+                if (S->cur[r].done) continue;
+                if (k < r) { all_done = false; continue; }   // this row has not started yet (the stagger is unchanged)
+                const int il = S->cur[r].il;
+                // THE LADDER, with real residency.  Reorder asks for another slot's layer first; the row answers by
+                // staying on the same layer for one round.  `deferred` prevents an endless Reorder (reset on a run).
                 {
                     const bool res = F->layer_resident(il);
                     const auto st = FastState::pipe_stage(res, /*in_flight=*/false, /*can_reorder=*/true,
                                                           /*can_cpu=*/true, /*can_disk=*/true);
-                    if (st == FastState::kStageReorder && S->cur[r].deferred < 1) {
-                        S->cur[r].defer_il = il;
-                        S->cur[r].deferred++;
-                        continue;   // run it next round instead of blocking here
+                    if (st == FastState::kStageReorder && S->cur[r].deferred == 0) {
+                        S->cur[r].deferred = 1;
+                        all_done = false;
+                        continue;   // same layer next round, not a skipped layer
                     }
-                    S->cur[r].defer_il = -1;
+                    S->cur[r].deferred = 0;
                 }
-                // floor = the lowest layer an active slot sits at; monotone within the step.  Published for the retire
-                // path and (later) the eviction rule "layers below floor only".
-                // floor is clamped to the first layer: "everything is at or above l0_" is the honest answer during
-                // spin-up, where l0_ + k - (n-1) is still negative and no layer has finished yet.
-                floor = std::max(l0_, l0_ + k - (n - 1));
-                if (il > floor + F->pipe_lead) continue;   // unreachable while S >= n-1: the rotor cannot overshoot
+                // floor = the lowest layer an active (unfinished) slot sits at; monotone within the step.
+                int floor = l1_;
+                for (int q = 0; q < n; ++q)
+                    if (!S->cur[q].done) floor = std::min(floor, S->cur[q].il);
+                floor = std::max(l0_, floor);
+                if (il > floor + F->pipe_lead) { all_done = false; continue; }   // unreachable while S >= n-1
                 row_base_ = r;
                 rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
                 if (F->pipe) F->pipe->layers_submitted.fetch_add(1, std::memory_order_relaxed);   // SUBMIT, really launched
@@ -1204,6 +1213,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
+                S->cur[r].il = il + 1;              // advance ONLY on a real run
+                S->cur[r].deferred = 0;
+                if (S->cur[r].il >= l1_) S->cur[r].done = true;
+                else all_done = false;
             }
         }
         row_base_ = 0;
