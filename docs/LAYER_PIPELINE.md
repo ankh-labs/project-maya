@@ -575,3 +575,28 @@ appear on this design - a null-to-negative result, which was a legitimate outcom
 
 Default OFF; the code stays for the next attempt, which needs a copy lane per row (or a queue with priorities) rather
 than one shared stream.
+
+## 2026-10-30 (miss accounting) — what the copy lane would actually have to hide
+
+Before building a per-row copy lane, the workload it serves:
+
+    tiers warm: 12096 experts (114.0 GB)        = 42 MoE layers x 288 experts, ALL resident - but 114 GB
+                                                  against ~48 GB of VRAM, so most of them are in the RAM tier
+    expert cache hit: 71.0% / 70.9%             -> ~29% of routed experts are NOT in VRAM and cross PCIe
+    engine's own figures: 0.567 ms per expert over PCIe; 114.0 GB / 12096 = 9.42 MB per expert
+    geometry: 42 MoE layers, 8 experts per route
+
+Per layer, per row, per token:
+
+    8 x 0.29                       = 2.3 expert misses
+    2.3 x 9.42 MB                  = ~22 MB over PCIe
+    2.3 x 0.567 ms                 = ~1.3 ms of copy
+
+And the layer's own wall time: 32 tokens per row in 4.05 s = 127 ms a token, over 42 MoE layers = ~3.0 ms a layer.
+
+So the copy is roughly **40-45% of a layer's time**, and it is structural rather than incidental: 114 GB of experts
+against 48 GB of VRAM means a large minority can never be resident at once.  The "the pool fits, so there is nothing to
+fetch" hypothesis is false on this box - the pool fits in memory, not in VRAM.
+
+Consequence: a per-row copy lane has real latency to hide (~1.3 ms a layer), so it is worth building; the shared copy
+stream was the wrong shape, not a solution to a non-problem.
