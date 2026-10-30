@@ -1033,11 +1033,20 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: the route error flag did not allocate";
         return false;
     }
-    if (cudaHostAlloc(&hp, sizeof(gf::MoeResponse) * 8, cudaHostAllocMapped) != cudaSuccess) {
+    // THE RESPONSE ARRAY KEEPS ITS OWN HANDLE (2026-10-30).  This block used to allocate the 8 responses into `hp`, then
+    // re-allocate `hp` for the 64-byte channel-seq words and point resp_h at the SECOND allocation - so every answer the
+    // service wrote (MoeResponse carries cpu_part[4096], ~17 KB, x8 slots) landed past the end of a 64-byte pinned buffer,
+    // and resp.seq[5] read whatever happened to follow it (1032389371, 998340161, 3178233609 across three boots).  That is
+    // also the shape that produced an illegal memory access.  Two allocations, two pointers.
+    gf::MoeResponse* resp8 = nullptr;
+    if (cudaHostAlloc((void**) &resp8, sizeof(gf::MoeResponse) * 8, cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the routing response did not allocate";
         return false;
     }
-    std::memset(hp, 0, sizeof(gf::MoeResponse) * 8);
+    std::memset(resp8, 0, sizeof(gf::MoeResponse) * 8);
+    F->resp_h = resp8;
+    cudaHostGetDevicePointer(&dp, resp8, 0);
+    F->md.resp = (gf::MoeResponse*) dp;
     // [8] one per channel: "the seq I just published", in host memory (the pipeline's host-side readiness read)
     if (cudaHostAlloc(&hp, 64, cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the channel seq words did not allocate";
@@ -1047,10 +1056,6 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->need_seq_h = (unsigned int*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.need_seq = (unsigned int*) dp;
-    F->resp_h = (gf::MoeResponse*) hp;
-    std::memset(F->resp_h, 0, 8 * sizeof(gf::MoeResponse));   // 8 slots, zeroed: an unwritten slot must not read as a seq
-    cudaHostGetDevicePointer(&dp, hp, 0);
-    F->md.resp = dp;
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->hop_h, (size_t) g.hc * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {

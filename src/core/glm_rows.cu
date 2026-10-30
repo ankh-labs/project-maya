@@ -1679,19 +1679,30 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }();
             const auto t0 = std::chrono::steady_clock::now();
             for (;;) {
-                const cudaError_t q = cudaStreamQuery(F->cs2);
-                if (q == cudaSuccess) {
+                // BOTH STREAMS (2026-10-30).  This used to poll only cs2, so EVERY stall was reported as "the row lane" -
+                // and "the wedge is on row 1's stream" has been in every error line today on the strength of where this
+                // loop happens to look, not where the block is.  Row 0's work runs on cs, and a stall there is invisible
+                // to a cs2-only query.
+                const cudaError_t qr = cudaStreamQuery(F->cs2);   // the row lane: row 1
+                const cudaError_t qe = cudaStreamQuery(F->cs);    // the engine stream: row 0
+                if (qr == cudaSuccess && qe == cudaSuccess) {
                     const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (el > 2.0)
                         std::fprintf(stderr,
-                                     "glm pipe: CUDA%d the row lane took %.1f s to drain after the last layer (bound %d "
+                                     "glm pipe: CUDA%d the lanes took %.1f s to drain after the last layer (bound %d "
                                      "s) - the waiter finished late, it did not deadlock\n",
                                      dev_, el, drain_s);
                     break;
                 }
-                if (q != cudaErrorNotReady) {
+                if (qr != cudaErrorNotReady && qr != cudaSuccess) {
                     (void) cudaGetLastError();
-                    err = std::string("glm rows: row lane: ") + cudaGetErrorString(q);
+                    err = std::string("glm rows: row lane (cs2): ") + cudaGetErrorString(qr);
+                    F->pipe_active.store(false, std::memory_order_release);
+                    return false;
+                }
+                if (qe != cudaErrorNotReady && qe != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    err = std::string("glm rows: engine stream (cs): ") + cudaGetErrorString(qe);
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
@@ -1714,6 +1725,14 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                             }
                             (void) cudaGetLastError();
                         }
+                    why += "; NotReady:";
+                    {
+                        const cudaError_t r2 = cudaStreamQuery(F->cs2);
+                        const cudaError_t e2 = cudaStreamQuery(F->cs);
+                        (void) cudaGetLastError();
+                        if (r2 == cudaErrorNotReady) why += " cs2(row 1)";
+                        if (e2 == cudaErrorNotReady) why += " cs(row 0)";
+                    }
                     why += "; lowest incomplete layer " + (stuck >= 0 ? std::to_string(stuck) : std::string("none")) +
                            " of " + std::to_string(l0_) + ".." + std::to_string(l1_ - 1);
                     for (int r2 = 0; r2 < n; ++r2)

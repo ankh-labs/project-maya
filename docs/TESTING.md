@@ -215,3 +215,42 @@ Three facts, in order of weight:
 Next instrument: **stage events on the row's stream** (route -> fetch -> mixer -> FFN -> head) so the first event that
 never retires names the stage, not just the layer. The drain's layer sweep already proves the granularity is needed:
 layer 38 alone cannot distinguish a parked wait from a stuck kernel.
+
+## 2026-10-30 — the response array was a 64-byte buffer (pre-existing; found by reading the allocator)
+
+`FastState::resp_h` is the 8-slot array the service writes each answer into. `MoeResponse` is ~17.3 KB (its
+`float cpu_part[4096]`), so the array is ~138 KB. The allocation block did this:
+
+```cpp
+cudaHostAlloc(&hp, sizeof(MoeResponse) * 8, Mapped);   // ~138 KB, zeroed
+cudaHostAlloc(&hp, 64, Mapped);                        // hp REPLACED by the 64-byte channel-seq words
+F->need_seq_h = (unsigned int*) hp;
+F->resp_h     = (MoeResponse*) hp;                     // <- resp_h now points at 64 bytes
+```
+
+So every answer the service wrote (`Rp = F->resp_h + (rq->ch & 7)`, then `Rp->part[...]`) landed **past the end of a
+64-byte pinned allocation**, and the device reads that same region through `F->md.resp`. Observed consequences:
+
+- `resp.seq[5]` read `1032389371`, `998340161`, `3178233609` in three consecutive boots - not uninitialised memory (the
+  array is memset) but whatever the write ran into;
+- an **illegal memory access** in one boot;
+- and, unavoidably, corruption of whatever pinned allocation follows, which is shared with the device.
+
+**It is pre-existing**: `15ff4f1` has the same two lines at 976 and 984, so it is in every build we have called
+verified tonight, including the one whose 796 rotor entries were treated as the working baseline. It is not a replay
+artefact.
+
+Fixed by giving the response array its own handle (`gf::MoeResponse* resp8`) and its own device pointer, with
+`need_seq_h` keeping the 64 bytes:
+
+```cpp
+cudaHostAlloc(&resp8, sizeof(MoeResponse) * 8, Mapped);  memset;  F->resp_h = resp8;  get dev ptr;  F->md.resp = ...
+cudaHostAlloc(&hp, 64, Mapped);                          memset;  F->need_seq_h = hp;  ...
+```
+
+**What this does NOT yet establish:** that it is the wedge. It is a real memory-corruption bug on the answer path, of the
+kind that produces timing-dependent faults, and it is now fixed and arm-able. Three boots decide whether the wedge was a
+symptom of it.
+
+Also in this build: the drain polls **both** streams (`cs` and `cs2`) and the failure line names which is `NotReady` -
+"row 1's stream" has been in every error line today because that was the only stream the loop looked at.
