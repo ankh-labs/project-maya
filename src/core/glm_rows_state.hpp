@@ -61,6 +61,13 @@ struct Glm5Model::RowsState {
         int deferred = 0;
     };
     RowCursor cur[8];
+    // WHO RECORDED THE CROSS-ROW EVENTS (2026-10-30).  ev_fill[il] and ev_layer[il] are single events per layer shared by
+    // both rows, and each row waits on the other's record: "this layer's slots were filled by whichever row ran it first".
+    // Two streams each waiting on an event the other records is a textbook event deadlock, and it is timing-dependent,
+    // indifferent to BF16, and invisible at n = 1 - exactly this fault's shape.  The stall line names the recorder so the
+    // suspicion becomes a statement: "row 1 waited on ev_fill[38] last recorded by row 0 on cs, generation stale".
+    std::vector<int> ev_fill_row, ev_layer_row;   // the row that last recorded each, -1 if never
+
     int* pf_n = nullptr;
     uint8_t* dhq = nullptr;
     float* head_x = nullptr;

@@ -1048,6 +1048,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.need_seq = (unsigned int*) dp;
     F->resp_h = (gf::MoeResponse*) hp;
+    std::memset(F->resp_h, 0, 8 * sizeof(gf::MoeResponse));   // 8 slots, zeroed: an unwritten slot must not read as a seq
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||

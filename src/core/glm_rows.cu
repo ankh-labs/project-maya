@@ -1004,6 +1004,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     }
     if (rows_per_row_ && !empty && il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr) {
         if (il < (int) F->ev_fill_gen.size()) F->ev_fill_gen[(size_t) il] = F->step_seq;   // stamp BEFORE the record
+        if (il < (int) S->ev_fill_row.size()) S->ev_fill_row[(size_t) il] = row_base_;      // ...and WHO records it
         cudaEventRecord(F->ev_fill[(size_t) il], s);
     }
     if (pred_on && !empty) {   // the claims are staged: the side stream copies them while this layer computes
@@ -1425,6 +1426,8 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             for (size_t i = hadf; i < F->ev_fill.size(); ++i)
                 cudaEventCreateWithFlags(&F->ev_fill[i], cudaEventDisableTiming);
             F->ev_fill_gen.resize((size_t) l1_, 0u);
+            if ((int) S->ev_fill_row.size() < l1_) S->ev_fill_row.assign((size_t) l1_, -1);
+            if ((int) S->ev_layer_row.size() < l1_) S->ev_layer_row.assign((size_t) l1_, -1);
             const size_t hadc = F->ev_copy.size();
             F->ev_copy.resize((size_t) l1_, nullptr);
             for (size_t i = hadc; i < F->ev_copy.size(); ++i)
@@ -1522,8 +1525,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
-                if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr)
+                if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr) {
                     cudaEventRecord(F->ev_layer[(size_t) il], rows_stream_);
+                    if (il < (int) S->ev_layer_row.size()) S->ev_layer_row[(size_t) il] = r;
+                }
                 S->cur[r].il = il + 1;              // advance ONLY on a real run
                 S->cur[r].deferred = 0;
                 if (S->cur[r].il >= l1_) S->cur[r].done = true;
@@ -1745,7 +1750,16 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                             }
                         }
-                        why += "; wait_seq";
+                        if (stuck >= 0) {
+                        const int fr = stuck < (int) S->ev_fill_row.size() ? S->ev_fill_row[(size_t) stuck] : -1;
+                        const int lr = stuck < (int) S->ev_layer_row.size() ? S->ev_layer_row[(size_t) stuck] : -1;
+                        const bool gen_ok = stuck < (int) F->ev_fill_gen.size() &&
+                                            F->ev_fill_gen[(size_t) stuck] == F->step_seq;
+                        why += "; layer " + std::to_string(stuck) + " ev_fill recorded by row " + std::to_string(fr) +
+                               (gen_ok ? " (generation current)" : " (GENERATION STALE - nothing recorded it this step)") +
+                               ", ev_layer recorded by row " + std::to_string(lr);
+                    }
+                    why += "; wait_seq";
                         if (got)
                             for (int c2 = 0; c2 < 8; ++c2)
                                 why += " " + std::to_string(c2) + "=" + std::to_string(wq[c2]);
