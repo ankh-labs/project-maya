@@ -5698,6 +5698,26 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
     // read the previous layer's list while this route writes)
     gf::MoeDev md = F->md;
+    // THE PER-ROW MoeDev, built on the path the pipeline ACTUALLY calls.  It lived in rows_moe_grouped's row_dev,
+    // which never runs with grouping off - so every per-row offset (plan pointers, wait channel, CPU-lane answer and
+    // seq, scratch) silently stayed the token path's single set, and both rows shared one plan and one channel.  That
+    // one fact also explains the dead transfers_done: it sat in the same unreachable function.
+    if (rows_per_row_) {
+        const int r = row_base_;
+        const auto& W = F->win;
+        md.plan_ptr = W.mplan_ptr + 8 * r;
+        md.plan_w = W.mplan_w + 8 * r;
+        md.plan_id = W.mplan_id + 8 * r;
+        md.fetch_src = W.mfetch + 8 * r;
+        md.cpu_part = W.mcpu_part + (size_t) g.n_embd * (size_t) r;
+        md.cpu_flag = W.mcpu_flag + r;
+        md.scratch = F->rows_scr != nullptr ? F->rows_scr + 8 * r : nullptr;
+        md.wait_ch = r & 7;   // the channel the service must answer: row 0 the token path's, row r its own
+        if (r > 0 && md.cpu_seq != nullptr) {
+            md.cpu_seq = W.cpu_seq_w + 16 * r;
+            md.cpu_ans = W.ans_d[r];
+        }
+    }
     md.pf_src = F->pf_buf[il & 1];
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];
