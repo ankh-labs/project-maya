@@ -35,3 +35,37 @@ What is established (same-boot comparisons, one boot each):
 What fails: one kernel never retires. Localised by the ev_layer sweep — lowest incomplete layer 33 of 0..44, on cs2 (row 1's stream), with both cursors already at 45. The service's last logged ch=1 answer is layer 31, two layers before the stuck layer, so the answer stream stops rather than never starting.
 
 Falsified today (each by a one-line instrument, recorded so they are not re-walked): parity aliasing of pf_buf (spread never exceeded 1; occ/reo deferrals 0); the round-cap fail-open (gate does not fire, all_done true); stream-fetch raw channel reads (flag off, unchanged); "row 1's residual is never written" (all three hashes differ); the head's i vs R(i) vs rb asymmetry (latent only; strides exact); "no ch=1 evidence" (112 answered).
+
+## 2026-10-30 — the route serialization, three boots (repeated, per the standing rule)
+
+`ev_route` (route launches ordered so publication order equals seq order) is in the tree and builds clean.
+
+| boot | tokens | rotor entries | drain timeouts | non-finite | floor |
+|---|---|---|---|---|---|
+| 1 | -1 + -1 | 5 | 2 | 0 | 0 |
+| 2 | -1 + -1 | 2 | 2 | 0 | 0 |
+| 3 | -1 + -1 | 14 | 2 | 0 | 0 |
+
+**3/3 still fail, and the ranges overlap the pre-fix range (2..6), so the serialization is NOT established as an
+improvement** - it is within this bug's normal variance. It is also not established as useless: it removes one real
+mechanism and costs one event per route. What it cannot be is evidence.
+
+The shape is identical in all three: one kernel on `cs2`, **both cursors already at `il 45`**, and the service's last
+`ch=1` answer lands about **two layers before the stuck layer** (last answer layer 11, stuck layer 13 in boot 3; last
+answer 31, stuck 33 in the earlier boot). The answer stream stops; it does not fail to start.
+
+### The two failure modes are one fault seen at two timeouts
+
+The 90 s drain boot did not wedge at all - it failed `NON-FINITE SCORE at layer 5` instead. Read with the shape above,
+that is not a different bug: the wait kernel is bounded (~60 s), so a request that is never answered has two visible
+outcomes. Give the waiter 20 s and it is a "drain timeout"; give it 90 s and it returns an answer-shaped garbage that the
+router rejects as non-finite. The variable is how long the observer waits, not which fault occurred.
+
+So the target is the **answer path** - a request for which no answer arrives - and not the rotor, the slicing, or the
+strides: those are measured correct. Of the two options LAYER_PIPELINE.md:307 names, the route serialization is now
+tested and does not remove it. The remaining documented option is the **per-channel ring**: the service answers each
+channel on its own, with no global seq order to violate.
+
+Before building that, the cheap instrument is a **published-but-unanswered counter**: increment when a route publishes
+seq N on channel c, and when the service answers N on c. The difference at the wedge names the unanswered request
+directly, which is the fact the last three boots could only infer from silence.
