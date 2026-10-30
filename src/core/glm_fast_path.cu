@@ -4526,8 +4526,12 @@ void Glm5Model::fast_service() {
                         P.key[(size_t) s] = ids[i];
                         P.tick[(size_t) s] = F->clock;
                         F->slot_of[(size_t) key] = s;
+                        if (F->floor_locked(il)) F->floor_violations.fetch_add(1, std::memory_order_relaxed);
                         for (int j = 0; j < gf::kSpares; ++j)
-                            if (P.spare[j] == s) P.spare[j] = -1;
+                            if (P.spare[j] == s) {
+                                P.spare[j] = -1;
+                                if (F->floor_locked(il)) F->spare_steals.fetch_add(1, std::memory_order_relaxed);
+                            }
                         F->promotions.fetch_add(1, std::memory_order_relaxed);
                     }
                     // exclusive tiers: its RAM copy is released at the next boundary (the fetch reads it now)
@@ -4577,8 +4581,12 @@ void Glm5Model::fast_service() {
                     P1.key[(size_t) s] = e;
                     P1.tick[(size_t) s] = F->clock;
                     F->slot_of[(size_t) key] = s;
+                    if (F->floor_locked(il + 1)) F->floor_violations.fetch_add(1, std::memory_order_relaxed);
                     for (int j = 0; j < gf::kSpares; ++j)
-                        if (P1.spare[j] == s) P1.spare[j] = -1;
+                        if (P1.spare[j] == s) {
+                            P1.spare[j] = -1;
+                            if (F->floor_locked(il + 1)) F->spare_steals.fetch_add(1, std::memory_order_relaxed);
+                        }
                     const int rs = F->ram_of[(size_t) key];
                     if (rs >= 0 && R1.st[(size_t) rs] == FastState::kRHold) R1.st[(size_t) rs] = FastState::kRRelease;
                     F->prefetches.fetch_add(1, std::memory_order_relaxed);
