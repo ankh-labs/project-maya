@@ -937,9 +937,17 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         // experts read a scratch slot that is not memory.  No identity check can see it (the tier table is right) and
         // no fill event can fix it (nothing was late) - which is why it survived five theories and row 0 never showed it.
         m.scratch = F->rows_scr != nullptr ? F->rows_scr + 8 * R(i) : nullptr;
-        // this row's OWN handshake channel: wait_seq[i] and resp[i].  Row 0 is channel 0, exactly the lone token
+        // this row's OWN handshake channel: wait_seq[R(i)] and resp[R(i)].  Row 0 is channel 0, exactly the lone token
         // path, so n = 1 is unchanged; n > 1 gives each waiter its own word and answer buffer.
-        m.wait_ch = i & 7;
+        //
+        // RESTORED (2026-10-30): this said `R(i) & 7` at cd52717 - the tree that ran 796 clean rotor entries - and the
+        // v1.1.40 replay reverted it to `i & 7`.  Every other line in this lambda indexes by R(i) = row_base_ + i, and
+        // the rotor calls rows_layers(rw + r, 1, ...), so i is ALWAYS 0 there: row 1 has been publishing on CHANNEL 0
+        // all evening.  Both rows then answer into resp[0], the service overwrites slot 0 in seq order, and a waiter
+        // whose answer was overwritten before it read it spins to its ~60 s ceiling - the drain timeout and the
+        // NON-FINITE both.  It also explains the one number we could never square: wait_seq[1] always read 0, because
+        // nothing ever wrote channel 1.
+        m.wait_ch = R(i) & 7;
         if (pred_on) {   // per-row prefetch staging: the token path's pf buffers hold one route's stage
             m.pf_src = S->pf_src + 8 * R(i);
             m.pf_dst = S->pf_dst + 8 * R(i);

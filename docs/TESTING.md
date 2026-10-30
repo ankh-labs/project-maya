@@ -311,3 +311,40 @@ Next: **stage events** per row per layer (route -> fetch -> mixer -> FFN -> head
 names the stage. The layer sweep has already shown that a layer number alone cannot distinguish a parked wait from a
 stuck kernel, and both compute streams being `NotReady` with no host wait outstanding puts the answer in that
 distinction.
+
+## 2026-10-30 — THE MISSING HUNK: row 1 has been publishing on channel 0 all evening
+
+The differential that should have been run this morning — **`cd52717` (the tree that ran 796 clean rotor entries) against HEAD** — found it in one line:
+
+```cpp
+cd52717 :  m.wait_ch = R(i) & 7;     // row_base_ + i -> the row's OWN channel
+now     :  m.wait_ch = i & 7;        // i within THIS call
+```
+
+The rotor calls `rows_layers(rw + r, 1, ...)`, so `i` is **always 0** in that lambda: row 1 has been asserting channel 0
+for every route. Every neighbouring line in the same lambda (`m.plan_ptr + 8 * R(i)`, `m.fetch_src`, `m.cpu_part`,
+`m.scratch`, `m.cpu_seq`) still uses `R(i)`, and the comment above it says *"this row's OWN handshake channel"* - so this
+is a single reverted line, exactly the shape the v1.1.40 replay produced elsewhere (it also dropped the whole
+`q8_1_to_float` block, which `55192e5` correctly described as "port ... the merge dropped").
+
+Why it explains every symptom we chased tonight:
+
+- **`wait_seq[1]` always read 0.** Nothing ever wrote channel 1, because no route ever claimed it. We read that as "row 1
+  has nothing to wait for" and built three theories on it.
+- **Both rows answered into `resp[0]`.** The service writes slot 0 in seq order, so the later answer overwrites the one
+  an earlier waiter is still spinning for. A waiter that misses its value spins to `moe_wait`'s ~60 s ceiling.
+- **The two-window shape**: through a 20 s drain that is a "drain timeout"; through a 90 s window the waiter gives up
+  and the router sees `NON-FINITE`. One fault, two observers - as concluded, but the mechanism is this line, not the
+  protocol.
+- **Both compute streams `NotReady`, no host wait, prefetch lanes idle**: both rows were parked in `moe_wait` on the same
+  channel, one of them chasing a value that had already been overwritten.
+- **Indifferent to serial/overlap, to BF16, and absent at n = 1**: with one row, `i` and `R(i)` are both 0.
+
+The `resp_h`/`need_seq` aliasing is **also** present at `cd52717`, so that find stands, and the 796-entry soak really did
+run with a live heap overflow - fix both.
+
+### Method correction
+
+The count audit compared `15ff4f1` against the rebased tree: **both post-rebase**, so it could not see this. The audit
+that finds dropped code is against `cd52717` - the tree with evidence of working. `pub_ch`-style counts, three boots and
+log-verified arms all still stand; the *reference* was wrong.
