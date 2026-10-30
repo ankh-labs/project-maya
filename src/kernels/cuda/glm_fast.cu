@@ -3994,12 +3994,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     ROUTE_MARK(1);   // the top k
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
-            if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
-    if (a.near_n > 0 && !a.rank_sel) {
             if (s_ids[i] < 0 || s_ids[i] >= E) { atomicMax(&bad, 1); atomicMax(&bfault, 1); }
-    // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
-    // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
-    __shared__ int s_near[16];
     if (a.near_n > 0) {
         if (E <= 512) topk_warp(s_sel, E, a.near_n, s_near);
         else topk_argmax(s_sel, E, a.near_n, s_near, s_bv, s_bi);
@@ -4391,7 +4386,6 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             q->win = a.win;
             q->win_n = a.win_n;
             q->win_rows = a.win_rows;
-            q->pad_ = 0;
             q->skip_mask = s_skip;
             q->pf_n = s_npf;
             rq->layer = a.layer;
