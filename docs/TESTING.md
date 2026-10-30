@@ -431,3 +431,31 @@ others), then a bisect over the replay only if that reports nothing but upstream
 
 Withdrawn, recorded so it is not re-derived: "no build before `bf3b16f` had a working answer path" is false - the answer
 path worked; the *adjacent* pinned memory was what the aliasing trampled.
+
+## 2026-10-30 — the per-row revert family: four found, all restored, fault still present
+
+The full-width audit and its follow-up sweep of `cd52717` against `HEAD` found **four reverts of one family** - per-row
+code resolved back to its single-row form:
+
+| # | reverted | what it did |
+|---|---|---|
+| 1 | `m.wait_ch = R(i) & 7` -> `i & 7` | row 1 published on channel 0 (inert: `fast_moe_experts` sets it again) |
+| 2 | `if (R(i) > 0 && md.cpu_seq ...)` -> `i > 0` | row 1 never got its own CPU-lane `cpu_seq` / `ans` slot |
+| 3 | `h.part`/`h.counter` per-row -> shared `F->part`/`F->counter`; `h.xq` by `i` | **both rows mixed into one mHC scratch** - the non-finite residual the old comment describes |
+| 4 | mHC scratch allocated only under `rows_batch_on()` | null-plus-offset per-row pointer -> **illegal access** |
+
+All four are restored (`57c5ebe`, `e7e058a`, `fdcfdc2`). A mechanical sweep of every `R(i)`-indexed line and every
+`f32`/`take` allocation line in `cd52717` against `HEAD` now comes back **clean** - no remaining revert of this family and
+no missing allocation gate.
+
+**Three boots after the fourth restore: still 0/3** (non-finite at layer 22; two drains at layers 36 and 15; rotor entries
+12 / 4 / 34 - the highest yet on HEAD, and no more illegal accesses, so #4 was real). The fault therefore is **not** this
+family, or not only it: what remains is upstream's own work (50 commits of v1.1.40/41) interacting with the rotation.
+
+Known-good end of the bisect, established tonight: `cd52717` clean 3/3 (rotor 41-47) and `cd52717 + the resp_h
+separation` clean 3/3 - so the bisect over the replay has a verified low end, and `bf3b16f` is proven neutral.
+
+Next: bisect the replay (`cd52717..HEAD`), three boots a step. The rotor-adjacent upstream changes to look at first are
+the ones the rotor consumes: the six raw `d.resp` reads in `moe_stream_mask`/`moe_fetch_kernel`, `route_err_d`, and the
+`ev_fill`/`ev_layer` recording path - all of them reached only when the rotation runs, and all of them invisible to a
+single-row test.
