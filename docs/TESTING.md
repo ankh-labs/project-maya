@@ -254,3 +254,34 @@ symptom of it.
 
 Also in this build: the drain polls **both** streams (`cs` and `cs2`) and the failure line names which is `NotReady` -
 "row 1's stream" has been in every error line today because that was the only stream the loop looked at.
+
+### The aliasing, stated fully (2026-10-30, verified independently)
+
+At `15ff4f1` lines 970-986 the 138 KB response allocation is made, memset, and **its handle is then discarded**: `hp` is
+overwritten by the 64-byte allocation and *both* pointers are taken from it.
+
+```cpp
+F->need_seq_h = (unsigned int*) hp;          // the 64-byte buffer
+cudaHostGetDevicePointer(&dp, hp, 0);
+F->md.need_seq = (unsigned int*) dp;
+F->resp_h     = (gf::MoeResponse*) hp;       // THE SAME 64-byte buffer
+cudaHostGetDevicePointer(&dp, hp, 0);
+F->md.resp    = dp;                          // THE SAME device pointer
+```
+
+So `resp` and `need_seq` are one object on the host and on the device, `MoeResponse::seq` (its first member) *is*
+`need_seq_h[0]`, and the 138 KB block is leaked and used by nothing.
+
+Two readings from tonight are retired by that, both of them mine as much as anyone's:
+
+- `resp.seq[0] == wait_seq[0]` was **structural aliasing**, not a satisfied waiter, and not an uncleared word;
+- `resp.seq[5] = 1032389371` is byte 20 of a 64-byte buffer read as the sixth response's `seq`.
+
+And every per-channel conclusion needs re-reading: `Rp = resp_h + (rq->ch & 7)` steps ~17.3 KB per channel while the
+channel's *seq word* sits 4 bytes in, so the "per-channel answer slots" were never per-channel - they were one 64-byte
+region with every write but channel 0's landing outside it. The 112 `ch = 1` answers prove the code path ran, not that
+the slots worked.
+
+**Consequence for the record: no build before `bf3b16f` had a working answer path - including every build tonight called
+verified, and including the `cd52717` baseline whose 796 rotor entries were treated as the known-good state.** If the
+allocations separated at `bf3b16f` make `n = 2` survive, that baseline was lucky rather than correct.
