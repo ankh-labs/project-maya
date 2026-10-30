@@ -942,9 +942,12 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             // state the first fetch already updated, so the plans and the slot contents disagree (an illegal access)
         } else if (skip_empty) {
             gf::moe_wait_fetch(m, E, K, Ly.blob, s);
+            if (rows_per_row_ && F->pipe) F->pipe->transfers_done.fetch_add(1, std::memory_order_relaxed);
         } else {
             gf::moe_wait(m, E, s);
             gf::moe_fetch(m, K, Ly.blob, s);
+            // the counter is incremented where the copy is ISSUED, by the thread that issued it
+            if (rows_per_row_ && F->pipe) F->pipe->transfers_done.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (rows_pf == 2 && !empty) {   // every route is on the compute stream: the fetches follow it, on the side stream
@@ -956,6 +959,9 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             gf::moe_fetch(m, K, Ly.blob, F->ps);
         }
     }
+    // TRANSFER's marker: this layer's fills are on this stream, so the event completes when the last of them lands.
+    if (rows_per_row_ && !empty && il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr)
+        cudaEventRecord(F->ev_fill[(size_t) il], s);
     if (pred_on && !empty) {   // the claims are staged: the side stream copies them while this layer computes
         cudaEventRecord(F->ev_pf, s);
         cudaStreamWaitEvent(F->ps, F->ev_pf, 0);
@@ -1178,6 +1184,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             F->ev_layer.resize((size_t) l1_, nullptr);
             for (size_t i = had; i < F->ev_layer.size(); ++i)
                 cudaEventCreateWithFlags(&F->ev_layer[i], cudaEventDisableTiming);
+            const size_t hadf = F->ev_fill.size();
+            F->ev_fill.resize((size_t) l1_, nullptr);
+            for (size_t i = hadf; i < F->ev_fill.size(); ++i)
+                cudaEventCreateWithFlags(&F->ev_fill[i], cudaEventDisableTiming);
         }
         // Safety net only: with one deferral per row between runs the schedule cannot exceed roughly 2L, and the cap
         // turns a scheduler bug into a visible short step instead of a spin.
@@ -1206,12 +1216,24 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                         continue;
                     }
                 }
-                // THE LADDER, with real residency.  Reorder asks for another slot's layer first; the row answers by
-                // staying on the same layer for one round.  `deferred` prevents an endless Reorder (reset on a run).
+                // THE LADDER, with real residency AND real arrival.  layer_resident() only says every expert has a slot
+                // assigned; the fill may still be copying (on this row's stream or, after another row ran the layer,
+                // on the other one).  RETIRE answers that with cudaEventQuery - never a synchronise in the loop.
+                cudaStream_t srow = (serial || (r & 1) == 0) ? F->cs : F->cs2;
+                bool filling = false;
+                if (il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr) {
+                    filling = cudaEventQuery(F->ev_fill[(size_t) il]) == cudaErrorNotReady;
+                    (void) cudaGetLastError();   // NotReady is not an error to leave set
+                }
                 {
                     const bool res = F->layer_resident(il);
-                    const auto st = FastState::pipe_stage(res, /*in_flight=*/false, /*can_reorder=*/true,
+                    const auto st = FastState::pipe_stage(res, filling, /*can_reorder=*/true,
                                                           /*can_cpu=*/true, /*can_disk=*/true);
+                    if (st == FastState::kStageInFlight && F->ev_fill[(size_t) il] != nullptr) {
+                        // WAIT for the bytes rather than reorder past them: this orders only the fill against this
+                        // row's read, so the overlap the design exists for is untouched.
+                        cudaStreamWaitEvent(srow, F->ev_fill[(size_t) il], 0);
+                    }
                     if (st == FastState::kStageReorder && S->cur[r].deferred == 0) {
                         S->cur[r].deferred = 1;
                         all_done = false;
@@ -1226,7 +1248,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 floor = std::max(l0_, floor);
                 if (il > floor + F->pipe_lead) { all_done = false; continue; }   // unreachable while S >= n-1
                 row_base_ = r;
-                rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
+                rows_stream_ = srow;
                 // This layer's slots were filled by whichever row ran it first; that row's fill must have landed
                 // before this one reads them.  (Never recorded: the wait is a no-op.)
                 if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr)
