@@ -5189,6 +5189,11 @@ int mv_type_ok(int t) {
 }
 
 // a failed launch is STICKY: the forward that issued it reports an error (launch_errors) instead of computing on
+// The BF16 q8_1 pre-pass: counted, and announced ONCE with its shape.  Two candidate faults live around it and they
+// look different: the 8 MiB kMvXfScratchBytes cap (returns false loudly) and the one process-wide mv_xf_scratch()
+// (two concurrent mv() calls share one base pointer and overwrite each other's activations - a stall or garbage, not
+// an error).  Reading the arm says which.
+std::atomic<uint64_t> g_xf_prepass{0}, g_xf_floats{0};
 std::atomic<int> g_launch_errors{0};
 void launch_check(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -5465,6 +5470,31 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             need_xf += (int64_t) j.ncol * (int64_t) j.n_in;
     }
     if (need_xf > 0) {
+        g_xf_prepass.fetch_add(1, std::memory_order_relaxed);
+        g_xf_floats.fetch_add((uint64_t) need_xf, std::memory_order_relaxed);
+        {
+            static std::atomic<bool> told{false};
+            static const bool at_exit = [] {
+                std::atexit([] {
+                    std::fprintf(stderr, "glm_fast mv: BF16 q8_1 pre-pass ran %llu time(s), %llu float(s) converted\n",
+                                 (unsigned long long) g_xf_prepass.load(), (unsigned long long) g_xf_floats.load());
+                });
+                return true;
+            }();
+            (void) at_exit;
+            if (!told.exchange(true)) {
+                int64_t cap_f = (int64_t) (kMvXfScratchBytes / sizeof(float));
+                for (int i = 0; i < n; ++i) {
+                    const MvJob& j = jobs[i];
+                    if (!(j.type == kTypeBF16 && j.xf == nullptr && j.xq != nullptr && j.n_in > 0)) continue;
+                    std::fprintf(stderr, "glm_fast mv: BF16 q8_1 pre-pass FIRST ENTRY (caller=mv): n_in=%d ncol=%d "
+                                 "xq_cstride=%lld need_xf=%lld floats, cap=%lld floats (%s)\n",
+                                 j.n_in, j.ncol, (long long) j.xq_cstride, (long long) need_xf, (long long) cap_f,
+                                 need_xf > cap_f ? "OVER CAP" : "fits");
+                    break;
+                }
+            }
+        }
         float* scr = (size_t) need_xf * sizeof(float) > kMvXfScratchBytes ? nullptr : mv_xf_scratch();
         if (scr == nullptr) {   // loud on purpose: a silent fallthrough here is a wrong answer, not a slow path
             std::fprintf(stderr, "glm_fast mv: no scratch for a BF16 job's q8_1 activations (%lld floats)\n",
