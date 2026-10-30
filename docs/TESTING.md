@@ -527,3 +527,33 @@ bisectable properly; failing means it arrived with v1.1.40 or earlier and the sa
 
 Option 3 stands and is not a failure state: `cd52717` is a verified working `n=2` rotor (41-47 entries, ~24 tok/s,
 coherent output), so Aaron's disk-spill rung starts there whenever he wants, independent of the replay.
+
+## 2026-10-30 (late) — the reverse rebase: attempted, stopped at 6/42, aborted, parked
+
+Setup done as directed before moving the tree:
+
+- **rerere disabled entirely** - `rerere.enabled=false`, `rerere.autoUpdate=false`. Resolutions were recorded during the
+  *forward* v1.1.40 -> v1.1.41 replay; going backwards they are not merely unverified, they are **backwards**, and would
+  reinstate the newer side while we try to return to the older one.
+- **backup tag**: `backup-pre-onto-20261030-1826` -> `ebd2a36`. Restore: `git reset --hard backup-pre-onto-20261030-1826`.
+
+The operation itself: `git rebase --onto c18d67f 8d9979f`, which replays exactly **42 commits** (8d9979f is an ancestor of
+HEAD; the range is our replayed work plus tonight's fixes).
+
+**It stopped at 6/42**, on `56ced70` - *"rebase onto v1.1.41: repair the three hunks the union helper mangled"* - with one
+conflicted file (`src/kernels/cuda/glm_fast.cu`). That commit exists **only because of v1.1.41**: its hunks describe
+repairs to code the newer base introduced. Replaying it onto the older base is not a merge problem, it is a semantic
+one - the commit has nothing to say there. So the backwards replay needs a decision per commit about which hunks are
+version-specific, not the mechanical conflict resolution a bisect split wants.
+
+`git rebase --abort` -> HEAD back at `ebd2a36`, tree clean, no `rebase-merge` left behind.
+
+Also established: **there is no merge commit** in `c18d67f..HEAD`, so `git revert -m 1 <merge>` - the clean way to undo
+the v1.1.41 delta in place - is not available: the v1.1.41 work arrived as a linear replay.
+
+**Decision: parked.** The split costs a per-commit semantic replay over 42 commits and buys a halving we can live without
+for now. Option 3 is not a failure state: **`cd52717` is a verified working `n=2` rotor** (41-47 entries, ~24 tok/s,
+coherent output, 3/3 boots), so Aaron's disk-spill rung starts there whenever he wants it.
+
+If someone does want the split later: re-enable rerere for the forward direction, do the replay as a deliberate task with
+a decision recorded per commit, and verify each with the arm (build, three boots, rotor count) - not as a bisect step.
