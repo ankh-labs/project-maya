@@ -1296,7 +1296,36 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     // This step's schedule figures, reset by the rotor branch below and quoted by the per-step token-id line - which sits
     // OUTSIDE that branch, so these cannot be branch-local: a counter only visible in the error path is one nobody reads
     // (and the round-cap gate never fired, which is how the first two of these went unread for a whole boot).
-    int occ_defers = 0, reo_defers = 0, spread_max = 0;
+    int occ_defers = 0, reo_defers = 0, spread_max = 0;   // this step's schedule figures (the token-id line quotes them)
+    // THE CHANNEL DELTA, ON EVERY FAILURE EXIT (2026-10-30).  Drain timeout and NON-FINITE are one mechanism seen through
+    // two observation windows - a request that is never answered - so a counter that only prints on the drain face is a
+    // fail-open instrument: the boot that fails non-finite instead produces no numbers at all, which is exactly the shape
+    // the 90 s run gave us.  Rendered here once and appended by every path that returns false from a step.
+    const auto ch_delta = [&]() -> std::string {
+        std::string out;
+        for (int c = 0; c < 8; ++c) {
+            const unsigned long long pubd = (unsigned long long) F->pub_ch[c].load(std::memory_order_relaxed);
+            const unsigned long long ansd = (unsigned long long) F->ans_ch[c].load(std::memory_order_relaxed);
+            if (pubd == 0 && ansd == 0) continue;
+            out += "; ch " + std::to_string(c) + " published " + std::to_string(pubd) + " answered " +
+                   std::to_string(ansd) + (pubd == ansd ? " (level)" : " (BEHIND " + std::to_string(pubd - ansd) + ")");
+        }
+        // AND THE RING ITSELF.  pub_ch counts at LAUNCH, so "published > answered on both channels" is the shape of a seq
+        // that was handed out and never written into its slot - the service then waits for it forever and every later
+        // request queued behind it on both channels.  Reading the slot the service is parked on separates that from a
+        // service thread blocked elsewhere: an old seq in that slot is a kernel that never ran; the right seq there is a
+        // consumer that is not consuming.
+        if (F->ring_h != nullptr) {
+            const unsigned sn = F->svc_next.load(std::memory_order_relaxed);
+            out += "; service waiting for seq " + std::to_string(sn) + " (next in ring:";
+            for (int k = 0; k < 4; ++k) {
+                const gf::MoeRequest* r = F->ring_h + ((sn + (unsigned) k) % gf::kRingSize);
+                out += " " + std::to_string(k) + "=seq " + std::to_string(r->seq) + "/ch " + std::to_string(r->ch);
+            }
+            out += ")";
+        }
+        return out;
+    };
     if (pipe_mode >= 2 && n == 2 && F->cs2 != nullptr && S->aq != nullptr) {
         // ---- the rotation (docs/LAYER_PIPELINE.md, increment 4): row r runs the layer k - r while row 0 runs k, so one
         // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
@@ -1478,6 +1507,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     cudaStreamWaitEvent(rows_stream_, F->ev_layer[(size_t) il], 0);
                 if (F->pipe) F->pipe->layers_submitted.fetch_add(1, std::memory_order_relaxed);   // SUBMIT, really launched
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
+                    err += ch_delta();
                     row_base_ = 0;
                     rows_stream_ = nullptr;
                     rows_per_row_ = false;
@@ -1509,7 +1539,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (!S->cur[r].done)
                     why += "; row " + std::to_string(r) + " stopped at layer " + std::to_string(S->cur[r].il) +
                            (S->cur[r].deferred ? " mid-deferral" : " not deferring");
-            err = why;
+            err = why + ch_delta();
             gf::mv_xf_set_slot(0);
             row_base_ = 0;
             rows_stream_ = nullptr;
@@ -1676,15 +1706,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     for (int r2 = 0; r2 < n; ++r2)
                         why += "; row " + std::to_string(r2) + " at il " + std::to_string(S->cur[r2].il) + " on cs" +
                                (((serial || (r2 & 1) == 0)) ? "" : "2");
-                    // THE DELTA, per channel: which of the three unanswered-request shapes this is.
-                    for (int c2 = 0; c2 < 8; ++c2) {
-                        const unsigned long long pubd = (unsigned long long) F->pub_ch[c2].load(std::memory_order_relaxed);
-                        const unsigned long long ansd = (unsigned long long) F->ans_ch[c2].load(std::memory_order_relaxed);
-                        if (pubd != 0 || ansd != 0)
-                            why += "; ch " + std::to_string(c2) + " published " + std::to_string(pubd) + " answered " +
-                                   std::to_string(ansd) + " (" + (pubd == ansd ? "level" : "BEHIND " +
-                                   std::to_string(pubd - ansd)) + ")";
-                    }
+                    why += ch_delta();
                     err = why;
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
@@ -1728,9 +1750,12 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(S->ev_done, F->cs);
     // the step back (the service threads answer the routes' misses meanwhile)
-    if (!glmfast::wait_event(S->ev_done, "glm rows step", err) || !F->route_ok(err)) return false;
+    if (!glmfast::wait_event(S->ev_done, "glm rows step", err) || !F->route_ok(err)) {
+        err += ch_delta();   // the NON-FINITE face of the unanswered request carries the numbers too
+        return false;
+    }
     if (gf::launch_errors() > 0) {
-        err = "glm rows: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
+        err = "glm rows: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)" + ch_delta();
         return false;
     }
     const cudaError_t e = cudaGetLastError();

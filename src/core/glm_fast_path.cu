@@ -4429,6 +4429,7 @@ void Glm5Model::fast_service() {
 #endif
     while (!F->quit.load(std::memory_order_relaxed)) {
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
+        F->svc_next.store(next, std::memory_order_relaxed);   // what a wedged step quotes: the seq nobody wrote
         const unsigned int sq = rq->seq;
         // the CHANNEL's published seq, in host memory: purely host-side (the device writing host memory broke the plain
         // path), and it is the same fact the ring entry carries.  A host waiter polls this to learn what to wait for.
