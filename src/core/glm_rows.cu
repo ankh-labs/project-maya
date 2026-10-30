@@ -156,11 +156,14 @@ bool Glm5Model::rows_alloc(std::string& err) {
         for (auto& p : S->kconv) p = f32(DI);
         S->kg1 = f32(DI);
         S->kg2 = f32(DI);
-        if (rows_batch_on()) {
-            S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
-            S->hc_part = f32(S->hc_part_n);
-            S->hc_ctr = take(64);
-        }
+        // UNCONDITIONAL, as at cd52717 (2026-10-30): the residual mixing's scratch is needed by the batched path AND by a
+        // per-row call - "a per-row call used the token path's shared F->part / F->counter, which two rows then wrote at
+        // once (a non-finite residual)".  Gating it on STRATA_GLM_ROWS_BATCH (off by default) left hc_part/hc_ctr null
+        // while the pipeline asked for a per-row slice, i.e. a null-plus-offset pointer: the illegal access that came
+        // back on all three boots when only the hc_row half of this restore was applied.
+        S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
+        S->hc_part = f32(S->hc_part_n);
+        S->hc_ctr = take(64);
         if (attn) {   // (STRATA_GLM_ROWS_ATTN's buffers: none with the setting off)
             S->aq = f32((int64_t) g.n_head * g.kv_lora);
             S->actx = f32((int64_t) g.n_head * g.kv_lora);
