@@ -1307,8 +1307,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             const unsigned long long pubd = (unsigned long long) F->pub_ch[c].load(std::memory_order_relaxed);
             const unsigned long long ansd = (unsigned long long) F->ans_ch[c].load(std::memory_order_relaxed);
             if (pubd == 0 && ansd == 0) continue;
-            out += "; ch " + std::to_string(c) + " published " + std::to_string(pubd) + " answered " +
-                   std::to_string(ansd) + (pubd == ansd ? " (level)" : " (BEHIND " + std::to_string(pubd - ansd) + ")");
+            // UNITS: pubd is the HOST's hand-outs, ansd is ANSWER-WRITES.  They are different quantities and their
+            // difference is NOT a backlog - a request that needs no answer written never increments ansd, and the
+            // service's own position is `next`, which the stall line prints separately.  The old label said "BEHIND",
+            // and that word sent two people looking for a queue that does not exist: the service has been caught up in
+            // every boot measured (waiting = H + 1, i.e. parked on a seq no step ever handed out).
+            out += "; ch " + std::to_string(c) + " hand-outs " + std::to_string(pubd) + " answer-writes " +
+                   std::to_string(ansd);
         }
         // AND THE RING ITSELF.  pub_ch counts at LAUNCH, so "published > answered on both channels" is the shape of a seq
         // that was handed out and never written into its slot - the service then waits for it forever and every later

@@ -180,3 +180,10 @@ Instrument: at a stall, dump the eight `wait_seq` words against the eight `resp[
 `next`. `wait_seq[1]` holding a seq whose `resp[1].seq` already matches it means the answer landed and the clear never
 happened. The `wait_seq` read is issued on its own stream and polled for at most 2 s, because a blocking host sync is
 the deadlock the diagnostics note warns about; if it cannot complete the line says so.
+
+Unit correction on the counters above: `pub_ch` is HOST HAND-OUTS and `ans_ch` is ANSWER-WRITES. They are different
+quantities - a request that needs no answer never increments `ans_ch` - and their difference is **not** a backlog. The
+service's position is `next`, which the stall line prints separately, and in every boot measured it reads `H + 1`: the
+service consumed every hand-out and is parked on a seq no step ever handed out. The output now says "hand-outs" and
+"answer-writes" instead of "published"/"answered", because the word BEHIND sent two people looking for a queue that does
+not exist.
