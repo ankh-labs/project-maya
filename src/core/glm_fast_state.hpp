@@ -519,6 +519,11 @@ struct Glm5Model::FastState {
     // first, and read by the other row on the other stream later.  On one stream that ordering was implicit; across two
     // it needs an event, or the second row reads a slot whose fetch has not landed (a non-finite score, arithmetic).
     std::vector<cudaEvent_t> ev_layer;
+    // ONE EVENT A LAYER'S FILL: recorded where the fetch is ISSUED (TRANSFER) and polled with cudaEventQuery (RETIRE).
+    // layer_resident() answers "every expert has a slot ASSIGNED", which is not "the bytes have ARRIVED" - in the fused
+    // path the two were the same because the copy and the compute shared a stream.  This is the arrival state, and it is
+    // what makes kStageInFlight reachable at all.
+    std::vector<cudaEvent_t> ev_fill;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
