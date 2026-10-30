@@ -459,3 +459,21 @@ Next: bisect the replay (`cd52717..HEAD`), three boots a step. The rotor-adjacen
 the ones the rotor consumes: the six raw `d.resp` reads in `moe_stream_mask`/`moe_fetch_kernel`, `route_err_d`, and the
 `ev_fill`/`ev_layer` recording path - all of them reached only when the rotation runs, and all of them invisible to a
 single-row test.
+
+## 2026-10-30 (late) — both v1.1.41 rotor-adjacent features excluded by measurement
+
+After the four per-row restores (`57c5ebe`, `e7e058a`, `fdcfdc2`, `73133ca`), two flags were tested three boots each on
+this tree. Both are **new in v1.1.41** - neither exists at `cd52717`:
+
+| flag | what it controls | boots | result |
+|---|---|---|---|
+| `STRATA_GLM_STREAM_FETCH=0` | `moe_stream_mask` / `moe_stream_copy`, the `s_sm` branch in `moe_fetch_kernel` (all absent at cd52717) | 3 | **0/3** (rotor 3 / 4 / 7; one drain, one non-finite, one drain) |
+| `STRATA_GLM_ROUTE_FAST=0` | the `a.fast` pre-write that indexes the ring by `*a.d.seq + 1`, plus the reordered reads | 3 | **0/3** (rotor 2 / 21 / 52; non-finite x2 and an illegal access) |
+
+So neither upstream feature is the fault on its own. The `*a.d.seq + 1` pre-write remains suspicious *in principle* (it
+is a shared device counter where a per-row one is required - row 1 can write its 16 KB FFN input into a slot row 0
+already published), but with `ROUTE_FAST` off entirely the failure persists, so it is not sufficient either.
+
+State of the bisect: low end verified (`cd52717` clean 3/3; `cd52717 + bf3b16f` clean 3/3), high end failing, four of
+our own reverts restored, two upstream feature flags excluded by three boots each. What is left is the **replay itself**:
+the interaction of v1.1.40/41 with the rotation, three boots per step.
