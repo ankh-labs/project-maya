@@ -1206,6 +1206,11 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
         }
         ++F->step_seq;   // every arrival answer below is about THIS step
+        // ENTRY, WITH THE STEP INDEX: the log already shows which step produced a token, so this says whether the rotor
+        // was entered for the step that did NOT.  Without it, silence from the in-rotor watchdog is ambiguous between
+        // 'not entered' and 'entered and healthy' - the same fail-open shape as the event oracle.
+        std::fprintf(stderr, "glm pipe: CUDA%d step %u: rotor entered (n=%d, layers %d..%d)\n", dev_, F->step_seq, n,
+                     l0_, l1_);
         gf::nonfinite_reset();
         cudaEventRecord(F->ev_hop, F->cs);
         cudaStreamWaitEvent(F->cs2, F->ev_hop, 0);
