@@ -1310,7 +1310,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // turns a scheduler bug into a visible short step instead of a spin.
         const int round_cap = 4 * L + 64;
         bool all_done = false;
-        for (int k = 0; k < round_cap && !all_done; ++k) {
+        int k = 0;                 // hoisted: the gate below quotes how far the schedule got
+        int occ_defers = 0;        // this step's deferrals BY CAUSE - the two numbers that decide the diagnosis
+        int reo_defers = 0;
+        for (; k < round_cap && !all_done; ++k) {
             all_done = true;
             for (int r = 0; r < n; ++r) {
                 if (S->cur[r].done) continue;
@@ -1330,6 +1333,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     if (occupied) {
                         if (F->pipe) F->pipe->layer_busy.fetch_add(1, std::memory_order_relaxed);
                         all_done = false;
+                        ++occ_defers;
                         continue;
                     }
                 }
@@ -1357,6 +1361,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     if (st == FastState::kStageReorder && S->cur[r].deferred == 0) {
                         S->cur[r].deferred = 1;
                         all_done = false;
+                        ++reo_defers;
                         continue;   // same layer next round, not a skipped layer
                     }
                     S->cur[r].deferred = 0;
@@ -1389,6 +1394,31 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (S->cur[r].il >= l1_) S->cur[r].done = true;
                 else all_done = false;
             }
+        }
+        // FAIL CLOSED (2026-10-30).  The cap exists to turn a scheduler bug into a VISIBLE short step instead of a spin,
+        // and it did not: all_done was never tested after the loop, so a step in which the cap ran out walked straight on
+        // to rows_head with rows that had never finished their stack.  The only symptom was the 20 s drain wait on a
+        // kernel still running (measured: four clean steps, then a wedge on the fifth - submitted 446 of an expected 450).
+        // A gate that fails open is sampled by exactly the case it was meant to catch.  The message names the state that
+        // decides the diagnosis rather than guessing at it: how far each stuck row got, whether it was mid-deferral, and
+        // how this step's deferrals split between the two mechanisms that can produce one.
+        if (!all_done) {
+            std::string why = "glm rows: the rotation exhausted its rounds (" + std::to_string(k) + " of " +
+                              std::to_string(round_cap) + ") with rows unfinished - a scheduler bug, reported instead of "
+                              "spun on; deferrals this step: " + std::to_string(occ_defers) +
+                              " two-rows-on-a-layer, " + std::to_string(reo_defers) + " reorder";
+            if (F->pipe) why += ", layer_busy " + std::to_string(F->pipe->layer_busy.load(std::memory_order_relaxed));
+            for (int r = 0; r < n; ++r)
+                if (!S->cur[r].done)
+                    why += "; row " + std::to_string(r) + " stopped at layer " + std::to_string(S->cur[r].il) +
+                           (S->cur[r].deferred ? " mid-deferral" : " not deferring");
+            err = why;
+            gf::mv_xf_set_slot(0);
+            row_base_ = 0;
+            rows_stream_ = nullptr;
+            rows_per_row_ = false;
+            F->pipe_active.store(false, std::memory_order_release);
+            return false;
         }
         {
             static const bool misslog = getenv("STRATA_GLM_MISS_LOG") != nullptr;
