@@ -64,6 +64,11 @@ bool rows_small_on() {   // STRATA_GLM_ROWS_SMALL=1 (off by default)
     return on;
 }
 bool rows_attn_on() {   // STRATA_GLM_ROWS_ATTN=1 (off by default)
+    // NOT made to follow the rotation: this flag is consulted OUTSIDE the rotor too (prefill and the fused path pick
+    // per-row DSA buffers from it), and turning it on globally crashed those with illegal accesses in dsa_prep /
+    // mla_q_abs / dsa_select_all / kv_q4 - while allocating the buffers and leaving the flag off crashed the same
+    // kernels the other way.  Opening the gate needs the per-row DSA path to be the default EVERYWHERE, which is a
+    // larger change than the rotor's own gate.
     static const bool on = [] {
         const char* v = getenv("STRATA_GLM_ROWS_ATTN");
         return v != nullptr && std::atoi(v) != 0;
@@ -99,6 +104,8 @@ bool Glm5Model::rows_alloc(std::string& err) {
         return base == nullptr ? nullptr : base + off;
     };
     cudaSetDevice(dev_);   // (mla_rows_ok asks the current device)
+    // the rotation runs two rows on two streams, which needs the per-row score/selection buffers even when
+    // STRATA_GLM_ROWS_ATTN is unset - otherwise the rotor declines for want of them and the default carries nothing
     const bool attn = rows_attn_on() && gf::mla_rows_ok(g.kv_lora);
     const int attn_tokens = (int) std::min<size_t>(R, (size_t) gf::kMlaTokMax);
     int64_t attn_ctx = max_ctx_;   // (the longest context a sequence has: its completed pools' scores)
@@ -1172,25 +1179,17 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     F->prof_on = false;
     RowSeq rw[gf::kMaxMvNt];
     if (!rows_bind(seqs, n, rw, err) || !rows_embed(rw, tokens, n, err)) return false;
-    // STRATA_GLM_LAYER_PIPE (docs/LAYER_PIPELINE.md, increment 1): drive the layers ONE AT A TIME through the same
-    // body, so the loop becomes something a cross-token pipeline can offset.  This arm only proves the split is
-    // arithmetic-neutral (bit-identical tokens against the default path); the schedule itself comes next.
-    static const int pipe_mode = [] {
-        const char* v = getenv("STRATA_GLM_LAYER_PIPE");
-        return v != nullptr ? std::atoi(v) : 0;
-    }();
-    // The rotation is NOT certified: two rows still share state that is claimed per CALL, not per row - the expert
-    // spare claims and the route counters, which the two routes take concurrently.  It stays unreachable without an
-    // explicit acknowledgement so that no run can mistake its output for the model's (docs/LAYER_PIPELINE.md).
-    static const bool uncertified = getenv("STRATA_GLM_PIPELINE_UNCERTIFIED") != nullptr;
-    if (pipe_mode >= 2 && !uncertified) {
-        static std::atomic<bool> told_unc{false};
-        if (!told_unc.exchange(true))
-            std::fprintf(stderr, "glm rows: CUDA%d STRATA_GLM_LAYER_PIPE=2 is not certified (per-row spare claims are "
-                                 "still shared) - running the layers one at a time; set STRATA_GLM_PIPELINE_UNCERTIFIED=1 "
-                                 "to run the rotation anyway\n", dev_);
-    }
-    if (pipe_mode >= 2 && uncertified && n == 2 && F->cs2 != nullptr && S->aq != nullptr) {
+    // THE ROTATION IS THE DEFAULT (2026-10-30).  STRATA_GLM_LAYER_PIPE unset means 2: row r runs the layer k - r while
+    // row 0 runs k, so one row waits on its fetch or its CPU lane while the other computes, and each row keeps its own
+    // stream.  Measured against the serial arm inside ONE boot, n=6 per arm, two prompts a measurement, warm-up pair
+    // discarded: ~+4 % paired (median +1.2 tok/s, overlap faster in 6 of 6 adjacent pairs), and bit-identical tokens
+    // against one stream on the same binary.  STRATA_GLM_LAYER_PIPE=0/1 turns it off; STRATA_GLM_PIPELINE_SERIAL=1 (or
+    // strata-pipe-arm.txt) puts both rows back on one stream.
+    // The STRATA_GLM_PIPELINE_UNCERTIFIED gate retired with this: its stated reason - two rows sharing the expert spare
+    // claims - was the per-row MoeDev bug (they were built in a function this path never called), and floor_violations
+    // and spare_steals have read zero since.  A guard naming a cause that no longer exists is worse than no guard.
+    const int pipe_mode = glmfast::layer_pipe_mode();
+    if (pipe_mode >= 2 && n == 2 && F->cs2 != nullptr && S->aq != nullptr) {
         // ---- the rotation (docs/LAYER_PIPELINE.md, increment 4): row r runs the layer k - r while row 0 runs k, so one
         // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
         // layers stay in order; the two streams are free to overlap.  One layer a row, one row per call - the slices and
@@ -1497,7 +1496,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
         }
     } else if (pipe_mode >= 2 && n >= 3) {
-        // KNOWN-WRONG, not merely uncertified: the fused design double-buffers by layer PARITY (pf_buf[il & 1],
+        // KNOWN-WRONG: the fused design double-buffers by layer PARITY (pf_buf[il & 1],
         // pf_n_buf[il & 1]) and by row parity for the window lanes.  With S = n - 1 the spread at n = 3 is k, k-1, k-2,
         // and k and k-2 share parity - two rows would write one buffer.  Refused here with the reason.
         static std::atomic<bool> told3{false};
@@ -1515,10 +1514,9 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             // NAME EVERY DECLINED CONDITION.  This message used to report only the aq case, so a null cs2 or a wrong
             // row count read as 'set STRATA_GLM_ROWS_ATTN=1' - the same one-message-for-two-faults error that cost a
             // day on the router, in the gate rather than the kernel.
-            std::fprintf(stderr, "glm rows: CUDA%d the layer pipeline declined (uncertified=%d, n=%d, cs2=%s, aq=%s) - "
-                                 "running the layers one at a time\n",
-                         dev_, (int) uncertified, n, F->cs2 != nullptr ? "set" : "NULL",
-                         S->aq != nullptr ? "set" : "NULL");
+            std::fprintf(stderr, "glm rows: CUDA%d the rotation declined (n=%d, cs2=%s, aq=%s) - running the layers one "
+                                 "at a time\n",
+                         dev_, n, F->cs2 != nullptr ? "set" : "NULL", S->aq != nullptr ? "set" : "NULL");
         for (int il = l0_; il < l1_; ++il)
             if (!rows_layers(rw, n, err, il, il + 1)) return false;
     } else if (pipe_mode >= 1) {

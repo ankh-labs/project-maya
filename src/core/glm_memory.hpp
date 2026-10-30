@@ -44,6 +44,16 @@ inline bool group_experts_on() {
     }();
     return on;
 }
+// The de-fused rotation is the DEFAULT: STRATA_GLM_LAYER_PIPE unset means 2, and 0/1 turns it off.  Measured against
+// the serial arm in one boot, n=6, two prompts a measurement: ~+4 % paired (median +1.2 tok/s, overlap faster in 6 of 6).
+inline int layer_pipe_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_GLM_LAYER_PIPE");
+        return v != nullptr ? std::atoi(v) : 2;
+    }();
+    return m;
+}
+inline bool pipe_rotation_on() { return layer_pipe_mode() >= 2; }
 // STRATA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
 inline bool skip_empty_on() {
     static const bool on = [] {
