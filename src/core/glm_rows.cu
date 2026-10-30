@@ -953,7 +953,12 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             m.pf_dst = S->pf_dst + 8 * R(i);
             m.pf_n = S->pf_n + i;
         }
-        if (i > 0 && md.cpu_seq != nullptr) {
+        // RESTORED (2026-10-30): the guard said `R(i) > 0` at cd52717 (the tree that passes 3/3), and the body it
+        // guards still indexes by R(i) - the same revert as wait_ch, in the same lambda, found by the full-width audit
+        // rather than by the marker list.  With `i > 0` and a per-row call (i always 0), row 1 never took this branch:
+        // its CPU-lane answers were addressed to the TOKEN PATH's shared cpu_seq / ans slot instead of its own, so a
+        // route whose experts the CPU lane computed could spin waiting for a word the host was writing elsewhere.
+        if (R(i) > 0 && md.cpu_seq != nullptr) {
             m.cpu_seq = W.cpu_seq_w + 16 * R(i);
             m.cpu_ans = W.ans_d[R(i)];
         }
