@@ -98,3 +98,32 @@ Changes:
   message now quotes. Today that would have found this in the first boot instead of the fifteenth.
 - **Backpressure demoted to a documented option, not built.** Throttling the producer to fit a 64-slot ring would trade
   away the latency the rotor exists for, to work around a constant.
+
+## 2026-10-30 — raising kRingSize moved the failure, it did not remove it
+
+Three boots at 512 tokens with `kRingSize` 64 -> 256 and the lap guard in:
+
+| boot | tokens | rotor | face | lap line |
+|---|---|---|---|---|
+| 1 | -1 + -1 | 3 | non-finite | `waits for seq 257, slot holds 1 (256 slots)` |
+| 2 | -1 + -1 | 10 | drain | same |
+| 3 | -1 + -1 | 14 | drain | same |
+
+`257 - 1 = 256 = kRingSize`, exactly as `2773 - 2709 = 64` was with the old value. **The lag is always one full
+ring**, whatever the ring's size. So `kRingSize` was not the cause and the arithmetic argument that justified raising it
+("at most 90 in flight") was wrong: the host enqueues a step's launches asynchronously and can run several steps ahead
+of the service, so in-flight publications are **not** bounded by `n_rows x layers`.
+
+What the constant did buy: the failure point moved from -64 to -256 and the shape stayed identical, which is what proved
+the producer is unbounded. That is a clean falsification of "raise the constant", by measurement, in three boots.
+
+What is now established:
+
+- the producer's lead over the service is unbounded from the ring's side (it grows until it laps);
+- a lap is permanent because a lapped service polls a slot that cannot hold its seq again;
+- the **guard is the win**: boot 1 failed in 3.1 s instead of 50.9 s, with one line naming the seq and the slot.
+
+**Therefore backpressure is required, not optional** - and the earlier ranking (demote it, it costs latency) was based on
+the same wrong assumption about in-flight size. The form that does not cost pipeline latency: before the rotor hands out
+a seq, require the service to be within a window - `F->seq_h - F->processed < kRingSize / 2` - yielding only while that
+window is closed. When the service keeps up it never binds; when it falls behind it stops the producer instead of lapping.
