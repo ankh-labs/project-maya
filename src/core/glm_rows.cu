@@ -360,7 +360,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     const bool kda_batch = batch && !dup && g.kda_head_dim == 128;
     // a pipeline call runs ONE row, so `batch` is false for it, but it still needs per-row buffers rather than the token
     // path's single set (docs/LAYER_PIPELINE.md)
-    const bool per_row_bufs = batch || row_base_ > 0;
+    const bool per_row_bufs = batch || rows_per_row_;
     gf::HcArgs hb[gf::kMaxMvNt];
     for (int il = ilf; il < ilt; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -590,7 +590,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora, nsm = g.n_sel_max();
     // n > 1 OR a per-row call (row_base_): a pipeline row runs alone, so n == 1, and without this it took the token
     // path's shared score / cells buffers instead of its own
-    bool attn = rows_attn_on() && (n > 1 || row_base_ > 0) && S->apart != nullptr && g.v_head % 32 == 0 &&
+    bool attn = rows_attn_on() && (n > 1 || rows_per_row_) && S->apart != nullptr && g.v_head % 32 == 0 &&
                 gf::mla_rows_ok(g.kv_lora);
     int run0[gf::kMaxMvNt];   // the first row of each row's run of consecutive rows of its conversation
     for (int i = 0; i < n; ++i) {
@@ -921,7 +921,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         const gf::MoeDev m = row_dev(i);
         const MoeIo io = {row_at(S->x, E, R(i)), rowq_at(S->xq, E, R(i)), row_at(S->rlog, g.n_expert, R(i)),
                           row_at(S->sh_g, FFs, R(i)), row_at(S->sh_u, FFs, R(i)), row_at(S->ffn, E, R(i))};
-        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) R(i) * W.sh_hq_s, pred_on, 0, no_bias, lane, i, n, 1,
+        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) R(i) * W.sh_hq_s, pred_on, 0, no_bias, lane,
+                       rows_per_row_ ? R(i) : i, rows_per_row_ ? 0 : n, rows_per_row_ ? 0 : 1,
                        row_at(S->plog, g.n_expert, R(i)), pred_pf);
         ++F->expected;
         if (rows_route_log_on() && l0_ == 0 && i < 2) rows_route_log_capture(s, W.mplan_id + 8 * R(i), K);
@@ -1146,6 +1147,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
         const uint64_t expected0 = F->expected;
+        rows_per_row_ = true;   // every layer below is ONE row of the pipeline
         if (F->pipe) F->pipe->watch_active.store(1, std::memory_order_release);   // arm the independent watchdog
         F->pipe_active.store(true, std::memory_order_release);   // from here the boundary's eviction rule applies
         // The rotor's skew IS the lead: row r runs layer k - r, so the spread is exactly n - 1.  S must be at least that
@@ -1186,6 +1188,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
                     row_base_ = 0;
                     rows_stream_ = nullptr;
+                    rows_per_row_ = false;
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
@@ -1193,10 +1196,12 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         }
         row_base_ = 0;
         rows_stream_ = nullptr;
+        rows_per_row_ = false;
         if (F->pipe) {
             // TRANSFER: every launched layer that had experts to move has had its fetch issued by rows_layers (the
             // device-side moe_wait_fetch on the slot's stream); this attributes it.  RETIRE: one per row per step.
-            F->pipe->transfers_done.fetch_add(F->expected - expected0, std::memory_order_relaxed);
+            // transfers_done is NOT credited here: rows_layers issues the fetch on the compute stream, which is the
+            // fused path's work.  A counter nothing increments is honest; one that borrows another path is not.
             F->pipe->tokens_retired.fetch_add((uint64_t) n, std::memory_order_relaxed);
             F->pipe->watch_active.store(0, std::memory_order_release);
         }
