@@ -55,8 +55,10 @@ struct Glm5Model::RowsState {
         int lead = 0;       // layers ahead of the slowest row (the pipeline depth it is using)
         bool done = false;  // past l1_: nothing left for this token
         int phase = kEmpty; // SlotPhase: the owner writes it, everyone else reads it between launches
-        int defer_il = -1;  // a layer the ladder deferred this round (Reorder): run it next round, in order
-        int deferred = 0;   // times this slot deferred rather than run (a real decision, counted)
+        // A layer the ladder answers Reorder for is NOT postponed by rewriting a round index: the row simply does not
+        // advance `il` this round, and runs the same layer on the next one.  `deferred` is therefore "this row has
+        // already used its one deferral since its last real run" and is cleared whenever a layer runs - not a fuse.
+        int deferred = 0;
     };
     RowCursor cur[8];
     int* pf_n = nullptr;
