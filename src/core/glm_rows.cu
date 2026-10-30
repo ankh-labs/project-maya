@@ -504,7 +504,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
 
         if (rows_per_row_)   // stage 1: the mixer's output (attention done, FFN not yet)
             gf::nonfinite_probe(rows(S->mixer, E, R(0)), (int) E, (il << 8) | (1 << 4) | rb, s);
-        if (rows_per_row_) gf::pipe_probe(rows(S->mixer, E, R(0)), (int) E, il * 4 + 1, s);
+        if (rows_per_row_) gf::pipe_probe(rows(S->mixer, E, R(0)), (int) E, rb * 2048 + il * 4 + 1, s);
         if (!Ly.moe) {
             gf::MvJob j[2];
             j[0] = {Ly.ffn_gate.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->dg, g.n_ff_dense, rb), nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
@@ -521,7 +521,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         }
         if (rows_per_row_)   // stage 2: this layer's FFN output (still pre-residual)
             gf::nonfinite_probe(rows(S->ffn, E, R(0)), (int) E, (il << 8) | (2 << 4) | rb, s);
-        if (rows_per_row_) gf::pipe_probe(rows(S->ffn, E, R(0)), (int) E, il * 4 + 2, s);
+        if (rows_per_row_) gf::pipe_probe(rows(S->ffn, E, R(0)), (int) E, rb * 2048 + il * 4 + 2, s);
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     for (int i = 0; i < n; ++i) {
@@ -816,8 +816,8 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     // Inside the FFN block: the router's logits and the shared expert's gate/up, so a divergence here separates a
     // routing/input fault from the shared path and from the routed experts (which the post-FFN stage covers).
     if (rows_per_row_) {
-        gf::pipe_probe(rows(S->rlog, g.n_expert, rb), g.n_expert, 1024 + il * 4 + 1, s);
-        gf::pipe_probe(rows(S->sh_u, FFs, rb), (int) FFs, 1024 + il * 4 + 2, s);
+        gf::pipe_probe(rows(S->rlog, g.n_expert, rb), g.n_expert, rb * 2048 + 1024 + il * 4 + 1, s);
+        gf::pipe_probe(rows(S->sh_u, FFs, rb), (int) FFs, rb * 2048 + 1024 + il * 4 + 2, s);
     }
     // its own error string: `err` is the scheduler's, and a cancelled or failed prompt leaves its text there
     // until the next prompt - read here, it failed every running request (with the setting off too)
