@@ -1407,8 +1407,31 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         }
         F->pipe_active.store(false, std::memory_order_release);   // the step's layers are done: the fused rule resumes
         F->pipe_floor.store(-1, std::memory_order_release);
-        // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
-        cudaStreamSynchronize(F->cs2);
+        // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states.
+        // BOUNDED: this used to be a bare cudaStreamSynchronize, i.e. an unbounded host wait between the last layer and
+        // rows_head - a kernel still spinning at the end of the step blocked it forever and said nothing, which is why
+        // step 2 never entered the rotor and no detector fired.
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (;;) {
+                const cudaError_t q = cudaStreamQuery(F->cs2);
+                if (q == cudaSuccess) break;
+                if (q != cudaErrorNotReady) {
+                    (void) cudaGetLastError();
+                    err = std::string("glm rows: row lane: ") + cudaGetErrorString(q);
+                    F->pipe_active.store(false, std::memory_order_release);
+                    return false;
+                }
+                (void) cudaGetLastError();
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                    err = "glm rows: the row lane did not drain within 20 s after the last layer - a kernel from this "
+                          "step is still running";
+                    F->pipe_active.store(false, std::memory_order_release);
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
     } else if (pipe_mode >= 2 && n >= 3) {
         // KNOWN-WRONG, not merely uncertified: the fused design double-buffers by layer PARITY (pf_buf[il & 1],
         // pf_n_buf[il & 1]) and by row parity for the window lanes.  With S = n - 1 the spread at n = 3 is k, k-1, k-2,

@@ -5060,30 +5060,49 @@ void Glm5Model::fast_ahead_reader() {
 bool Glm5Model::fast_boundary(std::string& err) {
     FastState* F = fast_;
     if (F == nullptr || F->lp.empty() || F->rc.empty()) return true;
-    // Also catches an asynchronous failure before waiting for routes that may never have been published.
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
-        return false;
-    // ...and the row lane.  The de-fused rotor (glm_rows.cu) puts row 1 on F->cs2 while `expected` counts BOTH rows'
-    // routes into one counter, so syncing only F->cs left the barrier spinning on routes whose publishing work it had
-    // never waited for: an unsatisfiable precondition, and with no deadline it presented as every thread waiting.
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs2), "glm boundary compute (row lane)", err) || !F->route_ok(err))
-        return false;
     const Glm5Geometry& g = g_;
+    // ORDER MATTERS: the route check runs BEFORE any wait on the device.  If the previous step left routes unconsumed,
+    // an unbounded cudaStreamSynchronize below swallows the hang and the deadline that names it is never reached -
+    // a bound on the wrong side of an unbounded wait is not a bound.
     {
-        // Bounded: a barrier whose counter can never be reached must say so, not hang.  (The fused path is one row at a
-        // time and this never trips; the de-fused arms are the ones that can.)
         const auto t0 = std::chrono::steady_clock::now();
         uint64_t seen = F->processed.load(std::memory_order_acquire);
         while (seen < F->expected) {
             if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
-                err = "glm boundary: the service did not consume " + std::to_string(F->expected - seen) +
-                      " of " + std::to_string(F->expected) + " route(s) within 20 s";
+                err = "glm boundary: the service did not consume " + std::to_string(F->expected - seen) + " of " +
+                      std::to_string(F->expected) + " route(s) within 20 s";
                 return false;
             }
             cpu_relax();
             seen = F->processed.load(std::memory_order_acquire);
         }
     }
+    // ... and the drain itself is bounded: an unbounded host wait is a gate that fails open, and this one is the first
+    // statement of every step - a kernel still spinning from the step before blocks it forever and says nothing.
+    {
+        cudaStream_t ss[2] = {F->cs, F->cs2};
+        const char* names[2] = {"compute", "row lane"};
+        for (int k = 0; k < 2; ++k) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (;;) {
+                const cudaError_t q = cudaStreamQuery(ss[k]);
+                if (q == cudaSuccess) break;
+                if (q != cudaErrorNotReady) {
+                    (void) cudaGetLastError();
+                    err = std::string("glm boundary ") + names[k] + ": " + cudaGetErrorString(q);
+                    return false;
+                }
+                (void) cudaGetLastError();
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                    err = std::string("glm boundary ") + names[k] +
+                          " stream did not drain within 20 s - a kernel from the previous step is still running";
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+    if (!F->route_ok(err)) return false;
     std::lock_guard<std::mutex> lk(F->mu);
     int nu = 0;
     bool ok = true;
