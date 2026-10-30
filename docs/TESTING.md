@@ -18,7 +18,7 @@ kv=fp16, slots=4064, kv_gb=1.26, vram_hit=0.672.
 SUMMARY: **7/7 passes**, mean 6.35 tok/s (range 0.07–16.65). JSON: `battery-v1141.json`.
 
 **This is a gate result, not a throughput measurement.** No paired v1.1.40 run of the same battery in the same boot
-exists, and a mean over cases that are prefill-dominated is not comparable to a decode figure (Oct 27 production:
+exists, and a mean over cases that are prefill-dominated is not comparable to a decode figure (the Oct 27 deployed build:
 23.8 tok/s). v1.1.41 throughput: **unmeasured**.
 
 ## 2026-10-30 — the de-fused rotation: correct, but short-lived
