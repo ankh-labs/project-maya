@@ -379,8 +379,12 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.hc_eps = g.hc_eps;
         h.iters = g.sinkhorn_iters;
         h.n_embd = E;
-        h.part = F->part;
-        h.counter = F->counter;
+        // RESTORED (2026-10-30): cd52717 had `per_row_bufs ? nullptr : F->part` / `... F->counter`, and the comment it
+        // carried says exactly why - "the token path's shared F->part / F->counter, which two rows then wrote at once (a
+        // non-finite residual)".  With the unconditional assignment every rotor row mixed its residual into ONE scratch:
+        // the arithmetic scrambles, and the router reports a non-finite score at whichever layer loses the race.
+        h.part = per_row_bufs ? nullptr : F->part;        // (per row: set in hc_row)
+        h.counter = per_row_bufs ? nullptr : F->counter;
         const auto hc_row = [&](int i, const float* block_out) {
             h.block_out = block_out;
             h.R_old = rw[i].Rc;
@@ -391,7 +395,13 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             h.post = rows(S->post, 8, R(i));
             h.comb = rows(S->comb, 16, R(i));
             h.x = rows(S->x, E, R(i));
-            h.xq = rows_q(S->xq, E, i);
+            h.xq = rows_q(S->xq, E, R(i));   // RESTORED: `i` is always 0 for a per-row call (row 1 read row 0's xq)
+            if (per_row_bufs) {
+                // ...and the per-row scratch must be set BEFORE the non-batch path uses it: at cd52717 this block sat
+                // above the `if (!batch)` below, so a rotor row got its own part/counter; at HEAD only the batch copy did.
+                h.part = rows(S->hc_part, S->hc_part_n, R(i));
+                h.counter = (unsigned int*) (S->hc_ctr + (size_t) R(i) * 64);   // (take(64): 64 bytes a row)
+            }
             if (!batch) {
                 gf::hc(h, s);
                 return;
