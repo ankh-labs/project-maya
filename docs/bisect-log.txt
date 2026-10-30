@@ -1,0 +1,27 @@
+git bisect start
+# status: waiting for both 'good' and 'bad' commits
+# bad: [6f3d76e9ca6ae67b7aab9726bc86db0774480e50] docs: STREAM_FETCH=0 and ROUTE_FAST=0 both 0/3 on the restored tree - neither upstream feature is the fault alone
+git bisect bad 6f3d76e9ca6ae67b7aab9726bc86db0774480e50
+# status: waiting for 'good' commit(s), 'bad' commit known
+# good: [cd52717629fe225715ebbf81758f84df4e26c270] docs: the rotation is on by default and survives a concurrent-load soak (3 pairs, 512 tokens each, 0 stalls)
+git bisect good cd52717629fe225715ebbf81758f84df4e26c270
+# good: [e16dec85abf8801a4cfc086ee4814071a3ff54a2] v1.1.35
+git bisect good e16dec85abf8801a4cfc086ee4814071a3ff54a2
+# good: [b1724708c3be9165c7e9acf19688abf8f10de4c9] ds4 DSpark: the drafter's head, markov steps and confidences only for the rows the round's cut can keep - the same drafts (DS4_DSPARK_LAZY, on; 0: every row) (#622)
+git bisect good b1724708c3be9165c7e9acf19688abf8f10de4c9
+# good: [828da49817a682b6558d4afb7af65ca67e833562] probe: per-row slots - the ambiguity is gone, and it is row 1's routed experts at layer 6
+git bisect good 828da49817a682b6558d4afb7af65ca67e833562
+# good: [7eb9c828bcf815d8e2345cc4816a8781e5c4a6f7] docs: scope lines both ways - Maya docs are the truth here, llama.cpp is the other engine and not current
+git bisect good 7eb9c828bcf815d8e2345cc4816a8781e5c4a6f7
+# good: [caa53d815fb43886345b6b4b56e9bdf4228fe5c0] rows: the producer/consumer framing is dead - pub_ch counts host hand-outs; dump the wait words instead
+git bisect good caa53d815fb43886345b6b4b56e9bdf4228fe5c0
+# good: [aa63051926593a7abc4fe5962337b4397baa38b1] docs: last production -> deployed build in TESTING.md
+git bisect good aa63051926593a7abc4fe5962337b4397baa38b1
+# good: [83b30c41f0968f29cfdeb8c9ae0f52ca69b10b6c] docs: the resp_h separation is neutral on the passing tree - clean 3/3, so bf3b16f stays and the regression is in the replay
+git bisect good 83b30c41f0968f29cfdeb8c9ae0f52ca69b10b6c
+# good: [e7e058a37ab088f5fdbfec0a2210a7726c0bee72] rows: restore the per-row mHC scratch (part, counter, xq) - both rows mixed into one buffer
+git bisect good e7e058a37ab088f5fdbfec0a2210a7726c0bee72
+# good: [73133caa12a329a783a53ad4a85e54bbd2874129] docs: four reverts of the per-row family found and restored; the sweep is clean and the fault remains
+git bisect good 73133caa12a329a783a53ad4a85e54bbd2874129
+# first 'bad' commit: [6f3d76e9ca6ae67b7aab9726bc86db0774480e50] docs: STREAM_FETCH=0 and ROUTE_FAST=0 both 0/3 on the restored tree - neither upstream feature is the fault alone
+exit=0

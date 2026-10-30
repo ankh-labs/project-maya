@@ -477,3 +477,53 @@ already published), but with `ROUTE_FAST` off entirely the failure persists, so 
 State of the bisect: low end verified (`cd52717` clean 3/3; `cd52717 + bf3b16f` clean 3/3), high end failing, four of
 our own reverts restored, two upstream feature flags excluded by three boots each. What is left is the **replay itself**:
 the interaction of v1.1.40/41 with the rotation, three boots per step.
+
+## 2026-10-30 (late) — git bisect returned a false result, and the shared-state filter came back clean
+
+### The bisect that answered nothing
+
+`git bisect start HEAD cd52717` finished with exit=0 and "bisect found first bad commit" = **the endpoint itself**, with
+`0` step-log lines: the test never ran.
+
+```
+git merge-base --is-ancestor cd52717 HEAD   -> false
+cd52717 reachable only via: backup/feat/rows-de-fused-pf-20261030-0835, tag backup-pre-20261030-0835
+```
+
+The rebase **rewrote the lineage**, so the tree with evidence of working is off-lineage and the range was empty. **Before
+any bisect on a rebased branch, check `git merge-base --is-ancestor <good> <bad>`** - otherwise the tool reports the
+endpoint as the answer and looks successful. The harness is otherwise sound and stays: skip (125) on unbuildable, skip
+(125) when the rotor never engaged, good (0) only on 3/3 clean, with the range, first-bad line and restored tip written to
+`docs/bisect-log.txt`.
+
+Also not usable: `c18d67f` (v1.1.40 base) is **not** an ancestor of `8d9979f` (v1.1.41 base) either - they are siblings.
+A *tree diff* between them is still valid and is what the shared-state scan used.
+
+### Step 1: the shared-state filter across the upstream delta
+
+Searched both `c18d67f..8d9979f` (v1.1.40 -> v1.1.41, 2,892 added lines) and `cd52717..HEAD` (18,143 added lines) for
+added lines touching state the rotor shares - ring indices, device counters, `__shared__`, single events, answer slots,
+scratch bases, parity buffers.
+
+**38 matches in the v1.1.41 delta, 83 in the full delta, and exactly one is on the rotor's path:**
+
+```
+MoeRequest* rq0 = (MoeRequest*) a.d.ring + ((*a.d.seq + 1) % kRingSize);   // ROUTE_FAST pre-write
+```
+
+Everything else is unrelated kernels (`exl3`, `ds4`, `prefill`), per-block `__shared__` declarations, or our own
+instrumentation. `ROUTE_FAST=0` was already 0/3, so this line is suspicious in principle and insufficient on its own.
+
+**Conclusion:** the fault is not a single upstream line of that shape either. With four of our reverts restored, the
+family swept clean, and two upstream feature flags excluded by three boots each, what remains is the *interaction* of
+v1.1.40/41 with the rotation - which needs the branch rebased onto the older base to split v1.1.41 off:
+
+```
+git rebase --onto c18d67f 8d9979f        # replay our commits onto v1.1.40's base, then: build, 3 boots
+```
+
+One build and three boots. Clean there means the fault arrived with v1.1.41 and that range **is** in lineage and
+bisectable properly; failing means it arrived with v1.1.40 or earlier and the same move repeats onto that base.
+
+Option 3 stands and is not a failure state: `cd52717` is a verified working `n=2` rotor (41-47 entries, ~24 tok/s,
+coherent output), so Aaron's disk-spill rung starts there whenever he wants, independent of the replay.
