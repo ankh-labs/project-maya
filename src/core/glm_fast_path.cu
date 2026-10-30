@@ -5295,6 +5295,12 @@ bool Glm5Model::fast_boundary(std::string& err) {
             // so taking one there is the "advanced slot evicts what a lagging slot needs" hazard, and this is the line
             // that makes it unreachable rather than merely unlikely.  pipe_floor is -1 when no pipeline runs, so the
             // fused path is unaffected.
+            // INERT BY CONSTRUCTION (verified 2026-10-30): every fast_boundary call site is outside the rotor, and the
+            // rotor arms pipe_active only after its own fast_boundary returns - so pipe_on is always false here and
+            // this guard has never skipped a layer.  It is kept because the invariant it describes is real, but the
+            // invariant is currently enforced by SCHEDULING (the boundary cannot run while rows are in flight), not by
+            // this line.  If fast_boundary is ever callable mid-step, this becomes live - and the counter to re-check
+            // that is floor_violations, not an assumption.
             const bool pipe_on = F->pipe_active.load(std::memory_order_acquire);
             const int pipe_f = F->pipe_floor.load(std::memory_order_acquire);
             for (int il = l0_; il < lt_; ++il) {
