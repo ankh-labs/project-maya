@@ -6513,6 +6513,58 @@ void nf_alloc() {
     *g_nf_h = kNoProbe;
 }
 }
+namespace {
+constexpr int kProbeSlots = 4096;
+__global__ void pipe_probe_kernel(const float* p, int n, int code, float* l2, int* mx) {
+    float sum = 0.f;
+    int best = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float v = fabsf(p[i]);
+        if (!isfinite(v)) {                                         // mark it, but keep going
+            atomicMax(&mx[code], 0x7f800000);
+            continue;
+        }
+        sum += v * v;
+        const int b = __float_as_int(v);
+        if (b > best) best = b;
+    }
+    atomicAdd(&l2[code], sum);
+    if (best > 0) atomicMax(&mx[code], best);
+}
+float* g_l2d = nullptr;
+int* g_mxd = nullptr;
+float g_l2h[kProbeSlots];
+int g_mxh[kProbeSlots];
+int g_seen[kProbeSlots];
+}
+void pipe_probe(const float* p, int n, int code, cudaStream_t s) {
+    if (p == nullptr || n <= 0 || code < 0 || code >= kProbeSlots) return;
+    if (g_l2d == nullptr) {
+        if (cudaMalloc(&g_l2d, kProbeSlots * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&g_mxd, kProbeSlots * sizeof(int)) != cudaSuccess) { g_l2d = nullptr; return; }
+        cudaMemset(g_l2d, 0, kProbeSlots * sizeof(float));
+        cudaMemset(g_mxd, 0, kProbeSlots * sizeof(int));
+        for (int i = 0; i < kProbeSlots; ++i) g_seen[i] = 0;
+    }
+    g_seen[code] = 1;
+    pipe_probe_kernel<<<16, 256, 0, s>>>(p, n, code, g_l2d, g_mxd);
+}
+void pipe_probe_report(const char* tag) {
+    if (g_l2d == nullptr) return;
+    cudaDeviceSynchronize();
+    cudaMemcpy(g_l2h, g_l2d, kProbeSlots * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(g_mxh, g_mxd, kProbeSlots * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < kProbeSlots; ++i) {
+        if (!g_seen[i]) continue;
+        float mxf = 0.f;
+        std::memcpy(&mxf, &g_mxh[i], sizeof(float));   // (the max-abs is stored as its float bits)
+        std::fprintf(stderr, "PROBE %s %d %.9g %.9g\n", tag, i, (double) g_l2h[i], (double) mxf);
+        g_seen[i] = 0;
+    }
+    cudaMemset(g_l2d, 0, kProbeSlots * sizeof(float));
+    cudaMemset(g_mxd, 0, kProbeSlots * sizeof(int));
+}
+
 void nonfinite_probe(const float* p, int n, int code, cudaStream_t s) {
     if (p == nullptr || n <= 0) return;
     nf_alloc();
