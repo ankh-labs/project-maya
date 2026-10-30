@@ -683,7 +683,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->cs2, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&F->ps2, cudaStreamNonBlocking) != cudaSuccess ||
+    cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pred, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf, cudaEventDisableTiming) != cudaSuccess ||
@@ -4008,6 +4009,7 @@ void Glm5Model::fast_destroy() {
     if (F->xpool) cudaFree(F->xpool);
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
+    if (F->ps2) cudaStreamSynchronize(F->ps2);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
     if (F->ev_done) cudaEventDestroy(F->ev_done);
     if (F->ev_pred) cudaEventDestroy(F->ev_pred);
@@ -4017,6 +4019,8 @@ void Glm5Model::fast_destroy() {
     if (F->pipe) { F->pipe->shutdown(); F->pipe.reset(); }
     if (F->cs2) cudaStreamDestroy(F->cs2);
     if (F->copy) cudaStreamDestroy(F->copy);
+    if (F->ps2) cudaStreamDestroy(F->ps2);
+    F->ps2 = nullptr;
     if (F->ps) cudaStreamDestroy(F->ps);
     delete F;
     fast_ = nullptr;
@@ -4491,6 +4495,13 @@ void Glm5Model::fast_service() {
             }
             F->ram_hits.fetch_add((uint64_t) std::popcount((unsigned) (fetch)), std::memory_order_relaxed);
             F->misses.fetch_add((uint64_t) std::popcount((unsigned) (fetch | miss | cpu)), std::memory_order_relaxed);
+            {
+                const int nmiss = std::popcount((unsigned) (fetch | miss | cpu));
+                if (nmiss > 0 && il < (int) F->miss_layer.size()) {
+                    F->miss_layer[(size_t) il] += (uint64_t) nmiss;
+                    F->bytes_layer[(size_t) il] += (uint64_t) nmiss * (uint64_t) F->lp[(size_t) il].stride;
+                }
+            }
             if (F->n_ahead > 0) fast_ahead_route(il, ids, miss, rq->ahead);
             if (miss != 0) {
                 // ---- disk only: read each into a free RAM slot (it stays there unless it was promoted) or staging;
@@ -5799,13 +5810,16 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
         // (the route writes it on the compute stream) and before the experts that read the slots.  This is what makes
         // copy and compute actually overlap; everything before it only overlapped row with row.
         cudaEvent_t ec = F->ev_copy[(size_t) il];
+        // ONE COPY STREAM PER ROW: a shared stream serialised the two rows' fetches, which is what made the first copy
+        // lane slower than the baseline it replaced.
+        cudaStream_t fs = (row_base_ & 1) ? F->ps2 : F->ps;
         cudaEventRecord(ec, s);
-        cudaStreamWaitEvent(F->ps, ec, 0);
-        gf::moe_wait(md, g.n_embd, F->ps);
+        cudaStreamWaitEvent(fs, ec, 0);
+        gf::moe_wait(md, g.n_embd, fs);
         if (F->prof_on) F->mark("moe_wait(copy)");
-        gf::moe_fetch(md, g.n_exp_used, Ly.blob, F->ps);
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, fs);
         if (F->prof_on) F->mark("moe_fetch(copy)");
-        cudaEventRecord(ec, F->ps);
+        cudaEventRecord(ec, fs);
         cudaStreamWaitEvent(s, ec, 0);
     } else if (!empty) {
         gf::moe_wait(md, g.n_embd, s);
