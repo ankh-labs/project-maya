@@ -1,5 +1,8 @@
 # Decisions
 
+> **Scope:** Maya decisions only. llama.cpp-era closures live in the lab copy at
+> `G:\AI\llama-server\docs\DECISIONS.md` — check there before assuming an old decision was never made.
+
 ## CLOSED 2026-10-30 — an explicit copy lane for the de-fused scheduler
 
 **Decision:** the de-fused row scheduler does not get a dedicated copy lane. `STRATA_GLM_COPY_LANE` stays off by

@@ -1,5 +1,9 @@
 # Maya engine — live state
 
+> **Scope:** this file is the live state of the **Maya** engine, and the source of truth for it. The **llama.cpp** stack
+> at `G:\AI\llama-server\` is the *other* engine and is **not current**: its docs there hold the llama.cpp history,
+> the older measurements and the pointer back here.
+
 ## 2026-10-30 — v1.1.41 deployed; the rotation is serialised off on this pack
 
 **Deployed:** v1.1.41, tag `deployed/v1.1.41-20261030-1210` @ `56ced70`, branch and tag pushed to Sia. Battery 7/7 PASS.
