@@ -917,6 +917,11 @@ public:
     // call over n rows; a driver that runs ONE row per call sets it to that row's index so two rows in flight never
     // share a slice (docs/LAYER_PIPELINE.md, increment 3b).
     int row_base_ = 0;
+    // "this call is one row of a pipeline", EXPLICIT.  row_base_ is the row INDEX, and row 0's index is 0, so using
+    // `row_base_ > 0` as the boolean made row 0 take the token path's shared buffers while row 1 took its own - two
+    // rows on two streams writing one buffer set (an illegal access, reported as an async launch failure at the
+    // sampler).  Third time in this branch that one variable with two meanings has cost a day.
+    bool rows_per_row_ = false;
     // The stream the layer path runs on; nullptr = the engine's compute stream.  A pipeline driver sets a row's own
     // stream before enqueueing its layers, so two rows' layers overlap (docs/LAYER_PIPELINE.md).
     cudaStream_t rows_stream_ = nullptr;
