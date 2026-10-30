@@ -734,7 +734,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         cudaEventCreateWithFlags(&F->ev_pred, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_pf_prev, cudaEventDisableTiming) != cudaSuccess ||
-        cudaEventCreateWithFlags(&F->ev_done, cudaEventDisableTiming) != cudaSuccess) {
+        cudaEventCreateWithFlags(&F->ev_route, cudaEventDisableTiming) != cudaSuccess ||
+    cudaEventCreateWithFlags(&F->ev_done, cudaEventDisableTiming) != cudaSuccess) {
         err = "glm fast: streams/events did not create";
         return false;
     }
@@ -5852,8 +5853,16 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     // one the host handed out when it launched this route.
     auto md_h = md;   // (this route's own copy: the caller holds md by const ref)
     md_h.hseq = (unsigned int) ++F->seq_h;
+    // SERIALIZE THE ROUTES, NOT THE COMPUTES (2026-10-30).  The seq above is handed out by the host at launch, so route
+    // publication order is only guaranteed if the launches are ordered: with two rows publishing concurrently, the later
+    // seq can reach the ring first, and a route that then spins on its answer occupies the SM the earlier route needed to
+    // publish - head-of-line blocking between the channels, which is the deadlock docs/LAYER_PIPELINE.md:298 diagnosed on
+    // 2026-10-29 and today's evidence re-derived from the other end (the CPU lane's answers stopping mid-step).  A route
+    // costs a top-k over the experts; the computes that follow each route still overlap, which is where the win is.
+    cudaStream_t rstream = rows_stream_ != nullptr ? rows_stream_ : F->cs;
+    if (F->ev_route != nullptr) cudaStreamWaitEvent(rstream, F->ev_route, 0);   // the previous route has published
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
-                  g.n_embd, md_h, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, (rows_stream_ != nullptr ? rows_stream_ : F->cs),
+                  g.n_embd, md_h, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, rstream,
                   pred ? (pred_logits != nullptr ? pred_logits : F->plog) : nullptr,
                   pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? (pred_pf_n > 0 ? pred_pf_n : F->max_pf) : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
@@ -5864,6 +5873,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                       const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
                       return il >= from ? w : 0.0f;
                   }(), win_rows, miss_to_cpu());
+    if (F->ev_route != nullptr) cudaEventRecord(F->ev_route, rstream);
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,

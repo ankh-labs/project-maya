@@ -1625,10 +1625,27 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // rows_head - a kernel still spinning at the end of the step blocked it forever and said nothing, which is why
         // step 2 never entered the rotor and no detector fired.
         {
+            // THE BOUND IS A KNOB (2026-10-30): 20 s is shorter than the wait kernel's own ~60 s ceiling, so a step that
+            // would have finished after its waiter gave up reads as a wedge.  STRATA_GLM_ROW_DRAIN_SEC settles which of the
+            // two a stall is - an unanswered request (the kernel terminates, late, with a bad answer) or a true deadlock
+            // (it never does).  A drain that takes more than 2 s now says so, with the time.
+            static const int drain_s = [] {
+                const char* e = getenv("STRATA_GLM_ROW_DRAIN_SEC");
+                const int v = e != nullptr ? std::atoi(e) : 20;
+                return v > 0 ? v : 20;
+            }();
             const auto t0 = std::chrono::steady_clock::now();
             for (;;) {
                 const cudaError_t q = cudaStreamQuery(F->cs2);
-                if (q == cudaSuccess) break;
+                if (q == cudaSuccess) {
+                    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    if (el > 2.0)
+                        std::fprintf(stderr,
+                                     "glm pipe: CUDA%d the row lane took %.1f s to drain after the last layer (bound %d "
+                                     "s) - the waiter finished late, it did not deadlock\n",
+                                     dev_, el, drain_s);
+                    break;
+                }
                 if (q != cudaErrorNotReady) {
                     (void) cudaGetLastError();
                     err = std::string("glm rows: row lane: ") + cudaGetErrorString(q);
@@ -1636,13 +1653,14 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     return false;
                 }
                 (void) cudaGetLastError();
-                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(drain_s)) {
                     // NAME THE LAYER.  "a kernel from this step is still running" is the one thing the log could not
                     // localise, and the step number wanders (5, then 2, then 4), which is the signature of a
                     // data-dependent wedge rather than a wiring fault.  ev_layer[il] is recorded after every layer run,
                     // so the lowest event that has not completed IS the stuck layer, and each row's cursor says which
                     // row's stream it belongs to.
-                    std::string why = "glm rows: the row lane did not drain within 20 s after the last layer";
+                    std::string why = "glm rows: the row lane did not drain within " + std::to_string(drain_s) +
+                                      " s after the last layer";
                     int stuck = -1;
                     for (int il2 = l0_; il2 < l1_; ++il2)
                         if (il2 < (int) F->ev_layer.size() && F->ev_layer[(size_t) il2] != nullptr) {

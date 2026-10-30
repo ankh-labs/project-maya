@@ -718,3 +718,42 @@ concurrent load are the shape that would surface the stall class, and none appea
 Gate status: the rotation is ON by default - `layer_pipe_mode()` defaults to 2 and the live config carries
 `MAYA_GLM_ROWS_ATTN=1` - and a boot with zero shell keys engages it and stays clean.  The per-row-DSA-everywhere change
 stays parked (22 MB of the rows' 31 MB, changes the attention shape, needs its own measurement).
+
+## 2026-10-30 — the head-of-line diagnosis, re-derived from the other end
+
+The 2026-10-29 finding at line 298 above was re-found today **independently**, from the symptom side rather than from
+the code side, which makes it corroborated rather than merely repeated.
+
+What was observed (one boot, `n=2`, rotor entered, both arms failing earlier in the day):
+
+- the service answered **112** requests carrying `ch = 1` — the per-channel answer slots work, so `wait_ch = 1` is
+  exercised and answered (`moe_wseq` / `resp_h[ch]` / `ans_h[r]` are not the fault);
+- those answers ran through **layer 31** and then **stopped mid-step**;
+- the drain sweep localised the wedge to **layer 33 on row 1's stream (`cs2`)**, with **both rows' cursors already at
+  `il 45`** — i.e. every row-layer had been submitted and one kernel simply never retired.
+
+Answers flowing for 31 layers and stopping is not a missing branch; it is the ring's strict-`seq` ordering meeting a
+route that cannot publish. That is line 298's head-of-line blocking, reached from the evidence instead of from the code.
+
+**The fix applied** (the cheaper of the two options the 2026-10-29 note names): the **routes** are serialized across
+rows with one event — waited before each `gf::moe_route` launch and recorded after it — so publication order equals
+`seq` order, while every compute that follows a route still overlaps across the two streams. `FastState::ev_route`.
+The per-channel answer slots were already in place; this is the other half of the protocol.
+
+### Method correction (applies to everything dated today)
+
+Line 356's ruling is not limited to 2026-10-29: **single-run comparisons across builds are not admissible for this
+bug**. Several of today's six falsifications were exactly one boot each, so they are downgraded from "dead" to
+"not established" — in particular the parity-spread result (spread 0..1, occ/reo 0), the round-cap gate (does not
+fire), and the "service answers stop" observation itself. What survives that ruling is only what is *static* or
+*within-run*:
+
+| claim | stays? |
+|---|---|
+| per-row strides exact (head_x 16384, head_xq 4608, logits 619520) | yes — arithmetic from types, not a run |
+| row 0's `n=2` tokens match the same-boot `n=1` baseline | as a fact about that boot; needs repetition to generalise |
+| row 1's token equals that step's `argmax` with changing logit hashes | within-run consistency; repetition needed |
+| residual hashes chain across steps | within-run; repetition needed |
+| `pf_buf` / round-cap / residual-arena theories | **not established** (one boot each) |
+
+Every arm from here is repeated: **minimum three boots per arm**, and no conclusion from one.

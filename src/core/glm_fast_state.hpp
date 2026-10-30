@@ -521,6 +521,12 @@ struct Glm5Model::FastState {
     int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
     unsigned int* need_seq_h = nullptr;   // [8] pinned: each channel's just-published seq (the route kernel writes it)
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
+    // THE ROUTE PUBLICATION ORDER (2026-10-30).  The service consumes the ring strictly in seq order and the seq is handed
+    // out by the host at launch, so two rows launching routes concurrently can reach the ring in the wrong order - and a
+    // route that spins while holding the SM the earlier route needed is head-of-line blocking, i.e. a deadlock
+    // (docs/LAYER_PIPELINE.md:298).  One event, waited before each route and recorded after it: publication order equals
+    // seq order, while every compute that follows a route still overlaps across rows.
+    cudaEvent_t ev_route = nullptr;
     // ONE EVENT A LAYER: a layer's expert slots and its tier-table entries are filled by whichever row visits the layer
     // first, and read by the other row on the other stream later.  On one stream that ordering was implicit; across two
     // it needs an event, or the second row reads a slot whose fetch has not landed (a non-finite score, arithmetic).
