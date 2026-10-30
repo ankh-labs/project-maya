@@ -570,6 +570,14 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> md_fallbacks{0};
     std::atomic<int> md_fallback_first_il{-1};
     std::atomic<uint64_t> floor_violations{0};
+    // PUBLISHED vs ANSWERED, per channel (2026-10-30).  The failing shape is a request that is never answered, and the
+    // three candidates are mutually exclusive and each names a different culprit: published > answered means the service
+    // never consumed it (the ring's claim/advance under two producers); published == answered means the answer was written
+    // and the device did not see it (fence/visibility on ans_h[ch] against cpu_seq); published stalling means the route
+    // kernel never ran (submission).  Counted where the seq is handed out and where the service consumes, so the delta is
+    // read rather than inferred from silence - which is all three boots so far could do.
+    std::atomic<uint64_t> pub_ch[8] = {};
+    std::atomic<uint64_t> ans_ch[8] = {};
     std::atomic<uint64_t> spare_steals{0};
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};

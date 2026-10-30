@@ -304,6 +304,20 @@ That is **head-of-line blocking between the two channels**, and it is structural
   route may never get an SM to publish the earlier sequence the service is waiting for. Deadlock, caught by the
   watchdog.
 
+> **CORRECTION (2026-10-30) — the SM-starvation mechanism above is WITHDRAWN for the rows path.** Neither waiter
+> occupies one block per SM here. `moe_wait` is launched `<<<1, 256>>>` (`glm_fast.cu:6778`) — **a single block, which
+> cannot deny a route kernel its SM** — and `moe_wait_fetch`, the SM-wide one, **is never called on this path**: it sits
+> behind `skip_empty` (`glm_rows.cu:982`), the branch taken is the `moe_wait` + `moe_fetch` pair, and its grid line
+> (`glm pipe: CUDA%d moe_wait_fetch grid %d of %d SM(s)`) appears in no log under `project-maya/` or `../scratch/`.
+>
+> Consequence, measured: serialising the route publications (one `FastState::ev_route`, waited before each launch and
+> recorded after) — the cheaper fix this section names — changed nothing. Three boots, 3/3 still failed, rotor entries
+> 5 / 2 / 14 against a 2..6 pre-fix range. It fixed a precondition that was not the binding constraint.
+>
+> What stands: the **bug** this section named — a request that is never answered — corroborated independently on
+> 2026-10-30 from the evidence side (the service's `ch = 1` answers running through layer 31 and then stopping, wedge at
+> layer 33 on `cs2`, both cursors already at `il 45`). What does not stand: the mechanism. Do not rebuild on it.
+
 **So the next change is the protocol, not the buffers:** either a per-channel ring (the service answers each channel
 on its own, no global order), or serialize the *routes* across rows with events while leaving the computes overlapped
 - which is the shape originally proposed and is the cheaper of the two.

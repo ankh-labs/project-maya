@@ -4912,6 +4912,7 @@ void Glm5Model::fast_service() {
                                     std::memory_order_relaxed);
             }
         }
+        F->ans_ch[rq->ch & 7].fetch_add(1, std::memory_order_relaxed);   // answered (consumed) on this channel
         F->processed.fetch_add(1, std::memory_order_release);
         ++next;
     }
@@ -5853,6 +5854,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     // one the host handed out when it launched this route.
     auto md_h = md;   // (this route's own copy: the caller holds md by const ref)
     md_h.hseq = (unsigned int) ++F->seq_h;
+    F->pub_ch[md.wait_ch & 7].fetch_add(1, std::memory_order_relaxed);   // published on this channel
     // SERIALIZE THE ROUTES, NOT THE COMPUTES (2026-10-30).  The seq above is handed out by the host at launch, so route
     // publication order is only guaranteed if the launches are ordered: with two rows publishing concurrently, the later
     // seq can reach the ring first, and a route that then spins on its answer occupies the SM the earlier route needed to

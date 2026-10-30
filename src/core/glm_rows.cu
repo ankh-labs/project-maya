@@ -1676,6 +1676,15 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     for (int r2 = 0; r2 < n; ++r2)
                         why += "; row " + std::to_string(r2) + " at il " + std::to_string(S->cur[r2].il) + " on cs" +
                                (((serial || (r2 & 1) == 0)) ? "" : "2");
+                    // THE DELTA, per channel: which of the three unanswered-request shapes this is.
+                    for (int c2 = 0; c2 < 8; ++c2) {
+                        const unsigned long long pubd = (unsigned long long) F->pub_ch[c2].load(std::memory_order_relaxed);
+                        const unsigned long long ansd = (unsigned long long) F->ans_ch[c2].load(std::memory_order_relaxed);
+                        if (pubd != 0 || ansd != 0)
+                            why += "; ch " + std::to_string(c2) + " published " + std::to_string(pubd) + " answered " +
+                                   std::to_string(ansd) + " (" + (pubd == ansd ? "level" : "BEHIND " +
+                                   std::to_string(pubd - ansd)) + ")";
+                    }
                     err = why;
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
