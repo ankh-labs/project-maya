@@ -567,7 +567,12 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> spare_steals{0};
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
-    unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
+    // [src 8 | dst 8] per layer parity.  MEASURED 2026-10-30: the parity aliasing is real in principle but UNREACHABLE
+    // here - the rotor's step recorded spread 0..1 on every step (occ_defers 0, reo_defers 0), so two rows never shared a
+    // parity.  Widening these to per-row was tried and REVERTED: it did not fix row 1, and it changed row 0's tokens
+    // (5609/915/57 against the baseline's 57/8484/77009), so it was not neutral and would mask whatever the real fault is.
+    // If a future schedule makes spread 2 reachable, widen this then, and prove neutrality before trusting it.
+    unsigned long long* pf_buf[2] = {nullptr, nullptr};
     int* pf_n_buf[2] = {nullptr, nullptr};
     void* arena = nullptr;
     size_t arena_bytes = 0;

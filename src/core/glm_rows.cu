@@ -1210,6 +1210,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     // claims - was the per-row MoeDev bug (they were built in a function this path never called), and floor_violations
     // and spare_steals have read zero since.  A guard naming a cause that no longer exists is worse than no guard.
     const int pipe_mode = glmfast::layer_pipe_mode();
+    // This step's schedule figures, reset by the rotor branch below and quoted by the per-step token-id line - which sits
+    // OUTSIDE that branch, so these cannot be branch-local: a counter only visible in the error path is one nobody reads
+    // (and the round-cap gate never fired, which is how the first two of these went unread for a whole boot).
+    int occ_defers = 0, reo_defers = 0, spread_max = 0;
     if (pipe_mode >= 2 && n == 2 && F->cs2 != nullptr && S->aq != nullptr) {
         // ---- the rotation (docs/LAYER_PIPELINE.md, increment 4): row r runs the layer k - r while row 0 runs k, so one
         // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
@@ -1310,11 +1314,21 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // turns a scheduler bug into a visible short step instead of a spin.
         const int round_cap = 4 * L + 64;
         bool all_done = false;
+        occ_defers = 0;
+        reo_defers = 0;
+        spread_max = 0;
         int k = 0;                 // hoisted: the gate below quotes how far the schedule got
-        int occ_defers = 0;        // this step's deferrals BY CAUSE - the two numbers that decide the diagnosis
-        int reo_defers = 0;
         for (; k < round_cap && !all_done; ++k) {
             all_done = true;
+            {   // the spread, recorded because it - not n - is what decides whether two rows share a parity
+                int lo = l1_, hi = -1;
+                for (int q = 0; q < n; ++q)
+                    if (!S->cur[q].done) {
+                        lo = std::min(lo, S->cur[q].il);
+                        hi = std::max(hi, S->cur[q].il);
+                    }
+                if (hi >= 0) spread_max = std::max(spread_max, hi - lo);
+            }
             for (int r = 0; r < n; ++r) {
                 if (S->cur[r].done) continue;
                 if (k < r) { all_done = false; continue; }   // this row has not started yet (the stagger is unchanged)
@@ -1614,7 +1628,8 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     static const bool toklog = getenv("STRATA_GLM_TOK_ID_LOG") != nullptr;   // ...and on demand for the n == 1 baseline
     if (n > 1 || toklog) {
         std::string line = "glm rows: CUDA" + std::to_string(dev_) + " step " + std::to_string(F->step_seq) +
-                           " token ids";
+                           " token ids | deferrals occ " + std::to_string(occ_defers) + " reo " +
+                           std::to_string(reo_defers) + " spread " + std::to_string(spread_max);
         for (int i = 0; i < n; ++i) {
             line += " | row " + std::to_string(i) + " seq " + std::to_string(rw[i].seq) + " pos " +
                     std::to_string(rw[i].p) + " id " + std::to_string(tokens_out[i]);
