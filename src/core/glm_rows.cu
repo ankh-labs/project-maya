@@ -1297,6 +1297,12 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
             {
                 static std::atomic<bool> told{false};
+                const uint64_t fv = F->floor_violations.load(std::memory_order_relaxed);
+                const uint64_t ss = F->spare_steals.load(std::memory_order_relaxed);
+                if (fv > 0 || ss > 0)
+                    std::fprintf(stderr, "glm pipe: CUDA%d floor-bearing mutations while the rotor ran: %llu slot_of, "
+                                         "%llu spare steals (a trailing row's slot was re-pointed or its spare taken)\n",
+                                 dev_, (unsigned long long) fv, (unsigned long long) ss);
                 const uint64_t busy = F->pipe->layer_busy.load(std::memory_order_relaxed);
                 if (busy > 0 && !told.exchange(true))
                     std::fprintf(stderr, "glm pipe: CUDA%d same-layer collision avoided %llu time(s) - the spare "
