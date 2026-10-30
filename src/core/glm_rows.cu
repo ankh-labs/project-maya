@@ -504,6 +504,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
 
         if (rows_per_row_)   // stage 1: the mixer's output (attention done, FFN not yet)
             gf::nonfinite_probe(rows(S->mixer, E, R(0)), (int) E, (il << 8) | (1 << 4) | rb, s);
+        if (rows_per_row_) gf::pipe_probe(rows(S->mixer, E, R(0)), (int) E, il * 4 + 1, s);
         if (!Ly.moe) {
             gf::MvJob j[2];
             j[0] = {Ly.ffn_gate.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->dg, g.n_ff_dense, rb), nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
@@ -520,6 +521,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         }
         if (rows_per_row_)   // stage 2: this layer's FFN output (still pre-residual)
             gf::nonfinite_probe(rows(S->ffn, E, R(0)), (int) E, (il << 8) | (2 << 4) | rb, s);
+        if (rows_per_row_) gf::pipe_probe(rows(S->ffn, E, R(0)), (int) E, il * 4 + 2, s);
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     for (int i = 0; i < n; ++i) {
@@ -1316,6 +1318,11 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
             {
                 static std::atomic<bool> told{false};
+                {
+                    static std::atomic<bool> once{false};
+                    if (!once.exchange(true))
+                        gf::pipe_probe_report(serial ? "serial" : "overlap");
+                }
                 const uint64_t fb = F->md_fallbacks.load(std::memory_order_relaxed);
                 if (fb > 0)
                     std::fprintf(stderr, "glm pipe: CUDA%d per-row calls fell back to the GLOBAL MoeDev %llu time(s), "
