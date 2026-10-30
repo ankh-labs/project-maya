@@ -187,3 +187,31 @@ service's position is `next`, which the stall line prints separately, and in eve
 service consumed every hand-out and is parked on a seq no step ever handed out. The output now says "hand-outs" and
 "answer-writes" instead of "published"/"answered", because the word BEHIND sent two people looking for a queue that does
 not exist.
+
+## 2026-10-30 — the sixteen words: the wedge is NOT the answer handshake
+
+Boot 3 (drain, lowest incomplete layer 38, both cursors already at il 45):
+
+```
+service waiting for seq 2760   (slots hold 2504.. = previous occupants; no lap)
+wait_seq   0=2758  1=0  2=0  3=0  4=0  5=0  6=0  7=0
+resp.seq   0=2758  1=2683  2=0  3=0  4=0  5=1032389371  6=0  7=0
+```
+
+Three facts, in order of weight:
+
+1. **`wait_seq[1] = 0`** - row 1's channel has NO pending wait word. `*moe_wseq(a.d) = mask ? seq : 0u`, so this says the
+   stuck row's last route had **nothing to wait for from the host** (mask 0): no CPU-lane and no disk expert requested an
+   answer. The wedged stream therefore cannot be parked in `moe_wait`, and the answer handshake is exonerated for the
+   stuck layer. By the criterion set earlier today, the suspect moves to the **arrival path** - an `ev_fill` / `ev_pf`
+   event that never fires (a `cudaStreamWaitEvent` on the row's stream is a wait, not a kernel, and reports exactly as
+   "a kernel from this step is still running").
+2. **`resp.seq[5] = 1032389371`** - garbage in a slot that was never written. No waiter polls channel 5 today, so it is
+   not the fault, but it is an uninitialised-memory tell worth removing on principle.
+3. **`resp.seq[0] = wait_seq[0] = 2758`** - the answer landed on channel 0 and the word was never cleared back to 0.
+   Harmless at a step's end only if nothing waits on it afterwards; that assumption is now written down rather than
+   left implicit.
+
+Next instrument: **stage events on the row's stream** (route -> fetch -> mixer -> FFN -> head) so the first event that
+never retires names the stage, not just the layer. The drain's layer sweep already proves the granularity is needed:
+layer 38 alone cannot distinguish a parked wait from a stuck kernel.
