@@ -446,6 +446,11 @@ void moe_wait_fetch_set_rows(int n);
 /// enumerates every remaining cross-stream dependency instead of one rebuild a gap.  Off the fused path: the only caller
 /// is the per-row rotor.  A stage boundary names the producer, a layer number on its own does not.
 void nonfinite_probe(const float* p, int n, int code, cudaStream_t s);
+/// Per-stage MAGNITUDE stats (L2 and max-abs) for the de-fused arm.  A NaN is where corruption became detectable, not
+/// where it started: a finite but wrong value propagates silently.  Comparing the same stage between the SERIAL arm
+/// (one stream, known-good) and the overlapped one finds the first DIVERGENCE, which is earlier than the first NaN.
+void pipe_probe(const float* p, int n, int code, cudaStream_t s);
+void pipe_probe_report(const char* tag);   // prints code,l2,maxabs for every slot seen, then clears
 void nonfinite_reset();
 int nonfinite_take();   // -1: nothing non-finite since the reset
 /// moe_cpu_wait for the n rows of a batched step in one launch: row r waits for the answer *seq[r] names (0: none) in
