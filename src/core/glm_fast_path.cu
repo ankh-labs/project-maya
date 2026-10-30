@@ -4668,6 +4668,12 @@ void Glm5Model::fast_service() {
             // a verify window's token answers into its own slot (the device waits for them at the layer's end)
             gf::CpuAnswer* ans = F->cpu_ans_h;
             if (rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr) ans = F->win.ans_h[rq->win];
+            // A DE-FUSED ROW's slot: the row waits on W.ans_d[ch] (glm_rows.cu: 'm.cpu_ans = W.ans_d[R(i)]'), and
+            // ch is the row (wait_ch = R(i) & 7).  Without this the service answered into cpu_ans_h - the lone token's
+            // slot - while row 1 spun on ans_h[1]->seq, which no one would ever write.  Row 0 is cpu_ans_h by the same
+            // comment that says ans_h covers tokens 1.., so it needs no case.
+            else if (rq->win == 0 && rq->ch > 0 && rq->ch < 16 && F->win.ans_h[rq->ch] != nullptr)
+                ans = F->win.ans_h[rq->ch];
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);

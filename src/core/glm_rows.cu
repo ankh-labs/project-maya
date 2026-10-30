@@ -1223,6 +1223,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // 'not entered' and 'entered and healthy' - the same fail-open shape as the event oracle.
         std::fprintf(stderr, "glm pipe: CUDA%d step %u: rotor entered (n=%d, layers %d..%d)\n", dev_, F->step_seq, n,
                      l0_, l1_);
+        {
+            static std::atomic<bool> told_ans{false};
+            if (!told_ans.exchange(true))   // POINTERS, not an inference: is ans_d[0] the same object as cpu_ans_h?
+                std::fprintf(stderr, "glm pipe: CUDA%d CPU-lane answer slots: cpu_ans_h=%p ans_d[0]=%p ans_d[1]=%p "
+                                     "(row 0 uses cpu_ans_h, row 1 uses ans_d[1])\n",
+                             dev_, (void*) F->cpu_ans_h, (void*) F->win.ans_d[0], (void*) F->win.ans_d[1]);
+        }
         gf::nonfinite_reset();
         cudaEventRecord(F->ev_hop, F->cs);
         cudaStreamWaitEvent(F->cs2, F->ev_hop, 0);
