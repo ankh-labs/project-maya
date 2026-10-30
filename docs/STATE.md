@@ -35,4 +35,19 @@ See `docs/HYPOTHESIS_shared_mv_scratch.md` (it also carries the named hypothesis
 
 **Throughput of v1.1.41 is UNMEASURED.** The battery passing 7/7 is a gate result, not a measurement: there is no
 paired v1.1.40 run of the same battery in the same boot, and its mean (6.35 tok/s) mixes prefill-dominated cases, so it
-does not compare against the Oct 27 production figure of 23.8 tok/s. Do not quote 6.35 as a throughput number.
+does not compare against the Oct 27 deployed-build figure of 23.8 tok/s. Do not quote 6.35 as a throughput number.
+
+## Standing posture (2026-10-30, corrected)
+
+**This is a homelab lab workstation, not production.** The box serves Aaron's own agents. Consequences for how findings are
+written here:
+
+- Say **the deployed build** or **the live box**, never "production".
+- There is **no release register**: no "not ready", no "ready for testing", no "safe to cut over". There is nothing to be
+  ready *for*. A wedged rotor is an experiment in progress, not an outage.
+- **A crash is a data point** - reported flatly, then the next arm runs.
+- The rotation stays default-on while it is being worked on. Restoring the fused build is a thing to *do* if the box is
+  wanted for something else, not a risk to escalate.
+
+Unchanged, and worth keeping: three boots per arm, verify from the log that the arm actually exercised what it claims
+(the rotor check), and no claim from a single run.

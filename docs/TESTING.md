@@ -301,7 +301,7 @@ path disabled, so disabling it proves nothing".
 
 The per-channel + single-read fix (mask and `s_sm` through `moe_wseq(d)` / `moe_resp_ch(d)`, one read per field)
 **stays** - it removes a real cross-channel leak and a host-write race that were genuine - but it is a correctness fix,
-not this fault's fix, and it will be built and run with the flag ON so the instrument sits on the path production uses.
+not this fault's fix, and it will be built and run with the flag ON so the instrument sits on the path the live box uses.
 
 **New signal worth holding:** the illegal memory access has now appeared twice today, both on `cs2` and both after a
 rotor run of several steps. It is reported through `cudaStreamQuery` on that stream, so it is a genuine device fault, not

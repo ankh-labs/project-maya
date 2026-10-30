@@ -44,7 +44,7 @@ Downloaded and verified: 156,319,213,529 bytes across four shards, all sha256-cl
 Maya-L carries ~145-150 GB of experts against the same 122.5 GB, so ~25 GB (~17 %) lands on the disk rung - the first
 time that code runs at all.
 
-**Prerequisite, and it is not optional:** stop the production engine first.  `maya.exe` holds ~99.5 GB RSS and the box is
+**Prerequisite, and it is not optional:** stop the running engine first.  `maya.exe` holds ~99.5 GB RSS and the box is
 127 GB; a 156 GB model will not load beside it, and the repack needs headroom too.
 
 **Expectation:** correctness before any throughput number.  This exercises untested code, so the first question is

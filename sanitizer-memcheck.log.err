@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "G:\AI\maya-eval\project-maya\serve\server.py", line 6005, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "G:\AI\maya-eval\project-maya\serve\server.py", line 5808, in main
+    engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "G:\AI\maya-eval\project-maya\serve\server.py", line 850, in __init__
+    raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+RuntimeError: the engine exited before it was ready (see G:\AI\maya-eval\project-maya\maya-v3q-q4.log)

@@ -1,7 +1,7 @@
 # Layer pipeline (RxTy) — spec
 
 Status: **spec only, nothing built.** Written against the current tree (`feat/rows-de-fused-pf` @ `84054cc`,
-production config `--parallel 2`, `--prefill 65536`, `kv=q4_0` streaming).
+the live config `--parallel 2`, `--prefill 65536`, `kv=q4_0` streaming).
 
 ## Notation
 
@@ -54,7 +54,7 @@ The leader must pause (wait for the follower) when the expert sets it wants resi
 With this box's numbers:
 
 - expert set per layer per token: `n_exp_used = 8` experts; a slot is ~8.8 MB (31.17 GB / 3,541 measured slots);
-- free VRAM with the production pool: **~1.2 GB** (pool 36.26 GB of 47.76 GB; 4,104 of 12,096 slots resident);
+- free VRAM with the full pool: **~1.2 GB** (pool 36.26 GB of 47.76 GB; 4,104 of 12,096 slots resident);
 - so ~136 free slots ≈ **17 layers** of one token's set, or **~8 layers** with two tokens in flight.
 
 That is the useful number: the bound is not one layer, it is several — so a 2-request pipeline has ample room and
@@ -437,7 +437,7 @@ What survives is second-order and is the part worth keeping: with the rule on, a
 no fetch**, so it does not evict a resident. Admitted to VRAM it costs a future miss, and hit rate is what decode is
 most sensitive to. That is **pool preservation**, not first-order latency.
 
-**Measured (production build, full pool, 200-token decode, slot dir cleared):**
+**Measured (deployed build, full pool, 200-token decode, slot dir cleared):**
 
     disk = 0        ram_fetch = 19.3 GB/s      vram_hit = 0.779      promo = 19.7
 
