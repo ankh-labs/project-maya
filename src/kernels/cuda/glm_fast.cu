@@ -6490,6 +6490,43 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
 namespace {
 std::atomic<int> g_wait_rows{1};
 }
+namespace {
+__global__ void nonfinite_probe_kernel(const float* p, int n, int code, int* flag) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float v = p[i];
+        if (!isfinite(v)) {
+            atomicMin(flag, code);   // the earliest stage wins, which names the producer
+            return;
+        }
+    }
+}
+int* g_nf_d = nullptr;
+int* g_nf_h = nullptr;
+constexpr int kNoProbe = 0x7fffffff;
+// cudaHostAlloc returns ZEROED memory.  The first version had nonfinite_reset() run before any probe had allocated, so
+// the flag stayed 0 and atomicMin against it could never lower it - the probe then reported 'layer 0 entry', a fault
+// that does not exist (there is no entry-stage probe).  Allocation initialises it, whoever gets there first.
+void nf_alloc() {
+    if (g_nf_d != nullptr) return;
+    if (cudaHostAlloc((void**) &g_nf_h, sizeof(int), cudaHostAllocMapped) != cudaSuccess) { g_nf_h = nullptr; return; }
+    if (cudaHostGetDevicePointer((void**) &g_nf_d, g_nf_h, 0) != cudaSuccess) { g_nf_d = nullptr; return; }
+    *g_nf_h = kNoProbe;
+}
+}
+void nonfinite_probe(const float* p, int n, int code, cudaStream_t s) {
+    if (p == nullptr || n <= 0) return;
+    nf_alloc();
+    if (g_nf_d == nullptr) return;
+    nonfinite_probe_kernel<<<16, 256, 0, s>>>(p, n, code, g_nf_d);
+}
+void nonfinite_reset() { nf_alloc(); if (g_nf_h != nullptr) *g_nf_h = kNoProbe; }
+int nonfinite_take() {
+    if (g_nf_h == nullptr) return -1;
+    const int v = *g_nf_h;
+    *g_nf_h = kNoProbe;
+    return v == kNoProbe ? -1 : v;
+}
+
 void moe_wait_fetch_set_rows(int n) { g_wait_rows.store(n < 1 ? 1 : n, std::memory_order_relaxed); }
 
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s) {
