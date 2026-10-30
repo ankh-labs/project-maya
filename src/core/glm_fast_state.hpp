@@ -515,6 +515,10 @@ struct Glm5Model::FastState {
     int pipe_lead = 2;                     // S: layers of lead the rotor allows (pin set = S x N x 8 x 8.80 MB)
     unsigned int* need_seq_h = nullptr;   // [8] pinned: each channel's just-published seq (the route kernel writes it)
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
+    // ONE EVENT A LAYER: a layer's expert slots and its tier-table entries are filled by whichever row visits the layer
+    // first, and read by the other row on the other stream later.  On one stream that ordering was implicit; across two
+    // it needs an event, or the second row reads a slot whose fetch has not landed (a non-finite score, arithmetic).
+    std::vector<cudaEvent_t> ev_layer;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
@@ -1047,8 +1051,13 @@ struct Glm5Model::FastState {
         if (helper_failed.load(std::memory_order_acquire)) { err = helper_error; return false; }
         const int e = route_error_h ? *route_error_h : 0;
         if (e == 0) return true;
-        const char* kind = (e % 4 == 1) ? "decode" : (e % 4 == 2) ? "predicted" : "lookahead";
-        err = "glm router: layer " + std::to_string(e / 4) + " " + kind + " invalid expert ID or non-finite score";
+        const int code = e & 0xFFFF, fault = (unsigned) e >> 24;
+        const char* kind = (code % 4 == 1) ? "decode" : (code % 4 == 2) ? "predicted" : "lookahead";
+        // TWO FAULTS, TWO FIXES: an out-of-range expert ID is an INDEX fault (routing / slot publication); a non-finite
+        // score is ARITHMETIC (a buffer read before its producer completed - with two streams, a missing event
+        // dependency).  One message for both cost a day of looking in the wrong place.
+        err = "glm router: layer " + std::to_string(code / 4) + " " + kind +
+              (fault == 1 ? " INVALID EXPERT ID (index fault)" : " NON-FINITE SCORE (arithmetic)");
         return false;
     }
 };
