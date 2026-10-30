@@ -6765,12 +6765,16 @@ __global__ void pipe_probe_kernel(const float* p, int n, int code, float* l2, in
 }
 float* g_l2d = nullptr;
 int* g_mxd = nullptr;
+// REACHABILITY: counted before any early return, so 'printed nothing' can be told apart from 'never called'.  Sixth
+// declared-but-inert instrument on this branch was one too many; this one proves itself first.
+uint64_t g_calls = 0, g_skipped = 0, g_launched = 0;
 float g_l2h[kProbeSlots];
 int g_mxh[kProbeSlots];
 int g_seen[kProbeSlots];
 }
 void pipe_probe(const float* p, int n, int code, cudaStream_t s) {
-    if (p == nullptr || n <= 0 || code < 0 || code >= kProbeSlots) return;
+    ++g_calls;
+    if (p == nullptr || n <= 0 || code < 0 || code >= kProbeSlots) { ++g_skipped; return; }
     if (g_l2d == nullptr) {
         if (cudaMalloc(&g_l2d, kProbeSlots * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&g_mxd, kProbeSlots * sizeof(int)) != cudaSuccess) { g_l2d = nullptr; return; }
@@ -6779,9 +6783,15 @@ void pipe_probe(const float* p, int n, int code, cudaStream_t s) {
         for (int i = 0; i < kProbeSlots; ++i) g_seen[i] = 0;
     }
     g_seen[code] = 1;
+    ++g_launched;
     pipe_probe_kernel<<<16, 256, 0, s>>>(p, n, code, g_l2d, g_mxd);
 }
 void pipe_probe_report(const char* tag) {
+    int slots = 0;
+    for (int i = 0; i < kProbeSlots; ++i) slots += g_seen[i] ? 1 : 0;
+    std::fprintf(stderr, "PROBE %s calls=%llu skipped=%llu launched=%llu slots=%d device=%s\n", tag,
+                 (unsigned long long) g_calls, (unsigned long long) g_skipped, (unsigned long long) g_launched, slots,
+                 g_l2d != nullptr ? "allocated" : "NULL");
     if (g_l2d == nullptr) return;
     cudaDeviceSynchronize();
     cudaMemcpy(g_l2h, g_l2d, kProbeSlots * sizeof(float), cudaMemcpyDeviceToHost);
