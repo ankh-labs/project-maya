@@ -69,3 +69,32 @@ channel on its own, with no global seq order to violate.
 Before building that, the cheap instrument is a **published-but-unanswered counter**: increment when a route publishes
 seq N on channel c, and when the service answers N on c. The difference at the wedge names the unanswered request
 directly, which is the fact the last three boots could only infer from silence.
+
+## 2026-10-30 — the lap: kRingSize was a single-row constant
+
+The ring quote settled it in all three boots, as a uniform negative offset rather than a lost request:
+
+| boot | service waiting for | its slot holds | difference |
+|---|---|---|---|
+| 1 | seq 2773 | 2709 | **-64** |
+| 2 | seq 2620 | 2556 | **-64** |
+| 3 | seq 2424 | 2360 | **-64** |
+
+`-64` is exactly `kRingSize`. The device outran the service and wrapped the ring; the resync guard at `glm_fast_path.cu:4441`
+only recognises being *ahead* (`(int)(sq - next) > 0`), so a lapped service polls a slot that will never hold its seq
+again - forever, which surfaced as a 20 s "drain timeout" or as NON-FINITE depending on the observer's window.
+
+Root cause is arithmetic, not timing: **the ring was sized for one producer.** The token path publishes at most one
+route a layer (45 <= 64, cannot lap); the rotation publishes one a row a layer (45 x 2 = 90 > 64, laps as soon as enough
+layers are resident and a row does not wait for its answer - `if (empty) continue` at `glm_rows.cu:971` skips the wait
+entirely). That is why it never appeared at n=1, and why it is indifferent to streams, serialisation and BF16.
+
+Changes:
+- **`kRingSize` 64 -> 256.** The bound is `n_rows x layers`, so 90 for the rotation; 256 is 2.8x that and still covers
+  the window paths. `sizeof(gf::MoeRequest)` is ~16.8 KB (dominated by its `float x[4096]`), so 256 slots is 4.3 MB of
+  pinned host memory; 512 (8.6 MB) would cover the 8-row maximum if the rotation is ever extended past n=2.
+- **The lap fails closed.** `(int)(sq - next) <= 0` on the parked slot, with `seq != 0` (an empty slot is not a lap),
+  prints `LAPPED: the service waits for seq N and its slot holds M` and sets `svc_lapped`, which every step-failure
+  message now quotes. Today that would have found this in the first boot instead of the fifteenth.
+- **Backpressure demoted to a documented option, not built.** Throttling the producer to fit a 64-slot ring would trade
+  away the latency the rotor exists for, to work around a constant.

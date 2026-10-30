@@ -576,7 +576,8 @@ struct Glm5Model::FastState {
     // and the device did not see it (fence/visibility on ans_h[ch] against cpu_seq); published stalling means the route
     // kernel never ran (submission).  Counted where the seq is handed out and where the service consumes, so the delta is
     // read rather than inferred from silence - which is all three boots so far could do.
-    std::atomic<unsigned> svc_next{0};   // the seq the service is waiting for (published in host order by the ring)
+    std::atomic<unsigned> svc_next{0};
+    std::atomic<bool> svc_lapped{false};   // the device published more than a whole ring ahead: unrecoverable by design   // the seq the service is waiting for (published in host order by the ring)
     std::atomic<uint64_t> pub_ch[8] = {};
     std::atomic<uint64_t> ans_ch[8] = {};
     std::atomic<uint64_t> spare_steals{0};

@@ -328,7 +328,15 @@ struct CpuAnswer {
     unsigned int pad[3];
     float part[4096];
 };
-constexpr int kRingSize = 64;
+// THE RING MUST HOLD ONE STEP'S WHOLE IN-FLIGHT SET (2026-10-30).  The bound is n_rows x layers, not layers: the token
+// path publishes at most 45 (one a layer) and could never lap 64, while the rotation runs two rows and publishes at most
+// 90 a step - so 64 lapped it as soon as enough layers were resident, which is what the -64 measurements showed (every
+// slot the service was parked on held seq next-64, three boots running).  A lap is unrecoverable: the guard in
+// fast_service only recognises being AHEAD, so a lapped service polls a slot that will never hold its seq again.
+// 256 = 2.8x the rotation's 90, and still covers the window paths.  8.6 MB of pinned host memory would also cover the
+// 8-row maximum (512 x 16.8 KB, sizeof(MoeRequest) is dominated by its float x[4096]); 256 is 4.3 MB and enough because
+// the rotation refuses n >= 3.
+constexpr int kRingSize = 256;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
 constexpr int kAhead = 4;
 /// One routing request, written by the device into host-mapped memory.

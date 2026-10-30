@@ -4442,6 +4442,19 @@ void Glm5Model::fast_service() {
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
             } else {
+                // FAIL CLOSED ON A LAP (2026-10-30).  The slot we are parked on holds an OLDER sequence, so the device
+                // published more than a whole ring ahead and this entry is gone for good - the resync above only
+                // recognises being behind-but-unlapped.  Polling here is how an arithmetic fault (a ring sized for one
+                // row) hid as a 20 s "drain timeout" for a day.  seq == 0 is an empty slot, not a lap.
+                if (sq != 0u && (int) (sq - next) <= 0) {
+                    static std::atomic<bool> told_lap{false};
+                    if (!told_lap.exchange(true))
+                        std::fprintf(stderr,
+                                     "glm pipe: CUDA%d LAPPED: the service waits for seq %u and its slot holds %u "
+                                     "(%d slots) - the device published a full ring ahead; this sequence is unrecoverable\n",
+                                     dev_, next, sq, gf::kRingSize);
+                    F->svc_lapped.store(true, std::memory_order_relaxed);
+                }
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
                 // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits
                 // each): a route the main thread queued can sit there while this thread waits for it.  After 1 ms
