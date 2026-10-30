@@ -5617,8 +5617,15 @@ static void q8_1_to_float(const block_q8_1* x, float* y, long long n, int n_in, 
     q8_1_to_float_kernel<<<(unsigned) blocks, threads, 0, s>>>(x, y, n, n_in, src_cstride_blocks);
 }
 
+namespace {
+constexpr int kMvXfSlots = 4;                 // one a concurrent row (the rotor runs at most 2); 8 MiB each
+std::atomic<void*> g_xf_slot_all[kMvXfSlots];
+thread_local int g_xf_cur = 0;
+}  // namespace
+void mv_xf_set_slot(int slot) { g_xf_cur = (slot >= 0 && slot < kMvXfSlots) ? slot : 0; }
+
 static float* mv_xf_scratch() {
-    static std::atomic<void*> slot{nullptr};
+    std::atomic<void*>& slot = g_xf_slot_all[g_xf_cur];
     void* p = slot.load(std::memory_order_acquire);
     if (p == nullptr) {
         void* want = nullptr;

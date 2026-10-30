@@ -1172,7 +1172,17 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     // step's, so the outputs are identical - we only lose the shared weight reads.
     // (RESTORED: 6ae276e deleted this in favour of an mv_nt pre-pass that never compiled and does not cover the
     //  single-job mv() calls at glm_rows.cu:491 and glm_fast_path.cu:5996.)
-    if (n > 1) {
+    // THE ROTOR IS EXEMPT (2026-10-30).  This constraint is about the n-ROW calls: mv_nt refuses a BF16 job without xf.
+    // The rotor calls rows_layers with ONE row (the rotor loop below: `rows_layers(rw + r, 1, ...)`), so that job never
+    // reaches mv_nt there - and since 737bd2f mv() dequantises a BF16 job's q8_1 activation itself.  The guard used to
+    // sit UNGUARDED ahead of the rotor check, so a batch that qualified for the rotation was decoded row by row before
+    // the rotor was ever consulted: the feature was not declined, it was skipped (measured: 0 rotor entries on a boot
+    // where every precondition - pipe mode, n == 2, cs2, aq - was met).
+    const bool rotor_will_run = glmfast::layer_pipe_mode() >= 2 && n == 2 &&
+                                F->cs2 != nullptr && S->aq != nullptr;
+    // The fallback stays for every case that still needs it: n >= 3, the declined path (aq/cs2 missing), and the fused
+    // token path.  Do not re-broaden it without re-reading the reason above.
+    if (n > 1 && !rotor_will_run) {
         bool bf16_out = false;
         for (int il = l0_; il < l1_ && !bf16_out; ++il) bf16_out = F->L[(size_t) il].out.type == 30;   // GGML_TYPE_BF16
         if (bf16_out) {
@@ -1359,6 +1369,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (il > floor + F->pipe_lead) { all_done = false; continue; }   // unreachable while S >= n-1
                 row_base_ = r;
                 rows_stream_ = srow;
+                gf::mv_xf_set_slot(r);   // this row's own BF16 q8_1 scratch: two rows run on two streams
                 // This layer's slots were filled by whichever row ran it first; that row's fill must have landed
                 // before this one reads them.  (Never recorded: the wait is a no-op.)
                 if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr)
@@ -1398,6 +1409,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                              (double) db / 1e6 / std::max(1, l1_ - l0_));
             }
         }
+        gf::mv_xf_set_slot(0);
         gf::moe_wait_fetch_set_rows(1);
         row_base_ = 0;
         rows_stream_ = nullptr;

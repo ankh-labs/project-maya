@@ -55,6 +55,10 @@ constexpr int kMaxMvNt = 16;
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
+/// The BF16 q8_1->float scratch is per SLOT, not process-wide: two rows on two streams both call mv() and must not write
+/// one buffer (a shared one is a race that presents as garbage, not as an error).  The rows path sets its row's slot
+/// before the row's launches; anything else uses slot 0.
+void mv_xf_set_slot(int slot);
 /// The calling thread's launches of mv(), moe_gate_up() and moe_down() read `flag` (a device int) first and do nothing
 /// while it is non-zero - a pipelined window's tokens after a wrong draft (skip_gate sets it from the host's word);
 /// nullptr (the default): no check.
