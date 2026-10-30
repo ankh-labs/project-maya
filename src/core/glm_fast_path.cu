@@ -1088,14 +1088,16 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cudaMemcpy(F->rows_scr, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
                 F->scratch_bytes += extra;
                 size_t f0 = 0, f1 = 0, tot = 0;
-                if (group) {   // the verify window's route state: grouping only
-                    cudaMemGetInfo(&f0, &tot);
-                    if (!win_alloc(kWinMax, err)) return false;
-                    cudaMemGetInfo(&f1, &tot);
-                    F->win_bytes += f0 > f1 ? f0 - f1 : 0;
-                    cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
-                    F->rows_group = R;
-                }
+                // THE WHOLE WINDOW STATE, not just its scratch: row_dev offsets every one of these per row
+                // (W.mplan_ptr + 8*R(i), W.mplan_w, W.mplan_id, W.mfetch + 8*R(i), W.mcpu_part + E*R(i),
+                // W.mcpu_flag + R(i)).  Unallocated, row 0 gets null and row 1 gets address 8 - or E*1 for cpu_part -
+                // exactly the class the two earlier pointer bugs came from.  Row 0 masks all of them.
+                cudaMemGetInfo(&f0, &tot);
+                if (!win_alloc(kWinMax, err)) return false;
+                cudaMemGetInfo(&f1, &tot);
+                F->win_bytes += f0 > f1 ? f0 - f1 : 0;
+                cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
+                F->rows_group = R;
                 F->rows_scr_rows = RT;
                 std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
                              "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
