@@ -310,6 +310,11 @@ struct MoeDev {
     // broke the plain path - measured).  The waiter sets 0xFFFFFFFF before a route ("not yet taken").  LAST field on
     // purpose: a new field in the middle moved every field after it.
     unsigned int* need_seq = nullptr;
+    // The seq the HOST assigned this route, in submission order (0 = let the device counter decide, the old way).  The
+    // device took the next value of one shared counter, so with two streams the ring filled in GPU-execution order while
+    // the service consumes strictly in seq order - a device spinning for a later answer and a service waiting for an
+    // earlier entry that was queued behind that spinner.  Host order == the order the service consumes, by construction.
+    unsigned int hseq = 0;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
@@ -432,6 +437,9 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
 /// moe_wait then moe_fetch as ONE launch (the same effects; STRATA_GLM_SKIP_EMPTY's batched rows): a route with no
 /// disk miss and nothing to fetch costs one near-empty launch instead of two.
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s);
+/// How many rows' wait kernels can be resident at once (the grid is then sized so they fit): the rotor sets this, the
+/// fused path leaves it at 1.  One block per SM per live waiter, and occupancy may allow only one such block.
+void moe_wait_fetch_set_rows(int n);
 /// moe_cpu_wait for the n rows of a batched step in one launch: row r waits for the answer *seq[r] names (0: none) in
 /// the host-mapped CpuAnswer ans[r] and adds it to out[r].
 struct CpuWaitRows {

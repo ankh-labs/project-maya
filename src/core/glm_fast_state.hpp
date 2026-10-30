@@ -970,6 +970,7 @@ struct Glm5Model::FastState {
     std::thread svc;
     std::atomic<bool> quit{false};
     uint64_t clock = 0;
+    uint64_t seq_h = 0;                  // the host's route counter: the seq of the next route it launches
     uint64_t expected = 0;               // requests this half's device has issued (one per MoE layer per token)
     std::atomic<uint64_t> processed{0};  // ... and the service thread has consumed
     // stats (written by the service thread, read by anyone)

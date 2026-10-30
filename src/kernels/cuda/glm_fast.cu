@@ -3906,7 +3906,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     if (tid == 0) bad = a.d.route_error != nullptr && *a.d.route_error != 0 ? 1 : 0;
     __syncthreads();
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
-    if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && ((*a.d.seq + 1) & 4095u) == 0u)
+    if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && (((a.d.hseq != 0u ? a.d.hseq : (*a.d.seq + 1))) & 4095u) == 0u)
         for (int i = tid; i < a.d.n_keys; i += ROUTE_THREADS) a.d.dcnt[i] >>= 1;
     for (int e = tid; e < E; e += ROUTE_THREADS) {
         const float p = 1.0f / (1.0f + expf(-a.logits[e]));
@@ -4016,8 +4016,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 a.d.plan_w[i] = 0.0f;
                 a.d.plan_id[i] = -1;
             }
-            const unsigned int seq = *a.d.seq + 1;
-            *a.d.seq = seq;
+            const unsigned int seq = a.d.hseq != 0u ? a.d.hseq : (*a.d.seq + 1);
+            *a.d.seq = seq;   // always: later kernels in this stream read it as "this route's seq"
             MoeRequest* rq = (MoeRequest*) a.d.ring + (seq % kRingSize);
             rq->layer = a.layer;
             rq->error = bad;
@@ -4196,8 +4196,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         }
         *a.d.pf_n = npf;
         s_npf = npf;
-        const unsigned int seq = *a.d.seq + 1;
-        *a.d.seq = seq;
+        const unsigned int seq = a.d.hseq != 0u ? a.d.hseq : (*a.d.seq + 1);
+        *a.d.seq = seq;   // always: later kernels in this stream read it as "this route's seq"
         s_seq = seq;
         *moe_wseq(a.d) = mask ? seq : 0u;
         if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = cpu ? seq : 0u;
@@ -6484,15 +6484,35 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
     launch_check("moe_fetch");
 }
 
+namespace {
+std::atomic<int> g_wait_rows{1};
+}
+void moe_wait_fetch_set_rows(int n) { g_wait_rows.store(n < 1 ? 1 : n, std::memory_order_relaxed); }
+
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s) {
-    static int sms = 0;
+    // ONE block per SM, and a live waiter occupies every SM it was launched on - so with N rows there are N of these
+    // resident at once.  If occupancy allows only one such block, the second row's waiter can never be scheduled and
+    // the service never sees the seq it is waiting for (the correct seq order is useless if the publisher is not
+    // resident).  Size the grid for the rows that are actually live rather than for the count of SMs.
+    static int sms = 0, grid = 0, grid_rows = 0;
+    const int rows = g_wait_rows.load(std::memory_order_relaxed);
     if (sms == 0) {
         int dev = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
     }
-    moe_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
+    if (grid == 0 || grid_rows != rows) {
+        int nb = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, moe_wait_fetch_kernel, 256, 0) != cudaSuccess ||
+            nb < 1)
+            nb = 1;
+        grid = nb >= rows ? sms : std::max(1, sms / rows);
+        grid_rows = rows;
+        std::fprintf(stderr, "glm pipe: CUDA%d moe_wait_fetch grid %d of %d SM(s): %d block(s) per SM, %d row(s)\n",
+                     d.wait_ch >= 0 ? 0 : 0, grid, sms, nb, rows);
+    }
+    moe_wait_fetch_kernel<<<grid, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
     launch_check("moe_wait_fetch");
 }
 
