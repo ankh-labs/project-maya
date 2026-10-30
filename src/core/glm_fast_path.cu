@@ -760,12 +760,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.attn_norm = f32("attn_norm.weight");
         Ly.ffn_norm = f32("ffn_norm.weight");
         if (Ly.recr) {
-            // v3q keeps these BF16 on disk; a GGUF may do that where Maya's quants quantize them, in which case the
-            // tensor is in dense.bin (w16_) and never reaches ws_map_ - so take the BF16 copy.  The v1.1.40 replay took
-            // upstream's quant-only q() here and the pack stopped loading ("in bf16", nine tensors).
-            Ly.q = q_or_b16("attn_q.weight", g.n_embd, g.d_inner());
-            Ly.k = q_or_b16("attn_k.weight", g.n_embd, g.d_inner());
-            Ly.v = q_or_b16("attn_v.weight", g.n_embd, g.d_inner());
+            Ly.q = q("attn_q.weight");
+            Ly.k = q("attn_k.weight");
+            Ly.v = q("attn_v.weight");
             Ly.f_a = b16("ssm_f_a.weight");
             Ly.g_a = b16("ssm_g_a.weight");
             Ly.f_b = b16("ssm_f_b.weight");
@@ -779,7 +776,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.ssm_norm = f32("ssm_norm.weight");
         } else {
             Ly.q_a = q_or_b16("attn_q_a.weight", g.n_embd, g.q_lora);
-            Ly.q_b = q_or_b16("attn_q_b.weight", g.q_lora, (int64_t) g.n_head * g.qk_nope);
+            Ly.q_b = q("attn_q_b.weight");
             Ly.kv_a = q_or_b16("attn_kv_a_mqa.weight", g.n_embd, g.kv_lora);
             Ly.q_a_norm = f32("attn_q_a_norm.weight");
             Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
@@ -797,14 +794,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
         }
-        Ly.out = q_or_b16("attn_output.weight",
-                          Ly.recr ? (int64_t) g.d_inner() : (int64_t) g.n_head * g.v_head, g.n_embd);
+        Ly.out = q("attn_output.weight");
         if (Ly.moe) {
             Ly.router = b16("ffn_gate_inp.weight");
             Ly.router_bias = f32("exp_probs_b.bias");
             Ly.sh_gate = q("ffn_gate_shexp.weight");
             Ly.sh_up = q("ffn_up_shexp.weight");
-            Ly.sh_down = q_or_b16("ffn_down_shexp.weight", (int64_t) g.n_ff_exp * g.n_shared, g.n_embd);
+            Ly.sh_down = q("ffn_down_shexp.weight");
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
