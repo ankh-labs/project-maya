@@ -918,7 +918,11 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         m.fetch_src = W.mfetch + 8 * R(i);
         m.cpu_part = W.mcpu_part + (size_t) E * R(i);
         m.cpu_flag = W.mcpu_flag + R(i);
-        m.scratch = F->rows_scr + 8 * R(i);
+        // NULL + 8*row is POINTER 8, not null.  rows_scr is allocated only with STRATA_GLM_GROUP_EXPERTS, so with
+        // grouping off (the default) row 0 got a real nullptr and row 1 got address 8: the trailing row's fetched
+        // experts read a scratch slot that is not memory.  No identity check can see it (the tier table is right) and
+        // no fill event can fix it (nothing was late) - which is why it survived five theories and row 0 never showed it.
+        m.scratch = F->rows_scr != nullptr ? F->rows_scr + 8 * R(i) : nullptr;
         // this row's OWN handshake channel: wait_seq[i] and resp[i].  Row 0 is channel 0, exactly the lone token
         // path, so n = 1 is unchanged; n > 1 gives each waiter its own word and answer buffer.
         m.wait_ch = i & 7;
@@ -980,6 +984,12 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         }
     }
     // TRANSFER's marker: this layer's fills are on this stream, so the event completes when the last of them lands.
+    if (rows_per_row_ && F->plan_cap != nullptr && il < F->plan_cap_layers && rb < F->plan_cap_rows) {
+        const size_t off = ((size_t) rb * F->plan_cap_layers + (size_t) il) * 8;
+        cudaMemcpyAsync(F->plan_cap + off, W.mplan_ptr + 8 * R(0), 8 * sizeof(unsigned long long),
+                        cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(F->plan_id_cap + off, W.mplan_id + 8 * R(0), 8 * sizeof(int), cudaMemcpyDeviceToHost, s);
+    }
     if (rows_per_row_ && !empty && il < (int) F->ev_fill.size() && F->ev_fill[(size_t) il] != nullptr) {
         if (il < (int) F->ev_fill_gen.size()) F->ev_fill_gen[(size_t) il] = F->step_seq;   // stamp BEFORE the record
         cudaEventRecord(F->ev_fill[(size_t) il], s);
@@ -1182,6 +1192,17 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // The embed, the bind and the boundary all ran on F->cs; row 1 computes on F->cs2, and on one stream that
         // ordering was implicit.  Without this the second row's first layer can read its x before the embed that writes
         // it has run - a sporadic non-finite score a layer or two in, i.e. arithmetic, not an index fault.
+        if (F->plan_cap == nullptr) {
+            F->plan_cap_rows = n;
+            F->plan_cap_layers = l1_;
+            if (cudaHostAlloc((void**) &F->plan_cap, (size_t) n * l1_ * 8 * sizeof(unsigned long long),
+                              cudaHostAllocMapped) != cudaSuccess ||
+                cudaHostAlloc((void**) &F->plan_id_cap, (size_t) n * l1_ * 8 * sizeof(int),
+                              cudaHostAllocMapped) != cudaSuccess) {
+                F->plan_cap = nullptr;
+                F->plan_id_cap = nullptr;
+            }
+        }
         ++F->step_seq;   // every arrival answer below is about THIS step
         gf::nonfinite_reset();
         cudaEventRecord(F->ev_hop, F->cs);
@@ -1314,8 +1335,41 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 static std::atomic<bool> told{false};
                 {
                     static std::atomic<bool> once{false};
-                    if (!once.exchange(true))
+                    if (!once.exchange(true)) {
                         gf::pipe_probe_report(serial ? "serial" : "overlap");
+                        if (F->plan_cap != nullptr) {   // diagnostic: one sync, at the end of the step
+                            cudaStreamSynchronize(F->cs);
+                            cudaStreamSynchronize(F->cs2);
+                            int bad_rows = 0;
+                            for (int r2 = 0; r2 < F->plan_cap_rows; ++r2) {
+                                int bad = 0, first_il = -1, first_id = -1, first_key = -1;
+                                for (int l2 = 0; l2 < F->plan_cap_layers; ++l2) {
+                                    if (l2 < l0_ || l2 >= l1_) continue;
+                                    const size_t off = ((size_t) r2 * F->plan_cap_layers + (size_t) l2) * 8;
+                                    auto& P2 = F->lp[(size_t) l2];
+                                    for (int e = 0; e < 8; ++e) {
+                                        const unsigned long long ptr = F->plan_cap[off + e];
+                                        if (ptr == 0ull) continue;
+                                        const int slot = P2.slot_index(ptr);
+                                        if (slot < 0 || slot >= P2.n) { ++bad; if (first_il < 0) { first_il = l2; first_id = F->plan_id_cap[off + e]; first_key = -1; } continue; }
+                                        if (P2.key[(size_t) slot] != F->plan_id_cap[off + e]) {
+                                            ++bad;
+                                            if (first_il < 0) { first_il = l2; first_id = F->plan_id_cap[off + e];
+                                                                first_key = P2.key[(size_t) slot]; }
+                                        }
+                                    }
+                                }
+                                if (bad > 0) {
+                                    ++bad_rows;
+                                    std::fprintf(stderr, "glm pipe: CUDA%d IDENTITY row %d: %d plan entr(ies) name a slot "
+                                                         "holding another expert; first at layer %d (id %d, slot holds %d)\n",
+                                                 dev_, r2, bad, first_il, first_id, first_key);
+                                }
+                            }
+                            std::fprintf(stderr, "glm pipe: CUDA%d IDENTITY rows with a mismatched plan: %d of %d\n", dev_,
+                                         bad_rows, F->plan_cap_rows);
+                        }
+                    }
                 }
                 const uint64_t fb = F->md_fallbacks.load(std::memory_order_relaxed);
                 if (fb > 0)
