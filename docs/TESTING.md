@@ -348,3 +348,30 @@ run with a live heap overflow - fix both.
 The count audit compared `15ff4f1` against the rebased tree: **both post-rebase**, so it could not see this. The audit
 that finds dropped code is against `cd52717` - the tree with evidence of working. `pub_ch`-style counts, three boots and
 log-verified arms all still stand; the *reference* was wrong.
+
+### Correction on the restored `wait_ch` line: real regression, not this wedge
+
+Three boots with `m.wait_ch = R(i) & 7` restored and the response array separated: **0/3 clean** (one drain at layer 29,
+two NON-FINITE at layers 34 and 27, 3-4 s).
+
+Why the restored line did not move the fault, stated plainly:
+
+- **`ch 1` hand-outs were already non-zero before the restore** (84..756 across earlier boots), and `resp.seq[1]` already
+  held real sequences (2683, 3623, 3493). So the per-channel path was already live for row 1: the route kernel's `MoeDev`
+  comes from `fast_moe_experts`, which sets `md.wait_ch = r & 7` itself. The `row_dev` line is a *second* assignment on a
+  path the rotation does not take.
+- So the reverted line is a **genuine regression restored** - every neighbouring line in that lambda indexes by `R(i)` and
+  the comment says "this row's OWN handshake channel" - but it is not the wedge.
+
+`wait_seq[1] = 0` also reads differently now: `*moe_wseq(a.d) = mask ? seq : 0u`, so a zero means the last route on that
+channel had **nothing to wait for** (mask 0), which is ordinary, not an unexercised channel.
+
+### What remains, unchanged by any fix so far
+
+Every drain boot tonight, across every build, reports the same five facts together: both compute streams `NotReady`,
+prefetch/copy lanes idle, `ev_fill` for the stuck layer **recorded by nobody this step**, `ev_layer` recorded by the row
+that was waiting, and no wait word outstanding. The stuck layer wanders (17, 29, 34, 40, 41, 43). That is a stream
+waiting on an event whose arrival never happens, on a path where the host has nothing left to answer.
+
+Next instrument is the one already designed and not yet built: **stage events per row per layer** on the row's own
+stream, so the first event that never retires names the stage rather than the layer.
