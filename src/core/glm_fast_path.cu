@@ -710,10 +710,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
     {
-        static const int pipe_mode = [] {
-            const char* v = getenv("STRATA_GLM_LAYER_PIPE");
-            return v != nullptr ? std::atoi(v) : 0;
-        }();
+    // ONE READER OF THE MODE.  This local lambda defaulted to 0 while layer_pipe_mode() defaults to 2, so with the
+    // variable UNSET the rotor engaged and the runtime was never created.  A default is a contract: every reader of
+    // the thing it defaults has to honour it.
+    const int pipe_mode = glmfast::layer_pipe_mode();
         if (pipe_mode >= 2) {
             F->pipe.reset(new PipeRuntime());
             F->pipe->start();
@@ -1103,7 +1103,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // and the route kernel dereferences the scratch ARRAY whenever a route finds no free spare (glm_fast.cu:4199,
         // 'ptr = a.d.scratch[i]').  With rows_scr unallocated that read is address 8*i - garbage slots for whichever row
         // is not row 0.  Gating the allocation on grouping left the pipeline without scratch entirely.
-        static const bool pipe_scratch = getenv("STRATA_GLM_LAYER_PIPE") != nullptr;
+        const bool pipe_scratch = glmfast::layer_pipe_mode() >= 2;   // MODE, not presence: unset means 2
         const bool group = glmfast::group_experts_on();
         if ((group || pipe_scratch) && rows_ != nullptr) {
             // (STRATA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
