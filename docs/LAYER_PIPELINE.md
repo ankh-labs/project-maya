@@ -673,3 +673,28 @@ that only exists on that path.
 A `[engine env]` dump was added to `child_env()` in serve/server.py (sorted MAYA_/STRATA_ pairs, to stderr) but did not
 land in maya-v3q-q4.log, so it must be written to a file before it can be diffed.  That is the next step: one file per
 boot, diff the two.
+
+#### The crash explained: a default honoured by ONE of four readers
+
+`STRATA_GLM_LAYER_PIPE` had four read sites and `eb41f73`'s default-to-2 reached only one of them:
+
+| site | read | unset meant |
+|---|---|---|
+| `glm_memory.hpp` `layer_pipe_mode()` | mode, default 2 | **2** - rotor engages |
+| `glm_fast_path.cu:669` local lambda | mode, default 0 | 0 - **no PipeRuntime** |
+| `glm_fast_path.cu:1067` `pipe_scratch` | presence (`!= nullptr`) | false - **no rows_scr** |
+| `glm_rows.cu:221` `pipe_flag_on` | presence + >= 2 | false - ladder assertion never runs |
+
+So with the variable UNSET the rotor ran with no per-row scratch and no runtime: the route kernel's
+`ptr = a.d.scratch[i]` read address `8*i`, i.e. garbage slots for every row but row 0 - the illegal access in
+mv / mla_q_abs / dsa_select_all / kv_q4, and it needs a non-row-0 row, which is why n=1 never crashed.
+
+Shell runs set the variable, so all four agreed. Config runs relied on the new default, so one said yes and three said
+no. **Delivery was never the variable; presence was.** The test matrix had no cell for "unset, relying on the default".
+
+All four now read `glmfast::layer_pipe_mode()`. Measured after: config-only delivery, ZERO shell keys, two concurrent
+requests - **2/2 boots clean, 64 tokens each, 0 errors, rotor on 31 steps, no declines** (before: 3/3 crashes).
+
+**The shape, for the record:** this is the same class as the de-fused root cause. There a per-row structure was built
+by only one of two paths; here a default was honoured by only one of four readers. A default is a contract, and
+introducing one means auditing every reader of the thing it defaults.
