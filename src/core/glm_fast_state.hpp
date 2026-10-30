@@ -389,25 +389,36 @@ namespace gf = strata::kernels::glmf;
 // but the runtime, its liveness proof and its shutdown path are real now.
 struct PipeRuntime {
     std::atomic<bool> stop{false};
-    std::atomic<uint64_t> n_submit{0}, n_transfer{0}, n_retire{0};
+    // HEARTBEATS: proof a thread is alive.  MONOTONE PROGRESS: proof it is doing work.  They are separate on purpose -
+    // a thread that starts, runs and then blocks forever on a phase that never advances reads healthy through a
+    // heartbeat, and reads healthy through a once-only latch.  The watchdog distinguishes the two with these.
+    std::atomic<uint64_t> hb_submit{0}, hb_transfer{0}, hb_retire{0};
+    std::atomic<uint64_t> layers_submitted{0}, transfers_done{0}, tokens_retired{0};
     std::thread t_submit, t_transfer, t_retire;
     std::mutex mu;
     std::condition_variable cv;
 
-    void idle(std::atomic<uint64_t>& n) {
+    void idle(std::atomic<uint64_t>& hb) {
         while (!stop.load(std::memory_order_acquire)) {
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait_for(lk, std::chrono::milliseconds(2));
             }
-            n.fetch_add(1, std::memory_order_relaxed);
+            hb.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
+    /// Total work completed, in any unit (a layer submitted, a transfer finished, a token retired).  The watchdog takes
+    /// two samples: equal totals with all three threads alive is a stall; a rising total is a slow run.
+    uint64_t progress() const {
+        return layers_submitted.load(std::memory_order_acquire) + transfers_done.load(std::memory_order_acquire) +
+               tokens_retired.load(std::memory_order_acquire);
+    }
+
     void start() {
-        t_submit = std::thread([this] { idle(n_submit); });
-        t_transfer = std::thread([this] { idle(n_transfer); });
-        t_retire = std::thread([this] { idle(n_retire); });
+        t_submit = std::thread([this] { idle(hb_submit); });
+        t_transfer = std::thread([this] { idle(hb_transfer); });
+        t_retire = std::thread([this] { idle(hb_retire); });
     }
 
     void shutdown() {
@@ -421,8 +432,8 @@ struct PipeRuntime {
     /// Liveness gate: every thread must have run at least once.  Checked at startup, so a thread that failed to start
     // (or a future refactor that leaves one idle) is loud.
     bool all_alive() const {
-        return n_submit.load(std::memory_order_acquire) > 0 && n_transfer.load(std::memory_order_acquire) > 0 &&
-               n_retire.load(std::memory_order_acquire) > 0;
+        return hb_submit.load(std::memory_order_acquire) > 0 && hb_transfer.load(std::memory_order_acquire) > 0 &&
+               hb_retire.load(std::memory_order_acquire) > 0;
     }
 };
 

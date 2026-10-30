@@ -674,9 +674,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->pipe->start();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             const bool live = F->pipe->all_alive();
-            std::fprintf(stderr, "glm pipe: CUDA%d runtime up: submit=%llu transfer=%llu retire=%llu %s\n", dev_,
-                         (unsigned long long) F->pipe->n_submit.load(), (unsigned long long) F->pipe->n_transfer.load(),
-                         (unsigned long long) F->pipe->n_retire.load(),
+            std::fprintf(stderr, "glm pipe: CUDA%d runtime up: hb=%llu/%llu/%llu %s\n", dev_,
+                         (unsigned long long) F->pipe->hb_submit.load(), (unsigned long long) F->pipe->hb_transfer.load(),
+                         (unsigned long long) F->pipe->hb_retire.load(),
                          live ? "(all three threads ran)" : "(A THREAD NEVER RAN - the runtime is not usable)");
         }
     }

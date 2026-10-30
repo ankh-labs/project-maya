@@ -1158,6 +1158,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // floor starts at the first layer and only moves forward; a slot may not run past floor + S.  The leader is
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
+        const uint64_t pipe_p0 = F->pipe ? F->pipe->progress() : 0;   // the watchdog's first sample
         F->pipe_active.store(true, std::memory_order_release);   // from here the boundary's eviction rule applies
         // The rotor's skew IS the lead: row r runs layer k - r, so the spread is exactly n - 1.  S must be at least that
         // or the invariant would forbid the very advance it is meant to allow; the pin set is S x N x 8 slots.
@@ -1184,6 +1185,18 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         }
         row_base_ = 0;
         rows_stream_ = nullptr;
+        // STALL vs SLOW: the runtime's threads can all be alive and none advancing - a thread blocked on a phase that
+        // never advances reads healthy through a heartbeat and through any once-only latch.  Equal progress across a
+        // whole step, with the runtime up, is a stall; a rising total is a slow run.  Said once, not per step.
+        if (F->pipe) {
+            const uint64_t p1 = F->pipe->progress();
+            if (p1 == pipe_p0) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "glm pipe: no progress across a step (submit/transfer/retire all alive, none "
+                                         "advancing) - expected until the queues are wired\n");
+            }
+        }
         F->pipe_active.store(false, std::memory_order_release);   // the step's layers are done: the fused rule resumes
         F->pipe_floor.store(-1, std::memory_order_release);
         // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
