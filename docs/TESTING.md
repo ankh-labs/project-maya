@@ -285,3 +285,29 @@ the slots worked.
 **Consequence for the record: no build before `bf3b16f` had a working answer path - including every build tonight called
 verified, and including the `cd52717` baseline whose 796 rotor entries were treated as the known-good state.** If the
 allocations separated at `bf3b16f` make `n = 2` survive, that baseline was lucky rather than correct.
+
+## 2026-10-30 — STREAM_FETCH=0 re-tested three times: the stream-fetch path is dead
+
+| boot | result | face |
+|---|---|---|
+| 1 | -1 + -1, 2.7 s | `NON-FINITE SCORE` at layer 24 (x2) |
+| 2 | -1 + -1, 3.2 s | **`row lane (cs2): an illegal memory access was encountered`** |
+| 3 | -1 + -1, 22.9 s | drain: `NotReady: cs(row0) cs2(row1)`, layer 40, `ev_fill` generation stale, `wait_seq 1=0` |
+
+With the flag off the stream mask is zero and `moe_stream_copy` is never entered, so the mask leak cannot be reached -
+and 0/3 clean means the stream-fetch path is **not** the cause. The earlier one-boot "falsification" is now a proper
+three-boot one, reached from the other direction: not "it still fails, so it is innocent" but "it fails with the
+path disabled, so disabling it proves nothing".
+
+The per-channel + single-read fix (mask and `s_sm` through `moe_wseq(d)` / `moe_resp_ch(d)`, one read per field)
+**stays** - it removes a real cross-channel leak and a host-write race that were genuine - but it is a correctness fix,
+not this fault's fix, and it will be built and run with the flag ON so the instrument sits on the path production uses.
+
+**New signal worth holding:** the illegal memory access has now appeared twice today, both on `cs2` and both after a
+rotor run of several steps. It is reported through `cudaStreamQuery` on that stream, so it is a genuine device fault, not
+a diagnostic artefact.
+
+Next: **stage events** per row per layer (route -> fetch -> mixer -> FFN -> head), so the first event that never retires
+names the stage. The layer sweep has already shown that a layer number alone cannot distinguish a parked wait from a
+stuck kernel, and both compute streams being `NotReady` with no host wait outstanding puts the answer in that
+distinction.

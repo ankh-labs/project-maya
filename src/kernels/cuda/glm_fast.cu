@@ -4545,11 +4545,27 @@ __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16)
 // STRATA_GLM_STREAM_FETCH: the response's streamed entries (posted before their disk reads finished).  0 when the
 // route had no disk misses, or the answer is not this route's (a wait that gave up).
 __device__ unsigned int moe_stream_mask(const MoeDev& d) {
+    // PER CHANNEL (2026-10-30).  These two reads used to take channel 0's word and channel 0's answer whatever the
+    // route's own channel was, so row 1 - wait_ch = 1 - picked up CHANNEL 0's stream_mask and fed it to its own fetch.
+    // That is not harmless at the resting state; it is armed by it: the resting state has wait_seq[0] == resp[0].seq
+    // (measured 2296/2296, 4112/4112, 3634/3634), so the comparison MATCHES and a non-zero channel-0 mask leaks into
+    // row 1's fetch, whose blocks then wait on ready bits nothing will set for it.
+    //
+    // Stable as well as correct: a channel's word cannot change under this kernel, because the same channel's next
+    // publish is the next route on the same stream (ordered after), and the host answers in order too.  That is what
+    // moe_stream_copy's "all-or-none __syncthreads" invariant needs - a per-block read of a word the host mutates
+    // between blocks was the other half of the hazard.
     if (d.wait_seq == nullptr || d.resp == nullptr) return 0u;
-    const unsigned int need = *(volatile const unsigned int*) d.wait_seq;
+    // wait_seq is device-written and stream-ordered (the next publish is the next route on this stream), so it is
+    // stable under this kernel.  resp[ch] is NOT: the host service writes it asynchronously, with no ordering against a
+    // running kernel.  So read each field ONCE into a local and decide from the locals - a comparison that re-reads can
+    // straddle the host's write and match on one generation while taking the next one's mask.
+    const unsigned int need = *moe_wseq(d);
     if (need == 0u) return 0u;
-    const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
-    return r->seq == need ? r->stream_mask : 0u;
+    const volatile MoeResponse* r = moe_resp_ch(d);
+    const unsigned int sq = r->seq;
+    const unsigned int sm = r->stream_mask;
+    return sq == need ? sm : 0u;
 }
 
 // entry i of a streamed response: each chunk copied from its RAM landing slot once the host's read of it set its
@@ -4558,7 +4574,7 @@ __device__ unsigned int moe_stream_mask(const MoeDev& d) {
 // is split between them.  A bit that never comes gives up after ~60 s like moe_wait.  (Every value deciding this
 // block's path is the same for all its threads: the __syncthreads below are reached by all or none.)
 __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_t* t) {
-    const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
+    const volatile MoeResponse* r = moe_resp_ch(d);   // this channel's answer, not channel 0's
     const int rch = r->s_chunks;
     const unsigned long long gu = r->s_gu, dn = r->s_dn;
     const int nb = 3 * rch, G = (int) gridDim.x, b = (int) blockIdx.x;
@@ -4670,8 +4686,15 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
     if (tid < 8) s_src[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
     __shared__ unsigned int s_sm;   // STRATA_GLM_STREAM_FETCH's streamed entries (block 0 reset wait_seq: s_need)
     if (tid == 0)
-        s_sm = s_need != 0u && d.resp != nullptr && ((volatile const MoeResponse*) d.resp)->seq == s_need
-                   ? ((volatile const MoeResponse*) d.resp)->stream_mask : 0u;
+    {
+        // ONE read of each field, then the decision, then the block broadcast that is already there (__syncthreads below).
+        // Three separate volatile reads against a host-written answer let block A see s_sm = 0 and block B see a mask,
+        // which breaks moe_stream_copy's all-or-none barrier invariant - the same hang from timing instead of channel.
+        const volatile MoeResponse* r = moe_resp_ch(d);
+        const unsigned int sq = r->seq;
+        const unsigned int sm = r->stream_mask;
+        s_sm = (s_need != 0u && sq == s_need) ? sm : 0u;
+    }
     __syncthreads();
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = s_src[i];

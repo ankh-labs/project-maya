@@ -1725,13 +1725,20 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                             }
                             (void) cudaGetLastError();
                         }
+                    // EVERY STREAM, not just the rows'.  Both cs and cs2 were NotReady in the first two boots that
+                    // reported this, which no single row's own work explains: a shared dependency - the prefetch lanes or
+                    // the copy lane - would hold both, and then the rows' streams are victims rather than culprits.
                     why += "; NotReady:";
                     {
-                        const cudaError_t r2 = cudaStreamQuery(F->cs2);
-                        const cudaError_t e2 = cudaStreamQuery(F->cs);
-                        (void) cudaGetLastError();
-                        if (r2 == cudaErrorNotReady) why += " cs2(row 1)";
-                        if (e2 == cudaErrorNotReady) why += " cs(row 0)";
+                        struct SName { cudaStream_t s; const char* n; };
+                        const SName all[5] = {{F->cs, " cs(row0)"}, {F->cs2, " cs2(row1)"}, {F->ps, " ps(prefetch)"},
+                                              {F->ps2, " ps2(prefetch2)"}, {F->copy, " copy"}};
+                        for (int k2 = 0; k2 < 5; ++k2) {
+                            if (all[k2].s == nullptr) continue;
+                            const cudaError_t q4 = cudaStreamQuery(all[k2].s);
+                            (void) cudaGetLastError();
+                            if (q4 == cudaErrorNotReady) why += all[k2].n;
+                        }
                     }
                     why += "; lowest incomplete layer " + (stuck >= 0 ? std::to_string(stuck) : std::string("none")) +
                            " of " + std::to_string(l0_) + ".." + std::to_string(l1_ - 1);
