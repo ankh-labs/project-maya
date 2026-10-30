@@ -1185,7 +1185,25 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // the handshake channel both key off row_base_, so they cannot collide.
         // BISECT: the same rotation with both rows on ONE stream separates a slicing bug (wrong output either way)
         // from a genuine race (right output serial, wrong when overlapped).
-        static const bool serial = getenv("STRATA_GLM_PIPELINE_SERIAL") != nullptr;
+        // RUNTIME ARM SWITCH.  This used to be `static const bool serial = getenv(...)`: fixed at process start, so
+        // serial and overlap could never be compared inside one boot - and every cross-boot comparison on this branch
+        // has misled at least once.  A one-character file is read at most every 200 ms ('s' = both rows on one stream,
+        // anything else = overlap), which is outside the service loop and costs one stat per 200 ms.  The environment
+        // still sets the default when the file is absent.
+        static const bool serial_default = getenv("STRATA_GLM_PIPELINE_SERIAL") != nullptr;
+        const bool serial = [&] {
+            static bool cur = serial_default;
+            static auto last = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::milliseconds(200)) return cur;
+            last = now;
+            if (FILE* f = std::fopen("strata-pipe-arm.txt", "r")) {
+                char c = 0;
+                if (std::fread(&c, 1, 1, f) == 1) cur = (c == 's' || c == 'S');
+                std::fclose(f);
+            }
+            return cur;
+        }();
         const int L = l1_ - l0_;
         // floor starts at the first layer and only moves forward; a slot may not run past floor + S.  The leader is
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
