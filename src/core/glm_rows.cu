@@ -823,6 +823,10 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
         const MoeIo io = {rows(S->x, E, R(i)), rows_q(S->xq, E, R(i)), rows(S->rlog, g.n_expert, R(i)),
                           rows(S->sh_g, FFs, R(i)), rows(S->sh_u, FFs, R(i)), rows(S->ffn, E, R(i))};
         if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
+        // TRANSFER's honest producer on the path that actually runs: one per row per layer, issued here rather than in
+        // rows_moe_grouped (which never executes with grouping off - a counter there read zero forever and I read the
+        // zero as 'every layer was empty').
+        if (rows_per_row_ && F->pipe) F->pipe->transfers_done.fetch_add(1, std::memory_order_relaxed);
         // the route log: this row's ids are still the plan's (the next row's route overwrites them); the copy is
         // async and the line prints one step later, when the previous step's copies are done - nothing syncs
         if (rows_route_log_on() && l0_ == 0 && i < 2 && rb == 0)
@@ -966,12 +970,10 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
             // state the first fetch already updated, so the plans and the slot contents disagree (an illegal access)
         } else if (skip_empty) {
             gf::moe_wait_fetch(m, E, K, Ly.blob, s);
-            if (rows_per_row_ && F->pipe) F->pipe->transfers_done.fetch_add(1, std::memory_order_relaxed);
         } else {
             gf::moe_wait(m, E, s);
             gf::moe_fetch(m, K, Ly.blob, s);
             // the counter is incremented where the copy is ISSUED, by the thread that issued it
-            if (rows_per_row_ && F->pipe) F->pipe->transfers_done.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (rows_pf == 2 && !empty) {   // every route is on the compute stream: the fetches follow it, on the side stream
@@ -1333,9 +1335,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             }
             {
                 static std::atomic<bool> told{false};
+                // DIAGNOSTICS OFF BY DEFAULT: both the probe report and the identity check SYNCHRONISE the host, and a
+                // host sync while a device kernel waits for a host answer (a CPU-lane route) is a deadlock the
+                // instrument creates.  STRATA_GLM_PIPE_DIAG=1 turns them back on for a measurement run.
                 {
+                    static const bool diag = getenv("STRATA_GLM_PIPE_DIAG") != nullptr;
                     static std::atomic<bool> once{false};
-                    if (!once.exchange(true)) {
+                    if (diag && !once.exchange(true)) {
                         gf::pipe_probe_report(serial ? "serial" : "overlap");
                         if (F->plan_cap != nullptr) {   // diagnostic: one sync, at the end of the step
                             cudaStreamSynchronize(F->cs);
