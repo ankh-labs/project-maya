@@ -442,6 +442,12 @@ void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaS
 /// How many rows' wait kernels can be resident at once (the grid is then sized so they fit): the rotor sets this, the
 /// fused path leaves it at 1.  One block per SM per live waiter, and occupancy may allow only one such block.
 void moe_wait_fetch_set_rows(int n);
+/// DIAGNOSTIC for the de-fused arm: record the EARLIEST (layer, stage, row) whose buffer reads non-finite, so one run
+/// enumerates every remaining cross-stream dependency instead of one rebuild a gap.  Off the fused path: the only caller
+/// is the per-row rotor.  A stage boundary names the producer, a layer number on its own does not.
+void nonfinite_probe(const float* p, int n, int code, cudaStream_t s);
+void nonfinite_reset();
+int nonfinite_take();   // -1: nothing non-finite since the reset
 /// moe_cpu_wait for the n rows of a batched step in one launch: row r waits for the answer *seq[r] names (0: none) in
 /// the host-mapped CpuAnswer ans[r] and adds it to out[r].
 struct CpuWaitRows {
