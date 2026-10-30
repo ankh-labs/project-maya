@@ -421,6 +421,9 @@ struct PipeRuntime {
 
     /// Set by the rotor (a pipeline step is in flight).  The watchdog reads it so it never reports a stall while the
     /// fused path is the only thing running - which is always, until the queues are wired.
+    // Rows that asked for a layer another row was already computing.  Fed by real traffic: if this stays 0 the
+    // same-layer race was never the cause and partitioning spares would have been wasted work.
+    std::atomic<uint64_t> layer_busy{0};
     std::atomic<int> watch_active{0};
     std::atomic<int> stalls_seen{0};
 
