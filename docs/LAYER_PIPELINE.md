@@ -600,3 +600,31 @@ fetch" hypothesis is false on this box - the pool fits in memory, not in VRAM.
 
 Consequence: a per-row copy lane has real latency to hide (~1.3 ms a layer), so it is worth building; the shared copy
 stream was the wrong shape, not a solution to a non-problem.
+
+## 2026-10-30 (counted misses + per-row copy lane) — the lane does not pay
+
+### Counted, not derived (STRATA_GLM_MISS_LOG=1, per step, both rows)
+
+    MISS step 430: 140 experts over PCIe, 1417.33 MB  (3.11 experts, 31.50 MB a layer)
+    MISS step 431:  94 experts,  948.22 MB            (2.09 experts, 21.07 MB a layer)
+    MISS step 432: 117 experts, 1212.96 MB            (2.60 experts, 26.95 MB a layer)
+    MISS step 433: 108 experts, 1074.63 MB            (2.40 experts, 23.88 MB a layer)
+    MISS step 434:  88 experts,  884.41 MB            (1.96 experts, 19.65 MB a layer)
+
+So ~2-3 experts and 20-31 MB per layer across BOTH rows: about 10-16 MB and 1-1.5 experts per row per layer.  The
+derivation from the hit rate (2.3 experts / 22 MB per row) was about 2x high, and the hit rate itself moved 71% -> 83.5%
+between requests, which is exactly why it should not be the figure of record.
+
+### Per-row copy lane (a copy stream each, STRATA_GLM_COPY_LANE=1)
+
+    paired deltas: +0.66 +0.96 -0.07 -0.19 -0.59 +0.51     3/6 positive, median ~ +0.24
+    serial  n=6  median 30.95      overlap n=6  median 31.62
+    baseline for comparison:       serial 31.36, overlap 33.37, paired +1.2
+
+The per-row lane removes the shared-stream serialisation and the advantage still disappears: overlap is ~5% slower than
+its own baseline and the paired delta collapses from +1.2 to ~0.  Reading: the two rows ALREADY hide each other's PCIe
+latency in the baseline; moving the copy to a separate stream adds two event round trips a layer and buys back less than
+it costs.  The row-vs-row overlap was doing this job all along.
+
+Default off.  The copy lane would need a workload where the rows do not already cover each other - the disk-tier case
+this design kept in - or a fetch that is a large fraction of a layer, which 1-1.5 experts/row is not.

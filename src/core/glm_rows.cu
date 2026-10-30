@@ -1267,6 +1267,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             S->cur[r].deferred = 0;
             S->cur[r].done = false;
         }
+        if ((int) F->miss_layer.size() < l1_) {   // counted misses, one bucket a layer
+            F->miss_layer.assign((size_t) l1_, 0);
+            F->bytes_layer.assign((size_t) l1_, 0);
+        }
         if ((int) F->ev_layer.size() < l1_) {   // one event a layer, created once
             const size_t had = F->ev_layer.size();
             F->ev_layer.resize((size_t) l1_, nullptr);
@@ -1363,6 +1367,25 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 S->cur[r].deferred = 0;
                 if (S->cur[r].il >= l1_) S->cur[r].done = true;
                 else all_done = false;
+            }
+        }
+        {
+            static const bool misslog = getenv("STRATA_GLM_MISS_LOG") != nullptr;
+            if (misslog) {   // the figure the copy lane is judged against, COUNTED rather than derived from a hit rate
+                static uint64_t lm = 0, lb = 0;
+                uint64_t tm = 0, tb = 0;
+                for (int i2 = 0; i2 < (int) F->miss_layer.size(); ++i2) {
+                    tm += F->miss_layer[(size_t) i2];
+                    tb += F->bytes_layer[(size_t) i2];
+                }
+                const uint64_t dm = tm - lm, db = tb - lb;
+                lm = tm;
+                lb = tb;
+                std::fprintf(stderr, "glm pipe: CUDA%d MISS step %u: %llu experts over PCIe, %.2f MB (%d layers, "
+                                     "%.2f experts and %.2f MB a layer)\n",
+                             dev_, F->step_seq, (unsigned long long) dm, (double) db / 1e6,
+                             std::max(1, l1_ - l0_), (double) dm / std::max(1, l1_ - l0_),
+                             (double) db / 1e6 / std::max(1, l1_ - l0_));
             }
         }
         gf::moe_wait_fetch_set_rows(1);

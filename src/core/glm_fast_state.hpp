@@ -482,6 +482,7 @@ struct PipeRuntime {
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    cudaStream_t ps2 = nullptr;   // a SECOND copy lane: one per row, so two rows' fetches never serialise
     // A SECOND compute stream, for the cross-token layer pipeline (docs/LAYER_PIPELINE.md): a row's layers stay in order
     // on their own stream, and two rows on cs and cs2 overlap.  Null unless the pipeline asks for it.
     cudaStream_t cs2 = nullptr;
@@ -537,6 +538,10 @@ struct Glm5Model::FastState {
     // waited on by the copy stream, then recorded there and waited on by the compute stream before the experts read
     // the slots.  Per layer is enough because no two rows occupy one layer; a single shared event would be the ev_pf
     // collision again.
+    // COUNTED, not derived from the hit rate: per layer, the experts that crossed PCIe and the bytes they moved.  A hit
+    // rate is a proxy judged on wall time; deriving wall time FROM it inherits the proxy's error - and it moved 71% to
+    // 83.5% across two requests, which is a 2x swing in the figure the copy lane is judged against.
+    std::vector<uint64_t> miss_layer, bytes_layer;
     std::vector<cudaEvent_t> ev_copy;
     std::vector<unsigned int> ev_fill_gen;   // the step_seq that recorded ev_fill[il] (0 = never)
     unsigned int step_seq = 0;
