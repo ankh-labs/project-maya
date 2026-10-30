@@ -491,3 +491,34 @@ The copy is still issued on the compute stream; TRANSFER records an event but do
 measures de-fused SCHEDULING without copy/compute overlap — a small win is the honest expectation, and ~0% would not
 have been a failure of the design either.  The spec's copy-stream move is the change that would produce a real
 overlap win, and it is still outstanding.
+
+## 2026-10-30 (later) — the runtime arm switch, and what the old method was hiding
+
+The arm was `static const bool serial = getenv(...)`, fixed at process start, so an A/B inside one boot was impossible.
+It is now a one-character file read at most every 200 ms ("s" = serial, anything else = overlap), outside the service
+loop.
+
+### ONE boot, alternating arm per measurement (both prompts every time, 32 tokens each)
+
+| run | arm     | tokens | sec  | tok/s |
+|-----|---------|--------|------|-------|
+| 1   | overlap | 64     | 4.15 | 15.4  |  (cold)
+| 2   | serial  | 64     | 2.30 | 27.8  |  (discarded)
+| 3   | overlap | 64     | 1.92 | 33.3  |
+| 4   | serial  | 64     | 2.04 | 31.4  |
+| 5   | overlap | 64     | 1.85 | 34.6  |
+| 6   | serial  | 64     | 2.15 | 29.8  |
+
+Valid (first pair discarded): serial n=2 **30.5 tok/s** (31.4, 29.8); overlap n=2 **34.0 tok/s** (33.3, 34.6).
+
+### The cross-boot measurement was not just noisy - it was wrong by 2.3x
+
+The earlier alternating-boot design reported 14.4 / 15.6 tok/s for the same arms and the same work.  Every one of those
+runs paid a cold start inside its own measurement; inside a single warm process the same code runs at 30/34.  The delta
+also changed: +8 % cross-boot, **+11 % in-boot**.  Both the level and the comparison were distorted, which is exactly
+what "measure inside one boot" was meant to prevent.
+
+### Still true
+
+The copy is issued on the compute stream, so this is scheduling overlap only; the +11 % is in the range that argument
+predicts, and the copy-stream move is the change that would show a real overlap win.
