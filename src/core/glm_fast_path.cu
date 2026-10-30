@@ -4821,6 +4821,16 @@ void Glm5Model::fast_service() {
             // comment that says ans_h covers tokens 1.., so it needs no case.
             else if (rq->win == 0 && rq->ch > 0 && rq->ch < 16 && F->win.ans_h[rq->ch] != nullptr)
                 ans = F->win.ans_h[rq->ch];
+            {
+                // THREE, once: what the row's route actually presents, and which slot the service chose for it.  The
+                // device spins on ans->seq == *d.cpu_seq, so a wrong ans pointer and a wrong seq are the only two ways
+                // the wait can be unsatisfiable - this line separates them.
+                static std::atomic<int> told_cpu{0};
+                if (told_cpu.fetch_add(1) < 3)
+                    std::fprintf(stderr, "glm cpu-lane: ch=%u win=%u cpu_mask=0x%x ans=%p (cpu_ans_h=%p ans_h1=%p) "
+                                         "seq=%u\n", rq->ch, rq->win, rq->cpu_mask, (void*) ans,
+                                 (void*) F->cpu_ans_h, (void*) F->win.ans_h[1], next);
+            }
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
