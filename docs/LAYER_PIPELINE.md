@@ -654,3 +654,22 @@ this design kept in - or a fetch that is a large fraction of a layer, which 1-1.
 5. Remaining hypothesis, and it fits the engine's own last words ("exit code 1 ... the usual cause is running out of
    RAM"): the machine was downloading 156 GB and hashing it (Maya-L) at the time.  A repeatability run of four
    identical boots is in progress; if any of them crashes under an idle box, load is not the explanation either.
+
+### Gate, continued: the difference is the CONFIG PATH, not the flag, the alias, k, or load
+
+Measured, box idle, two concurrent requests every time:
+
+| delivery | result |
+|---|---|
+| shell `STRATA_GLM_ROWS_ATTN=1` + `LAYER_PIPE=2` | works, 6+ boots, 32+32 / 24+24 tokens, 0 errors |
+| shell `MAYA_GLM_ROWS_ATTN=1` (alias only) + `LAYER_PIPE=2` | works, 48 tokens, 0 errors, rotor on steps 1-2 |
+| config `env` carrying the flag (server rewrites the key to `MAYA_GLM_ROWS_ATTN`) | **crashes 3/3**: illegal access in mv / mla_q_abs / dsa_select_all / kv_q4, rotor engaged first |
+
+So: not the flag's value, not the `MAYA_`/`STRATA_` name (both work from the shell), not k=7, and not machine load
+(the box was idle and the download finished).  The engine's `rows_attn_on()` is env-only and reads the same value in
+both.  What remains is the config path itself - the ordering of the config's env relative to engine startup, or a key
+that only exists on that path.
+
+A `[engine env]` dump was added to `child_env()` in serve/server.py (sorted MAYA_/STRATA_ pairs, to stderr) but did not
+land in maya-v3q-q4.log, so it must be written to a file before it can be diffed.  That is the next step: one file per
+boot, diff the two.
