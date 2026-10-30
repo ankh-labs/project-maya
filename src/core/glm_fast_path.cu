@@ -4846,10 +4846,21 @@ void Glm5Model::fast_service() {
                 // device spins on ans->seq == *d.cpu_seq, so a wrong ans pointer and a wrong seq are the only two ways
                 // the wait can be unsatisfiable - this line separates them.
                 static std::atomic<int> told_cpu{0};
-                if (told_cpu.fetch_add(1) < 3)
+                static std::atomic<uint64_t> n_ch_pos{0};   // every request carrying ch > 0, cumulative
+                if (rq->ch > 0) {
+                    // UNCAPPED for a de-fused row: the old cap was three lines total, and the first three were spent on
+                    // the pre-rotor token path, so the branch that answers a row's own slot had no evidence of ever
+                    // firing.  A row whose wait is never answered wedges its stream, and the step number wanders with
+                    // the routes - so the question is not "did it happen" but "for which layer".
+                    const uint64_t nth = n_ch_pos.fetch_add(1, std::memory_order_relaxed) + 1;
+                    std::fprintf(stderr, "glm cpu-lane: ch=%u win=%u layer=%d cpu_mask=0x%x ans=%p seq=%u (row request #%llu)\n",
+                                 rq->ch, rq->win, (int) rq->layer, rq->cpu_mask, (void*) ans, next,
+                                 (unsigned long long) nth);
+                } else if (told_cpu.fetch_add(1) < 3) {
                     std::fprintf(stderr, "glm cpu-lane: ch=%u win=%u cpu_mask=0x%x ans=%p (cpu_ans_h=%p ans_h1=%p) "
                                          "seq=%u\n", rq->ch, rq->win, rq->cpu_mask, (void*) ans,
                                  (void*) F->cpu_ans_h, (void*) F->win.ans_h[1], next);
+                }
             }
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];

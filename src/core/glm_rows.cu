@@ -1637,8 +1637,28 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 }
                 (void) cudaGetLastError();
                 if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
-                    err = "glm rows: the row lane did not drain within 20 s after the last layer - a kernel from this "
-                          "step is still running";
+                    // NAME THE LAYER.  "a kernel from this step is still running" is the one thing the log could not
+                    // localise, and the step number wanders (5, then 2, then 4), which is the signature of a
+                    // data-dependent wedge rather than a wiring fault.  ev_layer[il] is recorded after every layer run,
+                    // so the lowest event that has not completed IS the stuck layer, and each row's cursor says which
+                    // row's stream it belongs to.
+                    std::string why = "glm rows: the row lane did not drain within 20 s after the last layer";
+                    int stuck = -1;
+                    for (int il2 = l0_; il2 < l1_; ++il2)
+                        if (il2 < (int) F->ev_layer.size() && F->ev_layer[(size_t) il2] != nullptr) {
+                            const cudaError_t q2 = cudaEventQuery(F->ev_layer[(size_t) il2]);
+                            if (q2 == cudaErrorNotReady) {
+                                stuck = il2;
+                                break;
+                            }
+                            (void) cudaGetLastError();
+                        }
+                    why += "; lowest incomplete layer " + (stuck >= 0 ? std::to_string(stuck) : std::string("none")) +
+                           " of " + std::to_string(l0_) + ".." + std::to_string(l1_ - 1);
+                    for (int r2 = 0; r2 < n; ++r2)
+                        why += "; row " + std::to_string(r2) + " at il " + std::to_string(S->cur[r2].il) + " on cs" +
+                               (((serial || (r2 & 1) == 0)) ? "" : "2");
+                    err = why;
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
