@@ -456,3 +456,38 @@ acceptance test is sharper than the tiny-pool run: **force a miss at layer 0 wit
 **`S = n-1` is right, not a fudge** - the rotor's skew *is* the lead, so the cover window and the invariant's slack are
 the same quantity by construction. The pin set is therefore `S x N x 8` slots = **1 x 2 x 8 x 8.80 MB = 141 MB at n = 2**
 (0.45% of the 31.17 GB pool), not the 281 MB the spec originally estimated.
+
+## 2026-10-30 — the overlapped arm works, and its first measurement
+
+The de-fused rotor now produces correct full-length output with two rows overlapped (acd52d1): 30+30 tokens,
+both requests ok, coherent text, and the fused path unchanged on the same binary (40 tokens, 2.5 s, 0 errors).
+
+Root cause of the whole tail of the hunt: the per-row `MoeDev` (plan pointers, fetch_src, cpu_part, cpu_flag,
+scratch, wait_ch, cpu_seq, cpu_ans) was built in `rows_moe_grouped`'s `row_dev`, and the path the rotor actually calls
+is `rows_moe -> fast_moe_experts`, which started from `F->md`.  One unreachable builder produced: five null/offset
+pointer bugs, a dead `transfers_done`, every CPU-lane route presenting ch=0, and the "row lane did not drain" stall.
+
+### Measurement (interleaved boots, NOT one boot)
+
+The arm is chosen at process start (`static const bool serial = getenv(...)`), so serial and overlap cannot be
+interleaved inside one process without an engine-side runtime switch that does not exist yet.  Design used instead:
+alternating boots S,O,S,O,S,O, two different prompts per boot (32 tokens each), first pair discarded.
+
+| run | arm     | tokens | seconds | tok/s |
+|-----|---------|--------|---------|-------|
+| 1   | serial  | 64     | 4.69    | 13.6  |
+| 2   | overlap | 64     | 4.14    | 15.5  |
+| 3   | serial  | 64     | 4.46    | 14.3  |
+| 4   | overlap | 64     | 4.09    | 15.6  |
+| 5   | serial  | 64     | 4.45    | 14.4  |
+| 6   | overlap | 64     | 4.11    | 15.6  |
+
+Valid runs (first pair discarded): serial n=2, 14.4 tok/s; overlap n=2, 15.6 tok/s — about +8%, tight and consistent,
+overlap 15.5-15.6 against serial 13.6-14.4.
+
+### What that number is and is not
+
+The copy is still issued on the compute stream; TRANSFER records an event but does not own the transfer.  So this
+measures de-fused SCHEDULING without copy/compute overlap — a small win is the honest expectation, and ~0% would not
+have been a failure of the design either.  The spec's copy-stream move is the change that would produce a real
+overlap win, and it is still outstanding.
