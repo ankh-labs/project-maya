@@ -1173,6 +1173,23 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (S->cur[r].done) continue;
                 if (k < r) { all_done = false; continue; }   // this row has not started yet (the stagger is unchanged)
                 const int il = S->cur[r].il;
+                // NO TWO ROWS ON ONE LAYER: LayerPool::spare is three entries PER LAYER and the tier table publishes a
+                // slot by (layer, expert), so two rows computing one layer race on a claim the other is mid-read on.
+                // Making that impossible beats splitting three spares two ways.  A row whose layer another row has in
+                // flight defers - the same mechanism the ladder's Reorder uses.
+                {
+                    bool occupied = false;
+                    for (int q = 0; q < n; ++q)
+                        if (q != r && !S->cur[q].done && S->cur[q].il - 1 == il) {
+                            occupied = true;
+                            break;
+                        }
+                    if (occupied) {
+                        if (F->pipe) F->pipe->layer_busy.fetch_add(1, std::memory_order_relaxed);
+                        all_done = false;
+                        continue;
+                    }
+                }
                 // THE LADDER, with real residency.  Reorder asks for another slot's layer first; the row answers by
                 // staying on the same layer for one round.  `deferred` prevents an endless Reorder (reset on a run).
                 {
@@ -1213,6 +1230,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         rows_stream_ = nullptr;
         rows_per_row_ = false;
         if (F->pipe) {
+            {
+                static std::atomic<bool> told{false};
+                const uint64_t busy = F->pipe->layer_busy.load(std::memory_order_relaxed);
+                if (busy > 0 && !told.exchange(true))
+                    std::fprintf(stderr, "glm pipe: CUDA%d same-layer collision avoided %llu time(s) - the spare "
+                                         "claims were being shared\n", dev_, (unsigned long long) busy);
+            }
             // TRANSFER: every launched layer that had experts to move has had its fetch issued by rows_layers (the
             // device-side moe_wait_fetch on the slot's stream); this attributes it.  RETIRE: one per row per step.
             // transfers_done is NOT credited here: rows_layers issues the fetch on the compute stream, which is the
