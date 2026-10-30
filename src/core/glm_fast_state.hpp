@@ -538,6 +538,10 @@ struct Glm5Model::FastState {
         const int f = pipe_floor.load(std::memory_order_acquire);
         return f >= 0 && il >= f;
     }
+    // Per-row calls that fell back to the GLOBAL F->md (shared plan, shared fetch_src, shared wait channel) - the
+    // fourth index-carried-a-boolean bug on this branch, and silent until now.
+    std::atomic<uint64_t> md_fallbacks{0};
+    std::atomic<int> md_fallback_first_il{-1};
     std::atomic<uint64_t> floor_violations{0};
     std::atomic<uint64_t> spare_steals{0};
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
