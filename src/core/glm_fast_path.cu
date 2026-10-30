@@ -1049,7 +1049,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         // has slots [8 i, 8 i + 8) of rows_scr, row 0 the ones above.  The rows' route state (plans, the CPU lane's
         // answer slots, the grouping) is the verify window's, its rows a window's tokens (win_alloc).  Both before the
         // pool takes the card.
-        if (glmfast::group_experts_on() && rows_ != nullptr) {
+        // The ROTOR needs per-row scratch for the same reason grouping does: the per-row MoeDev offsets into rows_scr,
+        // and the route kernel dereferences the scratch ARRAY whenever a route finds no free spare (glm_fast.cu:4199,
+        // 'ptr = a.d.scratch[i]').  With rows_scr unallocated that read is address 8*i - garbage slots for whichever row
+        // is not row 0.  Gating the allocation on grouping left the pipeline without scratch entirely.
+        static const bool pipe_scratch = getenv("STRATA_GLM_LAYER_PIPE") != nullptr;
+        const bool group = glmfast::group_experts_on();
+        if ((group || pipe_scratch) && rows_ != nullptr) {
             // (STRATA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
             // the conversations' own name earlier rows' slots, and group only while every expert is in VRAM)
             const int mm = multi_mtp_setting() > 0 ? multi_mtp_cap() : 0;
@@ -1072,12 +1078,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cudaMemcpy(F->rows_scr, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
                 F->scratch_bytes += extra;
                 size_t f0 = 0, f1 = 0, tot = 0;
-                cudaMemGetInfo(&f0, &tot);
-                if (!win_alloc(kWinMax, err)) return false;
-                cudaMemGetInfo(&f1, &tot);
-                F->win_bytes += f0 > f1 ? f0 - f1 : 0;
-                cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
-                F->rows_group = R;
+                if (group) {   // the verify window's route state: grouping only
+                    cudaMemGetInfo(&f0, &tot);
+                    if (!win_alloc(kWinMax, err)) return false;
+                    cudaMemGetInfo(&f1, &tot);
+                    F->win_bytes += f0 > f1 ? f0 - f1 : 0;
+                    cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
+                    F->rows_group = R;
+                }
                 F->rows_scr_rows = RT;
                 std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
                              "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
