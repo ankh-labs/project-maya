@@ -698,3 +698,23 @@ requests - **2/2 boots clean, 64 tokens each, 0 errors, rotor on 31 steps, no de
 **The shape, for the record:** this is the same class as the de-fused root cause. There a per-row structure was built
 by only one of two paths; here a default was honoured by only one of four readers. A default is a contract, and
 introducing one means auditing every reader of the thing it defaults.
+
+#### Soak with the rotation engaged (same boot, config-only delivery)
+
+Six sequential 256-token turns first (each is n=1, so the rotation declines by design): 256 tokens each, 10.4-12.5 s,
+0 errors.
+
+Then three rounds of TWO CONCURRENT 256-token turns, which is what actually engages the rotor:
+
+| round | tokens | wall | aggregate |
+|---|---|---|---|
+| pair 1 | 512 | 22.0 s | 23.3 tok/s |
+| pair 2 | 512 | 22.7 s | 22.6 tok/s |
+| pair 3 | 512 | 20.8 s | 24.6 tok/s |
+
+796 rotor entries across the session, **0 stalls, 0 drain errors, 0 non-finite, 0 illegal accesses.**  Long turns under
+concurrent load are the shape that would surface the stall class, and none appeared.
+
+Gate status: the rotation is ON by default - `layer_pipe_mode()` defaults to 2 and the live config carries
+`MAYA_GLM_ROWS_ATTN=1` - and a boot with zero shell keys engages it and stays clean.  The per-row-DSA-everywhere change
+stays parked (22 MB of the rows' 31 MB, changes the attention shape, needs its own measurement).
