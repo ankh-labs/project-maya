@@ -1604,6 +1604,23 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             c.last_tok = tok;
         }
     }
+    // RAW TOKEN IDs per row per step (2026-10-30).  Text cannot separate three very different faults behind a short or
+    // empty reply: the row sampled EOS, it sampled a valid token the server then discarded, or tokens_out[r] was never
+    // written and holds a stale value.  Integers separate them, and they also show whether a wrong opening is one wrong
+    // token or a correct token followed by divergence.  The position is printed with the id because the two together are
+    // the evidence: a row sampling a plausible fragment of the prompt's own subject, at a position that is not where the
+    // prompt ended, is generating from the wrong cursor rather than from noise.  Gated on n > 1 so the n == 1 baseline -
+    // the thing this is compared against - stays silent.
+    static const bool toklog = getenv("STRATA_GLM_TOK_ID_LOG") != nullptr;   // ...and on demand for the n == 1 baseline
+    if (n > 1 || toklog) {
+        std::string line = "glm rows: CUDA" + std::to_string(dev_) + " step " + std::to_string(F->step_seq) +
+                           " token ids";
+        for (int i = 0; i < n; ++i) {
+            line += " | row " + std::to_string(i) + " seq " + std::to_string(rw[i].seq) + " pos " +
+                    std::to_string(rw[i].p) + " id " + std::to_string(tokens_out[i]);
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
     return true;
 }
 
