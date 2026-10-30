@@ -1620,6 +1620,11 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    try:   # THE ENGINE'S ENVIRONMENT, all of it: two named keys cannot explain a difference both boots report correctly
+        _kv = sorted(f"{k}={v}" for k, v in env.items() if k.startswith(("MAYA_", "STRATA_")))
+        print("[engine env] " + " | ".join(_kv), file=sys.stderr, flush=True)
+    except Exception:
+        pass
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
