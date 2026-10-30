@@ -46,3 +46,32 @@ time that code runs at all.
 
 **Expectation:** correctness before any throughput number.  This exercises untested code, so the first question is
 whether it loads and produces coherent output, not how fast.
+
+## RE-DECIDED 2026-10-30 — `6ae276e`'s deletion of the BF16 KDA-output fallback is reversed
+
+`6ae276e` (28 Oct) removed a 21-line fallback in `multi_rows` that decoded a BF16-output batch one row at a time,
+replacing it with an `mv_nt` pre-pass that (a) referenced three symbols it never defined, so nothing from `6ae276e`
+onward compiled, and (b) did not cover the single-job `mv()` calls. It also deleted the comment recording why:
+`rows_layers`' KDA output projection is BF16 in this pack, the rows path only has `kda_rec`'s q8_1 activations, and
+`n == 1` never showed it because it stays on `mv()`.
+
+Decision: **the fallback is restored** (verbatim, comment included) and `mv()` also gained a q8_1→float pre-pass so a
+single BF16 job works. The fallback is the correct behaviour until the KDA output job is given float activations; the
+cost is the shared weight reads, and its arithmetic equals the `n == 1` step's per row.
+
+**Consequence, recorded so it is not discovered late:** with this pack the fallback fires for every batch, so the
+rotation does not run at `n > 1`. See `docs/STATE.md` for the re-ranked options (repack first).
+
+## CLOSED 2026-10-30 — a textual union is only valid for pure insertions
+
+Resolving a rebase conflict by concatenating both sides is valid only when both sides are pure insertions into
+unchanged surrounding text. It is invalid the moment either side **restructures or deletes** inside the hunk — that is
+a three-way merge, which no textual union can express. Brace balance is not the test; purity of insertion is.
+
+This cost a build: on the v1.1.40→41 replay one hunk had upstream restructuring a block our side had edited inside, and
+concatenation duplicated a block, orphaned an atomic outside its loop, and left an unclosed brace that swallowed the
+file. Any helper that auto-resolves must **refuse when either side contains a deletion**.
+
+Second rule from the same episode: a conflict that compiles is not evidence. A union that duplicates a statement with
+balanced braces compiles perfectly and is silently wrong. Audit by **count** against the last verified build — every
+marker line must appear as often as it did there; up is a union artefact, down is a lost edit.
