@@ -395,6 +395,10 @@ struct PipeRuntime {
     std::atomic<uint64_t> hb_submit{0}, hb_transfer{0}, hb_retire{0};
     std::atomic<uint64_t> layers_submitted{0}, transfers_done{0}, tokens_retired{0};
     std::thread t_submit, t_transfer, t_retire;
+    // A FOURTH thread that does nothing but sample.  The stall detector cannot live on RETIRE: RETIRE polls events, so
+    // it is a plausible blocker, and a detector that the failure can silence is the latch problem one level up.  This
+    // one blocks on nothing but its own sleep.
+    std::thread t_watch;
     std::mutex mu;
     std::condition_variable cv;
 
@@ -415,7 +419,37 @@ struct PipeRuntime {
                tokens_retired.load(std::memory_order_acquire);
     }
 
+    /// Set by the rotor (a pipeline step is in flight).  The watchdog reads it so it never reports a stall while the
+    /// fused path is the only thing running - which is always, until the queues are wired.
+    std::atomic<int> watch_active{0};
+    std::atomic<int> stalls_seen{0};
+
+    void watch() {
+        uint64_t last = progress();
+        int quiet_ms = 0;
+        bool reported = false;
+        while (!stop.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const uint64_t now_p = progress();
+            if (now_p != last) {
+                last = now_p;
+                quiet_ms = 0;
+                reported = false;   // progress resumed: a later stall is a new episode
+                continue;
+            }
+            quiet_ms += 100;
+            if (watch_active.load(std::memory_order_acquire) != 0 && quiet_ms >= 5000 && !reported) {
+                reported = true;
+                stalls_seen.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "glm pipe: STALL - runtime alive, no progress for %d ms (hb %llu/%llu/%llu)\n",
+                             quiet_ms, (unsigned long long) hb_submit.load(), (unsigned long long) hb_transfer.load(),
+                             (unsigned long long) hb_retire.load());
+            }
+        }
+    }
+
     void start() {
+        t_watch = std::thread([this] { watch(); });
         t_submit = std::thread([this] { idle(hb_submit); });
         t_transfer = std::thread([this] { idle(hb_transfer); });
         t_retire = std::thread([this] { idle(hb_retire); });
@@ -424,7 +458,7 @@ struct PipeRuntime {
     void shutdown() {
         stop.store(true, std::memory_order_release);
         { std::lock_guard<std::mutex> lk(mu); cv.notify_all(); }
-        std::thread* ts[3] = {&t_submit, &t_transfer, &t_retire};
+        std::thread* ts[4] = {&t_submit, &t_transfer, &t_retire, &t_watch};
         for (auto* t : ts)
             if (t->joinable()) t->join();
     }
