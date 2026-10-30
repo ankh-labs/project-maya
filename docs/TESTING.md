@@ -375,3 +375,37 @@ waiting on an event whose arrival never happens, on a path where the host has no
 
 Next instrument is the one already designed and not yet built: **stage events per row per layer** on the row's own
 stream, so the first event that never retires names the stage rather than the layer.
+
+## 2026-10-30 — the reference build works: the regression is inside cd52717..HEAD
+
+Built the pre-rebase tree (`cd52717`, tag `backup-pre-20261030-0835`) through the working pipeline and ran the same arm
+the soak used: `run-maya-cfgonly.bat`, the same config, **zero shell keys** (verified empty), two concurrent requests,
+512 tokens, three boots.
+
+| boot | tokens | finish | time | rotor entries | drain | non-finite |
+|---|---|---|---|---|---|---|
+| 1 | 44 + 176 | stop / stop | 9.4 s | **43** | 0 | 0 |
+| 2 | 43 + 177 | stop / stop | 9.2 s | **42** | 0 | 0 |
+| 3 | 48 + 129 | stop / stop | 8.0 s | **47** | 0 | 0 |
+
+Coherent answers in all six replies, ~24 tok/s aggregate - the morning's 23-25 tok/s. **Clean 3/3, rotor engaged
+throughout.**
+
+So: the rotation worked before the rebase, the regression is inside `cd52717..HEAD`, and the search is now a bounded
+bisect rather than an open hunt. Two bounds on what that means:
+
+- the morning tree carries the `resp_h`/`need_seq` aliasing and **works** - both sides of the handshake use the same
+  undersized pointer, so answers land while adjacent pinned memory is corrupted. The bug is real; it was not the
+  functional failure. Separating them (bf3b16f) is still correct but is a bisect variable, not a proven neutral.
+- the rotor was genuinely running here (42-47 entries), unlike `15ff4f1`, where the BF16 fallback pre-empted the
+  rotation and a "coherent n=2" measured the fallback.
+
+Note: rebuilding `build/` on `cd52717` discarded the instrumented binary; `788b1da` is committed and rebuilds in one pass.
+
+### Two build facts worth keeping
+
+- A fresh build directory on this tree never had the toolchain environment (`nvcc fatal: Cannot find compiler 'cl.exe'
+  in PATH`), so `fatbinary fatal: Could not open input file '*.ptx'` there was a *build* failure, not a code fault.
+  Building the reference commit through the existing pipeline was the cheap correct move.
+- `sccache` layered under `nvcc` is a known hazard for nvcc's intermediate `.ptx`/`.cubin` temporaries; for a one-off
+  reference build, empty the `CMAKE_*_COMPILER_LAUNCHER` variables rather than tuning `-j`.
