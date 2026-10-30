@@ -540,6 +540,12 @@ struct Glm5Model::FastState {
     }
     // Per-row calls that fell back to the GLOBAL F->md (shared plan, shared fetch_src, shared wait channel) - the
     // fourth index-carried-a-boolean bug on this branch, and silent until now.
+    // IDENTITY CAPTURE: per (row, layer) the plan's 8 slot pointers and the 8 expert ids that name them.  Copied
+    // asynchronously on the row's own stream (no sync in the step) and validated at the end: does the slot a plan
+    // names actually hold the expert the plan names?  That is the difference between 'wrong pointer' and 'late fill'.
+    unsigned long long* plan_cap = nullptr;   // pinned [rows * layers * 8]
+    int* plan_id_cap = nullptr;               // pinned [rows * layers * 8]
+    int plan_cap_rows = 0, plan_cap_layers = 0;
     std::atomic<uint64_t> md_fallbacks{0};
     std::atomic<int> md_fallback_first_il{-1};
     std::atomic<uint64_t> floor_violations{0};
