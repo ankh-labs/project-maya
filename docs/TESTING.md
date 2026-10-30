@@ -409,3 +409,25 @@ Note: rebuilding `build/` on `cd52717` discarded the instrumented binary; `788b1
   Building the reference commit through the existing pipeline was the cheap correct move.
 - `sccache` layered under `nvcc` is a known hazard for nvcc's intermediate `.ptx`/`.cubin` temporaries; for a one-off
   reference build, empty the `CMAKE_*_COMPILER_LAUNCHER` variables rather than tuning `-j`.
+
+## 2026-10-30 — single-variable test: the resp_h separation is NEUTRAL
+
+`cd52717` (the tree that passes) plus **only** the `resp_h` / `need_seq` separation - `1 file changed, 9 insertions(+),
+5 deletions(-)` - same config-only arm, three boots:
+
+| boot | tokens | finish | time | rotor | drain | non-finite |
+|---|---|---|---|---|---|---|
+| 1 | 44 + 172 | stop / stop | 9.5 s | **43** | 0 | 0 |
+| 2 | 42 + 134 | stop / stop | 8.1 s | **41** | 0 | 0 |
+| 3 | 47 + 136 | stop / stop | 8.5 s | **46** | 0 | 0 |
+
+**Clean 3/3.** Separating `resp` from `need_seq` does not break the working rotor: the aliasing was self-consistent and
+its removal is genuinely neutral. `bf3b16f` **stays**.
+
+That closes the strongest prior we had - the only edit either of us made to a contract that was live on a passing tree -
+and it puts the regression in the replay itself (`cd52717..HEAD`). Next: the **full-width deleted-lines audit** of
+`cd52717` against `HEAD` over the scheduler files (not marker-filtered: the marker audit found `wait_ch` and could miss
+others), then a bisect over the replay only if that reports nothing but upstream's own changes.
+
+Withdrawn, recorded so it is not re-derived: "no build before `bf3b16f` had a working answer path" is false - the answer
+path worked; the *adjacent* pinned memory was what the aliasing trampled.
