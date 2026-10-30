@@ -1134,7 +1134,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                                  "still shared) - running the layers one at a time; set STRATA_GLM_PIPELINE_UNCERTIFIED=1 "
                                  "to run the rotation anyway\n", dev_);
     }
-    if (pipe_mode >= 2 && uncertified && n >= 2 && F->cs2 != nullptr && S->aq != nullptr) {
+    if (pipe_mode >= 2 && uncertified && n == 2 && F->cs2 != nullptr && S->aq != nullptr) {
         // ---- the rotation (docs/LAYER_PIPELINE.md, increment 4): row r runs the layer k - r while row 0 runs k, so one
         // row is waiting on its fetch or its CPU lane while the other computes.  Each row keeps its OWN stream, so its
         // layers stay in order; the two streams are free to overlap.  One layer a row, one row per call - the slices and
@@ -1147,6 +1147,11 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
         const uint64_t expected0 = F->expected;
+        // The embed, the bind and the boundary all ran on F->cs; row 1 computes on F->cs2, and on one stream that
+        // ordering was implicit.  Without this the second row's first layer can read its x before the embed that writes
+        // it has run - a sporadic non-finite score a layer or two in, i.e. arithmetic, not an index fault.
+        cudaEventRecord(F->ev_hop, F->cs);
+        cudaStreamWaitEvent(F->cs2, F->ev_hop, 0);
         gf::moe_wait_fetch_set_rows(n);   // N rows: N wait kernels can be resident at once
         rows_per_row_ = true;   // every layer below is ONE row of the pipeline
         if (F->pipe) F->pipe->watch_active.store(1, std::memory_order_release);   // arm the independent watchdog
@@ -1162,6 +1167,12 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             S->cur[r].il = l0_;
             S->cur[r].deferred = 0;
             S->cur[r].done = false;
+        }
+        if ((int) F->ev_layer.size() < l1_) {   // one event a layer, created once
+            const size_t had = F->ev_layer.size();
+            F->ev_layer.resize((size_t) l1_, nullptr);
+            for (size_t i = had; i < F->ev_layer.size(); ++i)
+                cudaEventCreateWithFlags(&F->ev_layer[i], cudaEventDisableTiming);
         }
         // Safety net only: with one deferral per row between runs the schedule cannot exceed roughly 2L, and the cap
         // turns a scheduler bug into a visible short step instead of a spin.
@@ -1211,6 +1222,10 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (il > floor + F->pipe_lead) { all_done = false; continue; }   // unreachable while S >= n-1
                 row_base_ = r;
                 rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
+                // This layer's slots were filled by whichever row ran it first; that row's fill must have landed
+                // before this one reads them.  (Never recorded: the wait is a no-op.)
+                if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr)
+                    cudaStreamWaitEvent(rows_stream_, F->ev_layer[(size_t) il], 0);
                 if (F->pipe) F->pipe->layers_submitted.fetch_add(1, std::memory_order_relaxed);   // SUBMIT, really launched
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
                     row_base_ = 0;
@@ -1219,6 +1234,8 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                     F->pipe_active.store(false, std::memory_order_release);
                     return false;
                 }
+                if (il < (int) F->ev_layer.size() && F->ev_layer[(size_t) il] != nullptr)
+                    cudaEventRecord(F->ev_layer[(size_t) il], rows_stream_);
                 S->cur[r].il = il + 1;              // advance ONLY on a real run
                 S->cur[r].deferred = 0;
                 if (S->cur[r].il >= l1_) S->cur[r].done = true;
@@ -1248,6 +1265,17 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         F->pipe_floor.store(-1, std::memory_order_release);
         // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
         cudaStreamSynchronize(F->cs2);
+    } else if (pipe_mode >= 2 && n >= 3) {
+        // KNOWN-WRONG, not merely uncertified: the fused design double-buffers by layer PARITY (pf_buf[il & 1],
+        // pf_n_buf[il & 1]) and by row parity for the window lanes.  With S = n - 1 the spread at n = 3 is k, k-1, k-2,
+        // and k and k-2 share parity - two rows would write one buffer.  Refused here with the reason.
+        static std::atomic<bool> told3{false};
+        if (!told3.exchange(true))
+            std::fprintf(stderr, "glm rows: CUDA%d the rotation is defined only for n = 2: at n >= 3 rows sit at k and "
+                                 "k-2, which share the parity pf_buf/win_lane double-buffer on - running the layers one "
+                                 "at a time\n", dev_);
+        for (int il = l0_; il < l1_; ++il)
+            if (!rows_layers(rw, n, err, il, il + 1)) return false;
     } else if (pipe_mode >= 2) {
         // the per-row DSA score/selection buffers only exist with STRATA_GLM_ROWS_ATTN=1; without them the rows would
         // share F->score / F->cells, so the pipeline refuses rather than corrupting (said once)

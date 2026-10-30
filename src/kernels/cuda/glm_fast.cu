@@ -3903,7 +3903,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __shared__ float s_w[8];
     __shared__ unsigned int s_mask, s_seq;
     __shared__ int bad;
+    __shared__ int bfault;   // 1 = invalid expert ID (an index fault), 2 = non-finite score (arithmetic)
     if (tid == 0) bad = a.d.route_error != nullptr && *a.d.route_error != 0 ? 1 : 0;
+    if (tid == 0) bfault = 0;
     __syncthreads();
     // the CPU lane's frequency counts age: every 4096 routes all of them halve (the whole block, before any use)
     if (a.cpu_plan != 0ull && a.d.dcnt != nullptr && (((a.d.hseq != 0u ? a.d.hseq : (*a.d.seq + 1))) & 4095u) == 0u)
@@ -3913,7 +3915,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         s_p[e] = p;
         s_sel[e] = a.bias ? p + a.bias[e] : p;
         if (a.affinity > 0.0f && a.d.tab != nullptr && a.d.tab[(size_t) a.layer * E + e] != 0ull) s_sel[e] += a.affinity;
-        if (!isfinite(a.logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 1);
+        if (!isfinite(a.logits[e]) || !isfinite(s_sel[e])) { atomicMax(&bad, 1); atomicMax(&bfault, 2); }
     }
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
@@ -3922,7 +3924,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     else topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
-            if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
+            if (s_ids[i] < 0 || s_ids[i] >= E) { atomicMax(&bad, 1); atomicMax(&bfault, 1); }
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
@@ -3938,14 +3940,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         for (int e = tid; e < E; e += ROUTE_THREADS) {
             const float p = 1.0f / (1.0f + expf(-a.pred_logits[e]));
             s_sel[e] = a.pred_bias ? p + a.pred_bias[e] : p;   // s_sel is free again: the selection is done
-            if (!isfinite(a.pred_logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 2);
+            if (!isfinite(a.pred_logits[e]) || !isfinite(s_sel[e])) { atomicMax(&bad, 2); atomicMax(&bfault, 2); }
         }
         __syncthreads();
         if (E <= 512) topk_warp(s_sel, E, a.k, s_pred);
         else topk_argmax(s_sel, E, a.k, s_pred, s_bv, s_bi);
         if (tid == 0)
             for (int i = 0; i < a.k; ++i)
-                if (s_pred[i] < 0 || s_pred[i] >= E) atomicMax(&bad, 2);
+                if (s_pred[i] < 0 || s_pred[i] >= E) { atomicMax(&bad, 2); atomicMax(&bfault, 1); }
     }
     // LOOKAHEAD: one warp per later layer, its top-k in registers (E <= 512; the same selection rule and ties)
     __shared__ short s_ah[kAhead][8];
@@ -3961,7 +3963,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             if (e < E) {
                 const float p = 1.0f / (1.0f + expf(-lg[e]));
                 x = bs ? p + bs[e] : p;
-                if (!isfinite(lg[e]) || !isfinite(x)) atomicMax(&bad, 3);
+                if (!isfinite(lg[e]) || !isfinite(x)) { atomicMax(&bad, 3); atomicMax(&bfault, 2); }
             }
             v[j] = x;
         }
@@ -3989,7 +3991,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             if (lane == 0) {
                 const bool valid = bi >= 0 && bi < E && isfinite(bv);
                 s_ah[w][r] = (short) (valid ? bi : -1);
-                if (!valid) atomicMax(&bad, 3);
+                if (!valid) { atomicMax(&bad, 3); atomicMax(&bfault, 1); }
             }
         }
     }
@@ -4006,7 +4008,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     if (bad != 0) {
         if (tid == 0) {
             // No probability/table lookup or DMA for an invalid route. Still publish and retire its sequence.
-            if (a.d.route_error != nullptr && *a.d.route_error == 0) *a.d.route_error = 4 * a.layer + bad;
+            if (a.d.route_error != nullptr && *a.d.route_error == 0)
+                *a.d.route_error = (4 * a.layer + bad) | (bfault << 24);
             *moe_wseq(a.d) = 0u;
             if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = 0u;
             *a.d.cpu_flag = 0;
