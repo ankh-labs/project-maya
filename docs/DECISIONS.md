@@ -31,3 +31,18 @@ GLM-5.3-Flash on this box.
 result credited to the rotor that the rotor was not carrying). The intra-boot ramp is 2.3x (first run 14.56 tok/s,
 steady state 31-35), so arms must be interleaved inside one process, a warm-up pair discarded, and the paired deltas
 quoted with their spread rather than a single percentage.
+
+## NEXT (not started) — the disk rung, Maya-L IQ3_S
+
+Downloaded and verified: 156,319,213,529 bytes across four shards, all sha256-clean.  No pack, no config yet.
+
+**Why it matters:** the rung is about experts against SLOT capacity, not against RAM.  Current slots are 4079 VRAM
+(36.0 GB) + 9857 RAM (86.5 GB) = 122.5 GB, which is why v3q's 114 GB of experts reports disk 0.0 and always has.
+Maya-L carries ~145-150 GB of experts against the same 122.5 GB, so ~25 GB (~17 %) lands on the disk rung - the first
+time that code runs at all.
+
+**Prerequisite, and it is not optional:** stop the production engine first.  `maya.exe` holds ~99.5 GB RSS and the box is
+127 GB; a 156 GB model will not load beside it, and the repack needs headroom too.
+
+**Expectation:** correctness before any throughput number.  This exercises untested code, so the first question is
+whether it loads and produces coherent output, not how fast.
