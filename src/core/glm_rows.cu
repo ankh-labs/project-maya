@@ -1199,7 +1199,35 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     } prof_off{F, F->prof_on};
     F->prof_on = false;
     RowSeq rw[gf::kMaxMvNt];
-    if (!rows_bind(seqs, n, rw, err) || !rows_embed(rw, tokens, n, err)) return false;
+    // THREE-POINT RESIDUAL HASH (2026-10-30).  A row whose position advances while its token never changes is either a row
+    // whose content is never written or one that recomputes the same thing - and those are different faults with different
+    // homes.  Two points cannot separate "the embedding never landed" from "the layers never wrote it", and the first of
+    // those lives UPSTREAM of the rotor: rows_bind/rows_embed run once for the whole batch on F->cs, while everything after
+    // them is per row.  So: before the embed, after the embed, and after the last layer.
+    unsigned long long res_pre[gf::kMaxMvNt] = {0}, res_emb[gf::kMaxMvNt] = {0}, res_post[gf::kMaxMvNt] = {0};
+    const bool reslog = n > 1 || getenv("STRATA_GLM_TOK_ID_LOG") != nullptr;   // the n == 1 baseline on demand
+    const auto res_hash = [&](const float* p) -> unsigned long long {
+        if (p == nullptr) return 0ull;
+        std::vector<float> h((size_t) g_.n_embd);
+        cudaMemcpyAsync(h.data(), p, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
+        if (cudaStreamSynchronize(F->cs) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0ull;
+        }
+        unsigned long long x = 1469598103934665603ull;   // FNV-1a over the row's residual: change is what matters, not value
+        for (float v : h) {
+            uint32_t b;
+            std::memcpy(&b, &v, sizeof b);
+            x = (x ^ b) * 1099511628211ull;
+        }
+        return x;
+    };
+    if (!rows_bind(seqs, n, rw, err)) return false;
+    if (reslog)
+        for (int i = 0; i < n; ++i) res_pre[i] = res_hash(rw[i].res);
+    if (!rows_embed(rw, tokens, n, err)) return false;
+    if (reslog)
+        for (int i = 0; i < n; ++i) res_emb[i] = res_hash(rw[i].res);
     // THE ROTATION IS THE DEFAULT (2026-10-30).  STRATA_GLM_LAYER_PIPE unset means 2: row r runs the layer k - r while
     // row 0 runs k, so one row waits on its fetch or its CPU lane while the other computes, and each row keeps its own
     // stream.  Measured against the serial arm inside ONE boot, n=6 per arm, two prompts a measurement, warm-up pair
@@ -1592,6 +1620,8 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     } else if (!rows_layers(rw, n, err)) {
         return false;
     }
+    if (reslog)
+        for (int i = 0; i < n; ++i) res_post[i] = res_hash(rw[i].res);   // what the 45 layers left there
     if (!rows_head(rw, sps, n, err)) return false;
     cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(S->ev_done, F->cs);
@@ -1631,8 +1661,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                            " token ids | deferrals occ " + std::to_string(occ_defers) + " reo " +
                            std::to_string(reo_defers) + " spread " + std::to_string(spread_max);
         for (int i = 0; i < n; ++i) {
+            char hp[24], he[24], ho[24];
+            std::snprintf(hp, sizeof hp, "%016llx", res_pre[i]);
+            std::snprintf(he, sizeof he, "%016llx", res_emb[i]);
+            std::snprintf(ho, sizeof ho, "%016llx", res_post[i]);
             line += " | row " + std::to_string(i) + " seq " + std::to_string(rw[i].seq) + " pos " +
-                    std::to_string(rw[i].p) + " id " + std::to_string(tokens_out[i]);
+                    std::to_string(rw[i].p) + " id " + std::to_string(tokens_out[i]) + " res " + hp + " " + he +
+                    " " + ho;
         }
         std::fprintf(stderr, "%s\n", line.c_str());
     }
