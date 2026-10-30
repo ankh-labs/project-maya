@@ -524,6 +524,12 @@ struct Glm5Model::FastState {
     // path the two were the same because the copy and the compute shared a stream.  This is the arrival state, and it is
     // what makes kStageInFlight reachable at all.
     std::vector<cudaEvent_t> ev_fill;
+    // A CUDA event is a FAIL-OPEN oracle: freshly created it is already "complete", and one recorded in an earlier step
+    // still holds that step's completion.  Both report "the bytes landed" for a fill that has not been issued yet, which
+    // is how a stale answer reached the ladder.  The event is believed only for the step that recorded it; a generation
+    // mismatch means NOT ARRIVED (fail closed - a spurious wait costs overlap, a spurious proceed costs correctness).
+    std::vector<unsigned int> ev_fill_gen;   // the step_seq that recorded ev_fill[il] (0 = never)
+    unsigned int step_seq = 0;
     // A slot_of / spare mutation that touches a layer the rotor still needs.  The floor guard sits at ONE of the five
     // writers (fast_boundary's eviction); a guard on one writer is a special case, not an invariant.  Counted first, so
     // that one run says whether the trailing row's fault is this or just the stale start-of-token layer_res snapshot.
