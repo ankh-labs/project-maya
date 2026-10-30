@@ -4898,8 +4898,27 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+    // ...and the row lane.  The de-fused rotor (glm_rows.cu) puts row 1 on F->cs2 while `expected` counts BOTH rows'
+    // routes into one counter, so syncing only F->cs left the barrier spinning on routes whose publishing work it had
+    // never waited for: an unsatisfiable precondition, and with no deadline it presented as every thread waiting.
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs2), "glm boundary compute (row lane)", err) || !F->route_ok(err))
+        return false;
     const Glm5Geometry& g = g_;
-    while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
+    {
+        // Bounded: a barrier whose counter can never be reached must say so, not hang.  (The fused path is one row at a
+        // time and this never trips; the de-fused arms are the ones that can.)
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t seen = F->processed.load(std::memory_order_acquire);
+        while (seen < F->expected) {
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                err = "glm boundary: the service did not consume " + std::to_string(F->expected - seen) +
+                      " of " + std::to_string(F->expected) + " route(s) within 20 s";
+                return false;
+            }
+            cpu_relax();
+            seen = F->processed.load(std::memory_order_acquire);
+        }
+    }
     std::lock_guard<std::mutex> lk(F->mu);
     int nu = 0;
     bool ok = true;
