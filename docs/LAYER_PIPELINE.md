@@ -522,3 +522,36 @@ what "measure inside one boot" was meant to prevent.
 
 The copy is issued on the compute stream, so this is scheduling overlap only; the +11 % is in the range that argument
 predicts, and the copy-stream move is the change that would show a real overlap win.
+
+## 2026-10-30 (baseline) — n>=6 per arm, one boot, full distribution
+
+One process, arm switched by file between measurements, the same two prompts (32 tokens each) every time, first pair
+discarded.
+
+| run | arm     | tok | sec  | tok/s |
+|-----|---------|-----|------|-------|
+| 1   | overlap | 64  | 4.40 | 14.56 |  (cold)
+| 2   | serial  | 64  | 2.38 | 26.94 |  (discarded)
+| 3   | overlap | 64  | 2.03 | 31.54 |
+| 4   | serial  | 64  | 2.11 | 30.31 |
+| 5   | overlap | 64  | 1.92 | 33.37 |
+| 6   | serial  | 64  | 1.98 | 32.37 |
+| 7   | overlap | 64  | 1.86 | 34.48 |
+| 8   | serial  | 64  | 1.92 | 33.31 |
+| 9   | overlap | 64  | 1.83 | 35.07 |
+| 10  | serial  | 64  | 1.95 | 32.86 |
+| 11  | overlap | 64  | 1.92 | 33.38 |
+| 12  | serial  | 64  | 2.09 | 30.68 |
+| 13  | overlap | 64  | 2.02 | 31.75 |
+| 14  | serial  | 64  | 2.04 | 31.36 |
+
+Distribution (valid runs, n=6 each):
+
+    serial   min 30.31  q1 30.68  median 31.36  q3 32.37  p95 33.31  max 33.31  mean 31.82  sd 1.11
+    overlap  min 31.54  q1 31.75  median 33.37  q3 33.38  p95 35.07  max 35.07  mean 33.26  sd 1.29
+
+Marginals overlap heavily (serial p95 33.31 vs overlap min 31.54), so the honest statement is the PAIRED one, adjacent
+runs in the same boot: +1.23, +1.00, +1.17, +2.21, +2.70, +0.39 tok/s - overlap faster in 6 of 6 pairs, median paired
+delta about +1.2 tok/s (~+4%).  The n=2 reading of +11% was optimistic; the direction survives, the magnitude halves.
+
+Baseline to judge the copy move against: **serial median 31.36, overlap median 33.37, paired +1.2 (+4%), n=6.**
