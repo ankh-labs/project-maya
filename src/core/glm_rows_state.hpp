@@ -55,6 +55,8 @@ struct Glm5Model::RowsState {
         int lead = 0;       // layers ahead of the slowest row (the pipeline depth it is using)
         bool done = false;  // past l1_: nothing left for this token
         int phase = kEmpty; // SlotPhase: the owner writes it, everyone else reads it between launches
+        int defer_il = -1;  // a layer the ladder deferred this round (Reorder): run it next round, in order
+        int deferred = 0;   // times this slot deferred rather than run (a real decision, counted)
     };
     RowCursor cur[8];
     int* pf_n = nullptr;

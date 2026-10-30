@@ -1158,6 +1158,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // floor starts at the first layer and only moves forward; a slot may not run past floor + S.  The leader is
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
         int floor = l0_;
+        const uint64_t expected0 = F->expected;
         if (F->pipe) F->pipe->watch_active.store(1, std::memory_order_release);   // arm the independent watchdog
         F->pipe_active.store(true, std::memory_order_release);   // from here the boundary's eviction rule applies
         // The rotor's skew IS the lead: row r runs layer k - r, so the spread is exactly n - 1.  S must be at least that
@@ -1165,8 +1166,27 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         if (F->pipe_lead < n - 1) F->pipe_lead = n - 1;
         for (int k = 0; k < L + n - 1; ++k) {
             for (int r = 0; r < n; ++r) {
-                const int il = l0_ + k - r;
+                int il = l0_ + k - r;
                 if (il < l0_ || il >= l1_) continue;
+                // A deferred layer runs before this round's own: order per row is preserved because the slot only ever
+                // holds the layer it was about to run.
+                const int want = S->cur[r].defer_il >= 0 ? S->cur[r].defer_il : il;
+                if (S->cur[r].defer_il < 0 && want != il) continue;
+                il = want;
+                // THE LADDER, with real residency: is this layer already wholly in VRAM?  If not and nothing is in
+                // flight, Reorder says run another slot's layer first and come back - that is the decision this loop
+                // acts on.  A slot that would defer twice runs anyway (livelock guard).
+                {
+                    const bool res = F->layer_resident(il);
+                    const auto st = FastState::pipe_stage(res, /*in_flight=*/false, /*can_reorder=*/true,
+                                                          /*can_cpu=*/true, /*can_disk=*/true);
+                    if (st == FastState::kStageReorder && S->cur[r].deferred < 1) {
+                        S->cur[r].defer_il = il;
+                        S->cur[r].deferred++;
+                        continue;   // run it next round instead of blocking here
+                    }
+                    S->cur[r].defer_il = -1;
+                }
                 // floor = the lowest layer an active slot sits at; monotone within the step.  Published for the retire
                 // path and (later) the eviction rule "layers below floor only".
                 // floor is clamped to the first layer: "everything is at or above l0_" is the honest answer during
@@ -1175,6 +1195,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 if (il > floor + F->pipe_lead) continue;   // unreachable while S >= n-1: the rotor cannot overshoot
                 row_base_ = r;
                 rows_stream_ = (serial || (r & 1) == 0) ? F->cs : F->cs2;
+                if (F->pipe) F->pipe->layers_submitted.fetch_add(1, std::memory_order_relaxed);   // SUBMIT, really launched
                 if (!rows_layers(rw + r, 1, err, il, il + 1)) {
                     row_base_ = 0;
                     rows_stream_ = nullptr;
@@ -1185,7 +1206,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         }
         row_base_ = 0;
         rows_stream_ = nullptr;
-        if (F->pipe) F->pipe->watch_active.store(0, std::memory_order_release);
+        if (F->pipe) {
+            // TRANSFER: every launched layer that had experts to move has had its fetch issued by rows_layers (the
+            // device-side moe_wait_fetch on the slot's stream); this attributes it.  RETIRE: one per row per step.
+            F->pipe->transfers_done.fetch_add(F->expected - expected0, std::memory_order_relaxed);
+            F->pipe->tokens_retired.fetch_add((uint64_t) n, std::memory_order_relaxed);
+            F->pipe->watch_active.store(0, std::memory_order_release);
+        }
         F->pipe_active.store(false, std::memory_order_release);   // the step's layers are done: the fused rule resumes
         F->pipe_floor.store(-1, std::memory_order_release);
         // rows_head runs on the engine's stream: every row's last layer has to be in before it reads their states
