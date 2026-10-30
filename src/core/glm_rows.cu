@@ -502,6 +502,8 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         }
         if (batch) gf::hc_rows(hb, n, s);
 
+        if (rows_per_row_)   // stage 1: the mixer's output (attention done, FFN not yet)
+            gf::nonfinite_probe(rows(S->mixer, E, R(0)), (int) E, (il << 8) | (1 << 4) | rb, s);
         if (!Ly.moe) {
             gf::MvJob j[2];
             j[0] = {Ly.ffn_gate.q, rows_q(S->xq, E, rb), rows(S->x, E, rb), rows(S->dg, g.n_ff_dense, rb), nullptr, 1.0f, Ly.ffn_gate.type, E, g.n_ff_dense};
@@ -516,6 +518,8 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         } else {
             if (!rows_moe(il, rw, n, err)) return false;
         }
+        if (rows_per_row_)   // stage 2: this layer's FFN output (still pre-residual)
+            gf::nonfinite_probe(rows(S->ffn, E, R(0)), (int) E, (il << 8) | (2 << 4) | rb, s);
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
     for (int i = 0; i < n; ++i) {
@@ -1162,6 +1166,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // The embed, the bind and the boundary all ran on F->cs; row 1 computes on F->cs2, and on one stream that
         // ordering was implicit.  Without this the second row's first layer can read its x before the embed that writes
         // it has run - a sporadic non-finite score a layer or two in, i.e. arithmetic, not an index fault.
+        gf::nonfinite_reset();
         cudaEventRecord(F->ev_hop, F->cs);
         cudaStreamWaitEvent(F->cs2, F->ev_hop, 0);
         gf::moe_wait_fetch_set_rows(n);   // N rows: N wait kernels can be resident at once
@@ -1259,6 +1264,15 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         rows_stream_ = nullptr;
         rows_per_row_ = false;
         if (F->pipe) {
+            {
+                const int nf = gf::nonfinite_take();
+                if (nf >= 0) {
+                    const int lay = nf >> 8, st = (nf >> 4) & 15, rw_ = nf & 15;
+                    static const char* stn[] = {"entry", "post-mixer", "post-FFN", "?"};
+                    std::fprintf(stderr, "glm pipe: CUDA%d FIRST NON-FINITE at layer %d %s (row %d)\n", dev_, lay,
+                                 st < 3 ? stn[st] : stn[3], rw_);
+                }
+            }
             {
                 static std::atomic<bool> told{false};
                 const uint64_t busy = F->pipe->layer_busy.load(std::memory_order_relaxed);
