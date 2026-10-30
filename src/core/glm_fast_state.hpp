@@ -444,9 +444,14 @@ struct PipeRuntime {
             if (watch_active.load(std::memory_order_acquire) != 0 && quiet_ms >= 5000 && !reported) {
                 reported = true;
                 stalls_seen.fetch_add(1, std::memory_order_relaxed);
-                std::fprintf(stderr, "glm pipe: STALL - runtime alive, no progress for %d ms (hb %llu/%llu/%llu)\n",
+                // The heartbeats say the THREADS are alive; the counters say WHERE the work stopped.  Without both, a
+                // stall report is 'something is stuck' rather than 'the submit lane issued N layers and transfer
+                // returned M', which is the only form that names the wedged stage.
+                std::fprintf(stderr, "glm pipe: STALL - runtime alive, no progress for %d ms (hb %llu/%llu/%llu; "
+                                     "submitted %llu, transfers %llu, retired %llu)\n",
                              quiet_ms, (unsigned long long) hb_submit.load(), (unsigned long long) hb_transfer.load(),
-                             (unsigned long long) hb_retire.load());
+                             (unsigned long long) hb_retire.load(), (unsigned long long) layers_submitted.load(),
+                             (unsigned long long) transfers_done.load(), (unsigned long long) tokens_retired.load());
             }
         }
     }
