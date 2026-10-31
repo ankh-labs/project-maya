@@ -138,6 +138,13 @@ understand, and merging onto it would make every new symptom ambiguous between t
 **Clean 3/3.** ~21 tok/s on the two normal boots (163 tokens in 7.7 s; 173 in 8.0 s); the long third turn ran 289 tokens
 over 287 rotor entries at 8.9 tok/s - more layers published per token means more misses, which is the mover doing its job.
 
+**Boot 3 is a different régime, not a larger boot 1** (112 ms/token against 47 ms/token, and 287 rotor steps against 44-45)
+for 289 tokens against 163): its request B generated 220 tokens where boot 1's generated 117, so the generation extended
+past what the resident expert set covers and the per-token cost should rise — the shape of cache saturation, not of a
+schedule regression. One measurement settles it and it is already instrumented: run the pair with
+`STRATA_GLM_MISS_LOG=1` and read experts-over-PCIe per step; if the misses grow with the token index, it is the cache, and
+the short boots simply never exercised it.
+
 `tools/patch_invariants.py` **PASSES** on the merged tree (11 invariants, `rotor_will_run` acknowledged as absent by design
 on this lineage).
 
