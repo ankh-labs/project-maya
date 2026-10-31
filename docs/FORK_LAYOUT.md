@@ -98,7 +98,11 @@ instrument.
 
 ## Merge procedure
 
-1. Branch from the **last verified-good tree**, not from the previous replay.
+1. Branch from the **last verified-good tree**, not from the previous replay. Note the
+   consequence: tooling added *after* that tree (the invariant manifest, any later
+   guard) does **not** come with it and must be cherry-picked across explicitly. A
+   manifest entry that post-dates the base is legitimate but must be labelled
+   `POST-BASE` with its commit, never silently dropped.
 2. Resolve each known site from the three-way reading, not from the compiler. The
    recurring loss shape is **per-row behaviour quietly reduced to per-call** — anything
    passing `n` where we passed `1`, indexing by `i` where we used `R(i)`, or reading one
