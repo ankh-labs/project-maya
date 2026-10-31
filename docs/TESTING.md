@@ -585,3 +585,22 @@ For each site, read three versions side by side - `git show cd52717:<file>`, `gi
 and what the replay produced - and ask only one question: **does our side still do what it did at `cd52717`?** The pattern
 that has paid out four times tonight is per-row behaviour quietly reduced to per-call (`R(i)` -> `i`, per-row buffer ->
 shared, gated allocation). Bounded at six sites, no boots, and it needs no rebuild to read.
+
+## Known replay losses NOT fixed by the mover clamp (2026-10-30)
+
+Recorded separately so neither gets folded into the fix above or forgotten behind it.
+
+**1. `slot_load`'s parallel read is gone (load path, not the rotor).** Markers at `cd52717` = 4, `HEAD` = 2: our
+"read the whole slot into one buffer across N streams" version (its comment: *"a single sequential read reached only
+~0.5 GB/s here, and it then ran interleaved with the per-chunk H2D copies"*) was replaced by a simpler read. Effect is
+warm-up / load throughput, not correctness, and it does not touch per-row state - which is why it is not the wedge. Worth
+its own restore and its own measurement.
+
+**2. The `kv_norm` H512 butterfly is upstream's now.** Markers: `cd52717` = 9, `vm1.1.41` base = 5, `HEAD` = 5 - so HEAD
+matches upstream, meaning our rotated-row butterfly was replaced by upstream's implementation rather than dropped. It is
+an arithmetic kernel with no per-row or shared-mutable state, so it cannot produce the wedge, but it does change numerics
+and deserves a correctness read (against the same-boot `n=1` baseline) rather than a revert.
+
+**Clean, for the record:** the `56ced70` de-duplication kept *our* expert-id guard (`{ bad, bfault }`) rather than
+upstream's `bad`-only form; `row_win`'s behaviour survives as `rows_per_row_ ? R(i) : i` at the route call; the pinning
+cap / RAM-tier sizing is byte-identical (9 references either side).
