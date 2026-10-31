@@ -604,3 +604,42 @@ and deserves a correctness read (against the same-boot `n=1` baseline) rather th
 **Clean, for the record:** the `56ced70` de-duplication kept *our* expert-id guard (`{ bad, bfault }`) rather than
 upstream's `bad`-only form; `row_win`'s behaviour survives as `rows_per_row_ ? R(i) : i` at the route call; the pinning
 cap / RAM-tier sizing is byte-identical (9 references either side).
+
+## 2026-10-30 (late) — the mover clamp: real fix, not the wedge
+
+`920d9fd` restored `const size_t batch = std::min<size_t>(8, F->stage.size())`, which bounds **both** readers
+(`F->stage[job / 3]` in the parallel read and `F->stage[k]` in the copy-out loop) at `EXPERT_USED=7`. Three boots:
+**0/3** - non-finite at layers 33 (rotor 47), an illegal access on `cs2` (rotor 12), and one drain (rotor 5). The fix
+stays: at k=7 it was a genuine host-side out-of-bounds write.
+
+Two observations from those boots are sharper than the verdict:
+
+**1. A ring entry was consumed on a channel nothing published (boot 3).**
+
+```
+ch 0 hand-outs 4158 answer-writes 4149;  ch 1 hand-outs 1974 answer-writes 1960;  ch 4 hand-outs 0 answer-writes 1
+```
+
+`wait_ch` is assigned in exactly two places (`md.wait_ch = r & 7` in `fast_moe_experts`, `m.wait_ch = R(i) & 7` in
+`row_dev`), and `row_base_ = r` only in the rotor, so with `n = 2` a request can only ever carry channel 0 or 1. A
+consume on channel **4** therefore means the service read a ring slot whose `ch` it never wrote - i.e. it consumed an
+entry that was not the one the device published for that seq.
+
+**2. The wedge can happen with everything accounted for (boot 2).**
+
+```
+NotReady: cs(row0);  lowest incomplete layer none of 0..44;  row 0 at il 45;  row 1 at il 45
+ch 0 hand-outs 2394 answer-writes 2394;  ch 1 hand-outs 210 answer-writes 210;  service waiting for seq 2605
+wait_seq 0=0 1=0 2=0 ... 7=0
+```
+
+Every layer event retired, every hand-out answered, no wait word outstanding - and `cs` is still `NotReady`. So a stream
+holds work that is neither a layer event nor a waiter, and the service is parked on a seq no slot holds.
+
+Both point at the same thing: **the ring slot a seq lands in, and the entry the other side reads out of it, can disagree.**
+That is the family `ROUTE_FAST`'s `*a.d.seq + 1` pre-write belongs to, but with `ROUTE_FAST=0` the failure persists, so
+the overwrite is somewhere else - and the `ch = 4` consume is the first direct evidence of it rather than an inference.
+
+Next instrument, if picked up: on consume, compare `rq->seq` **and** `rq->ch` against what the host recorded for that seq
+(the `pub_ch` side already stores the channel), and print any mismatch with the slot index. A single line per mismatch
+would name the writer.
