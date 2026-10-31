@@ -3949,8 +3949,20 @@ bool Glm5Model::fast_warm(std::string& err) {
     size_t done_bytes = 0, total_bytes = 0;
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
     int last_pct = -1;
-    for (size_t b = 0; b < jobs.size(); b += 8) {
-        const int nb = (int) std::min<size_t>(8, jobs.size() - b);
+    // the staging buffers are the router's top-k (F->stage.assign(n_exp_used) in fast_setup),
+    // not 8: a fixed batch of 8 read stage[7] past the end once MAYA_GLM_EXPERT_USED lowered
+    // k -- a garbage destination pointer for a whole expert blob (the 0xc0000005 inside
+    // VCRUNTIME140's memcpy, during warm-up or later from the heap it corrupted).  Clamp the
+    // batch to what stage actually holds; at k=8 this is the same batch of 8 as before.
+    //
+    // RESTORED (2026-10-30): the v1.1.41 replay dropped this clamp and hardcoded 8.  With
+    // MAYA_GLM_EXPERT_USED=7 -- every config we run -- F->stage holds 7 entries and BOTH readers below
+    // reach index 7: the parallel read's `F->stage[job / 3]` and the copy-out loop's `F->stage[k]` for
+    // k < nb.  Restoring `batch` bounds `nb`, so both are fixed by this one expression; a future reader
+    // who finds the second index should not conclude the fix was partial.
+    const size_t batch = std::min<size_t>(8, F->stage.size());
+    for (size_t b = 0; b < jobs.size(); b += batch) {
+        const int nb = (int) std::min<size_t>(batch, jobs.size() - b);
         F->workers->run(nb * 3, [&](int job) {
             const Job& J = jobs[b + (size_t) (job / 3)];
             const int role = job % 3;
