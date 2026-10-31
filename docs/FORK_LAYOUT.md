@@ -111,3 +111,55 @@ instrument.
 4. Three boots at `n=2`, rotor entry count and tok/s read from the log. No single-run
    cross-build comparison: this failure is a Heisenbug (see `LAYER_PIPELINE.md`).
 5. Only then tag and deploy.
+
+## 2026-10-30 (late) — v1.1.42 merged onto the verified-good tree: a working n=2 rotor
+
+**Branch `feat/v1142-from-good`, merge commit `f383c28`, tagged `deployed/v1.1.42-20261030-2106`.**
+Base: `cd52717` (the verified working `n=2` rotor), NOT the v1.1.41 replay - that one fails 0/3 for reasons we do not
+understand, and merging onto it would make every new symptom ambiguous between three origins.
+
+### The arm (three boots, `n=2`, 512 tokens, config-only)
+
+| boot | tokens | finish | time | rotor entries | drain | non-finite |
+|---|---|---|---|---|---|---|
+| 1 | 46 + 117 | stop / stop | 7.7 s | **45** | 0 | 0 |
+| 2 | 45 + 128 | stop / stop | 8.0 s | **44** | 0 | 0 |
+| 3 | 69 + 220 | stop / stop | 32.4 s | **287** | 0 | 0 |
+
+**Clean 3/3.** ~21 tok/s on the two normal boots (163 tokens in 7.7 s; 173 in 8.0 s); the long third turn ran 289 tokens
+over 287 rotor entries at 8.9 tok/s - more layers published per token means more misses, which is the mover doing its job.
+
+`tools/patch_invariants.py` **PASSES** on the merged tree (11 invariants, `rotor_will_run` acknowledged as absent by design
+on this lineage).
+
+### What this is, and what it is not
+
+**This routes around the wedge; it does not fix it.** v1.1.42 touches neither the MoE routing ring, `wait_ch`, the
+response channels nor ring publication (only `fast_service`'s idle gate, + config env naming). The `ch = 4` consume and
+the fully-accounted wedge remain unexplained, and the ring-entry instrument has since reported **"ring entries consistent
+with the host's record"** - so the entry the service reads is the one published, and the fault is downstream of the read.
+
+### The eight conflict resolutions (three-way, not compile-driven)
+
+`serve/server.py` took upstream's `maya_names.export_env` and kept our engine-env print. `glm_fast_path.cu` 1017/4119
+were unions of additions (plus the `resp_h` separation from `bf3b16f`, which our per-channel indexing needs); 4751 took
+upstream's streaming block but kept **our `rq->ch` indexing** of the response. `glm_fast.cu` 4007/6777 unions, with
+upstream's ROUTE_FAST pre-write kept but **indexed by the route's own `hseq`** instead of `*a.d.seq + 1` (a shared counter
+would let a later row write its 16 KB FFN input into a slot another row had published); 4047 ours plus their `!rank_sel`;
+4138 **ours** - `*moe_wseq(a.d)`, not upstream's `*a.d.wait_seq` (channel 0), the same reduction as `wait_ch`.
+
+Two compile fixes that were themselves informative: a duplicate `s_near`, and `q->pad_`, which no longer exists because
+the merged `MoeRequest`'s slot is `int ch` - the waiting row's channel.
+
+### Export regenerated
+
+`G:\AI\maya-eval\maya-patches\series-v1142\` - 261 `format-patch` files (4.7 MB) for `e16dec85a..f383c28`, plus
+`by-file/src_core_glm_fast_path.v1142.diff` and `by-file/src_kernels_cuda_glm_fast.v1142.diff` as the three-way reading
+material for the next merge.
+
+### Not done, deliberately
+
+Repointing the services: **there is no Maya NSSM service** (`sc query maya` -> 1060) and `config_drift.py` lives under
+`G:\AI\llama-server\tools\` - both belong to the llama.cpp lab, not this project. The Maya engine is launched from the
+config (`exe: build\maya.exe`) by `maya.py`, so the deploy step is the config plus that server, not an NSSM restart.
+Confirm before anything is restarted.
