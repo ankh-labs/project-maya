@@ -1350,6 +1350,13 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         // (the ring-scan that stood here is REMOVED: a CUDA stream is in-order, so once one kernel wedges every launch
         // the host enqueued behind it has not run either - H - T would be the host's enqueue lead by construction, not a
         // fault, and would read non-zero in every stalled boot.  It cannot discriminate, so it is not measured.)
+        if (F->ring_mismatch.load(std::memory_order_relaxed) != 0ull) {
+            out += "; RING MISMATCHES " + std::to_string(F->ring_mismatch.load(std::memory_order_relaxed)) +
+                   " (first: seq " + std::to_string(F->mm_seq.load()) + " slot " + std::to_string(F->mm_slot.load()) +
+                   " got ch " + std::to_string(F->mm_got.load()) + " want ch " + std::to_string(F->mm_want.load()) + ")";
+        } else {
+            out += "; ring entries consistent with the host's record";
+        }
         if (F->ring_h != nullptr) {
             const unsigned sn = F->svc_next.load(std::memory_order_relaxed);
             out += "; service waiting for seq " + std::to_string(sn) + " (next in ring:";

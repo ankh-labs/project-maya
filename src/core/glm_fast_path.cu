@@ -1012,6 +1012,11 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.ring = dp;
     F->route_error_h = (volatile int*) (F->ring_h + gf::kRingSize);
+    F->exp_ch = (unsigned char*) std::calloc((size_t) gf::kRingSize, 1);
+    if (F->exp_ch == nullptr) {
+        err = "glm fast: the ring-entry record did not allocate";
+        return false;
+    }
     {   // the device's publish mark: one pinned word, written by the route kernel at the publish itself
         void* ph = nullptr;
         void* pd = nullptr;
@@ -4972,6 +4977,24 @@ void Glm5Model::fast_service() {
                                     std::memory_order_relaxed);
             }
         }
+        // the entry the consume actually got, against the channel the host published for that seq
+        if (F->exp_ch != nullptr && rq->seq != 0u) {
+            const unsigned want = (unsigned) F->exp_ch[rq->seq % (unsigned) gf::kRingSize];
+            const unsigned got = rq->ch & 7u;
+            if (got != want) {
+                const uint64_t n = F->ring_mismatch.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!F->ring_mismatch_told.exchange(true)) {
+                    F->mm_seq.store(rq->seq);
+                    F->mm_slot.store(rq->seq % (unsigned) gf::kRingSize);
+                    F->mm_got.store(got);
+                    F->mm_want.store(want);
+                    std::fprintf(stderr,
+                                 "glm pipe: CUDA%d RING ENTRY MISMATCH: seq %u in slot %u carries ch %u, the host published "
+                                 "it on ch %u (%llu so far)\n",
+                                 dev_, rq->seq, rq->seq % (unsigned) gf::kRingSize, got, want, (unsigned long long) n);
+                }
+            }
+        }
         F->ans_ch[rq->ch & 7].fetch_add(1, std::memory_order_relaxed);   // answered (consumed) on this channel
         F->processed.fetch_add(1, std::memory_order_release);
         ++next;
@@ -5915,6 +5938,8 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     auto md_h = md;   // (this route's own copy: the caller holds md by const ref)
     md_h.hseq = (unsigned int) ++F->seq_h;
     F->pub_ch[md.wait_ch & 7].fetch_add(1, std::memory_order_relaxed);   // published on this channel
+    if (F->exp_ch != nullptr)                                            // ...and recorded for the consume-side check
+        F->exp_ch[md_h.hseq % (unsigned) gf::kRingSize] = (unsigned char) (md.wait_ch & 7);
     // SERIALIZE THE ROUTES, NOT THE COMPUTES (2026-10-30).  The seq above is handed out by the host at launch, so route
     // publication order is only guaranteed if the launches are ordered: with two rows publishing concurrently, the later
     // seq can reach the ring first, and a route that then spins on its answer occupies the SM the earlier route needed to

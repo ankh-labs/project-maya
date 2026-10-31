@@ -577,6 +577,14 @@ struct Glm5Model::FastState {
     // kernel never ran (submission).  Counted where the seq is handed out and where the service consumes, so the delta is
     // read rather than inferred from silence - which is all three boots so far could do.
     std::atomic<unsigned> svc_next{0};
+    // RING ENTRY CHECK (2026-10-30): the service consumed an entry on channel 4, and wait_ch can only be 0 or 1 at n = 2
+    // (row_base_ = r only in the rotor, wait_ch assigned in two places, both from it).  So the host records the channel it
+    // published for each seq, and the consume compares: a mismatch means the slot held a different entry than the one
+    // written for that seq - and names the writer's disagreement rather than inferring it.  Counter plus ONE dump.
+    unsigned char* exp_ch = nullptr;          // [kRingSize]: the channel published for seq % kRingSize
+    std::atomic<uint64_t> ring_mismatch{0};
+    std::atomic<bool> ring_mismatch_told{false};
+    std::atomic<unsigned> mm_seq{0}, mm_slot{0}, mm_got{0}, mm_want{0};
     unsigned long long* dev_pub_h = nullptr;   // pinned: the seq the DEVICE last published
     unsigned long long* dev_pub_d = nullptr;   // its device pointer   // the seq the service is waiting for (published in host order by the ring)
     std::atomic<uint64_t> pub_ch[8] = {};
