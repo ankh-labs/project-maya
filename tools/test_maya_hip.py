@@ -87,7 +87,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["gpu"], [1, 0])
         self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
         self.assertEqual(cfg["env"]["STRATA_HIPBLASLT_TUNING"],
-                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}:{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
+                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
@@ -108,6 +108,8 @@ class HipSetupTests(unittest.TestCase):
         (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
         (tables / "gfx1201-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
         (tables / "gfx1100-glm-hipblaslt-100401.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
+        # a second table for one version (another build's solution numbers) comes after that version's own file
+        (tables / "gfx1100-glm-hipblaslt-100401-b.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
         pc = maya.check_pc(self.a)
         self.a.env = ["STRATA_GLM_PREFILL_SUB=512"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
@@ -118,14 +120,55 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "4096")
         self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")
         self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
-        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(":"),
+        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
-                          str(tables / "gfx1100-glm-hipblaslt-100401.txt")])
+                          str(tables / "gfx1100-glm-hipblaslt-100401.txt"),
+                          str(tables / "gfx1100-glm-hipblaslt-100401-b.txt")])
         # Keep the runtime's exact-version choice; an explicit operator table still wins.
         self.a.env.append("STRATA_HIPBLASLT_TUNING=/selected/table.txt")
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
+
+    def test_rocm_devel_links_repaired(self):
+        # #574: rocm-sdk init skipped the device-library links whose unnormalized target passed 260 characters
+        site = self.root / "site"
+        lib = site / "_rocm_sdk_libraries"
+        (lib / "bin/rocblas/library/gfx1151").mkdir(parents=True)
+        for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat"):
+            (lib / "bin/rocblas/library/gfx1151" / f).write_bytes(f.encode())
+        (lib / ".devel_links").mkdir()
+        up = "../../../../../_rocm_sdk_libraries/bin/rocblas/library/gfx1151/"
+        links = [{"relpath": f"bin/rocblas/library/gfx1151/{f}", "target": up + f}
+                 for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat", "gone.dat")]
+        (lib / ".devel_links/gfx1151.json").write_text(json.dumps({"version": "7.14.1", "links": links}))
+        self.assertEqual(maya.rocm_devel_links(site), (0, []))           # (no expanded SDK yet: nothing to check)
+        devel = site / "_rocm_sdk_devel/bin/rocblas/library/gfx1151"
+        devel.mkdir(parents=True)
+        os.link(lib / "bin/rocblas/library/gfx1151/Kernels.hsaco", devel / "Kernels.hsaco")   # the one init made
+        self.assertEqual(maya.rocm_devel_links(site, repair=False),
+                         (0, [links[1]["relpath"], links[2]["relpath"]]))
+        made, absent = maya.rocm_devel_links(site)
+        self.assertEqual((made, absent), (1, [links[2]["relpath"]]))   # a target that is not there stays absent
+        self.assertEqual((devel / "TensileLibrary_Type_x.dat").read_bytes(), b"TensileLibrary_Type_x.dat")
+        self.assertTrue((devel / "TensileLibrary_Type_x.dat").samefile(
+            lib / "bin/rocblas/library/gfx1151/TensileLibrary_Type_x.dat"))   # a hard link, as init makes them
+        self.assertEqual(maya.rocm_devel_links(site), (0, [links[2]["relpath"]]))
+
+    def test_tuning_table_list_uses_the_os_path_separator(self):
+        # Windows joins with ';': a ':' would also split the drive letter of C:\... (the engine then opened \...)
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for v in ("100202", "100401"):
+            (tables / f"gfx1100-glm-hipblaslt-{v}.txt").write_text(f"STRATA_HIPBLASLT_TUNING_V1 gfx1100 {v}\n")
+        pc = maya.check_pc(self.a)
+        for sep in (";", ":"):
+            with self.subTest(sep=sep), patch.object(maya.os, "pathsep", sep):
+                p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                                      self.root / "pack", "test", 8192, self.root / "data", None)
+                self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"],
+                                 sep.join(str(tables / f"gfx1100-glm-hipblaslt-{v}.txt")
+                                          for v in ("100202", "100401")))
 
     def test_gpus_with_an_apu_use_discrete_first_and_sequential_loading(self):
         self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 112})
@@ -207,9 +250,53 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
-    def test_hip_skips_vision_without_downloading(self):
+    def test_refresh_compiles_a_target_the_new_source_has_not_built(self):
+        # #664: after a git pull, starting GLM compiled build-hip/maya and stamped the new source with targets
+        # ["maya"]; the DeepSeek setup's next start found that source in the stamp and ran the old maya-ds4.
+        build = self.root / "build-hip"
+        build.mkdir()
+        (self.root / "llama/ggml").mkdir(parents=True)
+        (self.root / "llama/ggml/CMakeLists.txt").touch()
+        stamp = {"backend": "hip", "src": "new-sha", "archs": ["gfx1151"], "rocm": str(self.rocm),
+                 "llama": str(self.root / "llama"), "targets": ["maya"]}
+        cfg = {"exe": str(build / "maya-ds4"), "backend": "hip", "gpu": [0]}
+        with patch.object(maya, "EXE", build / "maya"), patch.object(maya, "DS4_EXE", build / "maya-ds4"), \
+                patch.object(maya, "MM3_EXE", build / "maya-mm3"), \
+                patch.object(maya, "STAMP", build / "MAYA-BUILD.json"), \
+                patch.object(maya.S, "source_hash", return_value="new-sha"), \
+                patch.object(maya, "hip_clang", return_value=self.rocm / "llvm/bin/clang++"), \
+                patch.object(maya, "compile_engine_hip") as compile_hip:
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)
+            compile_hip.assert_called_once()
+            self.assertEqual(compile_hip.call_args.kwargs["target"], "maya-ds4")
+            compile_hip.reset_mock()
+            stamp["targets"] = ["maya", "maya-ds4"]
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
+            compile_hip.assert_not_called()
+
+    def test_hip_no_vision_skips_without_downloading(self):
+        self.a.no_vision = True
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
             self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))
+
+    def test_hip_builds_the_vision_encoder(self):
+        # (#345) a HIP setup compiles maya-vision for its own GPUs, as a CUDA one does: the encoder on demand
+        spec = maya.MODELS.get("test") or maya.MODELS[next(iter(maya.MODELS))]
+        m = spec["vision"]
+        (self.root / m["folder"]).mkdir(parents=True, exist_ok=True)
+        for k in ("mmproj", "vocab"):
+            (self.root / m["folder"] / m[k]).write_bytes(b"x")
+        pc = {"backend": "hip", "archs": ["gfx1151"]}
+        self.a.rebuild = False
+        with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")), \
+                patch.object(maya, "compile_vision", return_value=True) as compile_vision, \
+                patch.object(maya, "VEXE", self.root / "no-maya-vision"):
+            v = maya.vision_step(self.a, pc, {"archs": ["gfx1151"]}, self.root, self.root, "test")
+        compile_vision.assert_called_once()
+        self.assertIs(compile_vision.call_args[0][0], pc)
+        self.assertTrue(v["gpu"])
 
     def installed_config(self, backend="hip", gpu=None):
         tp = self.root / "tokenizer"
@@ -335,7 +422,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("AMD Radeon AI PRO R9700", text)
         self.assertIn(str(32 * 2**30), text)
         self.assertIn("6.14.0-37", text)
-        self.assertIn(f"path {self.rocm}\nversion 7.2.1", text)
+        shown = str(self.rocm).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.1", text)
         self.assertIn('"backend": "hip"', text)
         self.assertIn("test-date", text)
         self.assertIn("the speed and memory lines (last 80 of 6)", text)
@@ -343,6 +431,30 @@ class HipSetupTests(unittest.TestCase):
             self.assertIn(line, text)
         query.assert_any_call(["/usr/bin/rocm-smi", "--showproductname", "--showmeminfo", "vram",
                                "--showdriverversion", "--json"])
+
+    def test_report_carries_minimax_engine_lines(self):
+        # a MiniMax report had none of its engine's lines ("last 80 of 0"): maya-mm3 --serve wrote where the model went
+        # to the server only, and REPORT_LINES knew no maya-mm3 line
+        kept = ["maya-mm3: loaded in 171.2 s, 9216 of 9216 experts in VRAM, 0.0 GB pinned pool",
+                "maya-mm3: weights: GGUF MiniMax-M3.1-Flash-Maya-S (dense Q6_K)",
+                "maya-mm3: VRAM 0 dense 7.9 GB, experts 118.1 GB",
+                "maya mm3 serve: DSpark kept 189 of 245 drafts",
+                "maya mm3 serve: prompt 201 tokens = 172 reused + 29 read in 806 ms (36.0 tok/s), 256 generated in "
+                "13334 ms (19.20 tok/s); CPU lane 0.0% of the experts"]
+        other = ["maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT"]
+        self.assertEqual(maya.speed_lines(kept + other), kept)
+
+    def test_report_minimax_images_from_its_vision_arg(self):
+        # a MiniMax report said "images off" with --vision on: it read cfg["vision"], which only GLM's configs set
+        path = self.installed_config()
+        cfg = maya.read_json(path)
+        cfg["exe"] = str(self.root / "build-hip/maya-mm3")
+        for args, shown in ((["--vision", "on"], "images on"), (["--vision", "off"], "images off"), ([], "images off")):
+            with self.subTest(args=args):
+                cfg["args"] = ["--pack", str(self.root / "model/maya-mm3"), "--max-context", "65536"] + args
+                path.write_text(json.dumps(cfg))
+                text, _ = self.run_report(cfg_path=path)
+                self.assertIn(shown + ",", text)
 
     def test_report_kfd_fallback_without_smi_or_rocm_version(self):
         self.installed_config()
@@ -352,10 +464,19 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("amdgpu driver:", text)
         self.assertIn("kernel", text)
         self.assertIn("using KFD topology", text)
-        self.assertIn(f"path {self.rocm}", text)
+        self.assertIn("path " + str(self.rocm).replace(str(Path.home()), "~"), text)
         self.assertIn("version unknown", text)
         self.assertFalse(any(Path(c.args[0][0]).name in ("rocm-smi", "amd-smi", "hipcc")
                              for c in query.call_args_list))
+
+    def test_report_rocm_path_inside_and_outside_home(self):
+        self.installed_config()
+        for home, shown in ((self.root, str(Path("~") / "rocm")), (self.root / "other-home", str(self.rocm))):
+            with self.subTest(home=home), patch.object(Path, "home", return_value=home):
+                text, _ = self.run_report()
+                self.assertIn(f"path {shown}\n", text)
+                if home == self.root:
+                    self.assertNotIn(str(home), text)
 
     def test_report_amd_smi_after_bad_rocm_smi_json(self):
         self.installed_config()
@@ -408,7 +529,8 @@ class HipSetupTests(unittest.TestCase):
         path.write_text(json.dumps(cfg))
         path.with_suffix(".log").write_text("glm stat: decode 50.0 ms/tok | prompt 413 tok/s\n")
         text, _ = self.run_report(cfg_path=path)
-        self.assertIn(f"path {root}\nversion 7.2.2", text)
+        shown = str(root).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.2", text)
         self.assertIn("Setup chosen.json", text)
         self.assertIn("Engine log chosen.log: the speed and memory lines", text)
         self.assertNotIn("Setup maya-test-cuda.json", text)
@@ -460,6 +582,7 @@ class HipSetupTests(unittest.TestCase):
                 patch.object(sys, "argv", ["maya.py", "--check"]), \
                 patch.object(maya.S, "gpus", return_value=nvidia), \
                 patch.object(maya.S, "amd_gpus", return_value=amd), \
+             patch.object(maya, "apple_silicon", return_value=False), \
                 patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}) as check:
             self.assertEqual(maya.main(), 0)
         return check.call_args.args[0].backend

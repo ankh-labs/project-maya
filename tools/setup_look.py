@@ -129,9 +129,12 @@ class Card(Vertical):
         lines = (list(text.split("\n")) + [None] * self.LINES)[:self.LINES]
         for k, (row, line) in enumerate(zip(self.query(Static), lines)):
             if line != self.shown[k]:
+                came_or_went = (line is None) != (self.shown[k] is None)
                 self.shown[k] = line
                 row.display = line is not None
-                row.update(line or "")
+                # (a line replaced by another is one row either way: no new layout - at the spinner's and the clock's
+                # pace that was most of an idle screen's CPU)
+                row.update(line or "", layout=came_or_went)
 
     @property
     def plain(self) -> str:

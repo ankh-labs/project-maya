@@ -20,6 +20,7 @@ export const S = {
   view: "chat",             // "chat", "monitor" or "models"
   sideOpen: store.get("side-open", true),   // the sidebar on a wide screen
   drawer: false,            // the chats drawer on a phone
+  savedSheet: false,        // the phone's Saved sheet (what the API would have charged)
   settings: null,           // the Settings dialog's open section, or null
   search: false,            // the search dialog
   dialog: null,             // a confirmation or a question
@@ -177,6 +178,12 @@ export function setFamily(model) {
 }
 setFamily("");
 export const thinkTitles = () => THINK_TITLES[familyOf()];
+// the thinking bar's pill (chat-view.js' ThinkingBar): over the chosen level's segment only, whatever the model's levels
+// - `i` its place (the first when the level is not the model's), `at` / `width` in percent of the track
+export function thinkPill(level) {
+  const n = LEVELS.length, i = Math.max(0, LEVELS.findIndex((l) => l.id === level));
+  return {i, n, at: (i * 100) / n, width: 100 / n};
+}
 export const PRESETS = {precise: {temperature: 0}, balanced: {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0},
                         creative: {temperature: 1.0, top_p: 0.95, top_k: 0, min_p: 0.05}};
 export const PRESET_NAMES = {precise: "Precise", balanced: "Balanced", creative: "Creative"};

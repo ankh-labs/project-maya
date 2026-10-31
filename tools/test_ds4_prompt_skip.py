@@ -164,6 +164,7 @@ struct Model {
     bool flow_pump(Chunk&, std::string&) { return true; }
 ROWS
     bool seed(Chunk& c, const Run& run, std::string& err) {
+        const int nk = (int) run.T.size();   // (the run's chunks)
 SEED
         return true;
     }

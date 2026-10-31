@@ -169,6 +169,58 @@ class Dashboard(unittest.TestCase):
             {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
         self.assertTrue(json.loads(b)["approximate"])
 
+    def test_peak_decode_speed(self):
+        # the Monitor's peak decode: the fastest answer since the server started, of PEAK_MIN_TOKENS tokens or more
+        from serve.server import PEAK_MIN_TOKENS
+        s, _, b = self.req("GET", "/metrics")
+        self.assertIsNone(json.loads(b)["totals"]["peak_decode"])
+        end = self.engine.script[-1:]                                  # (its end-of-turn token)
+        self.engine.script = self.engine.scripts[0] = ByteTokenizer().encode("</think>\n\n" + "a long enough answer " * 3) + end
+        self.engine.tok_s = 4000
+        rows = []
+        for _ in range(3):
+            self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+            rows.append(json.loads(self.req("GET", "/metrics")[2])["requests"][0])
+        peak = json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"]
+        top = max(rows, key=lambda r: r["decode_tok_s"])
+        self.assertEqual((peak["tok_s"], peak["tokens"], peak["time"]), (top["decode_tok_s"], top["output_tokens"], top["time"]))
+        self.assertGreaterEqual(peak["tokens"], PEAK_MIN_TOKENS)
+        _, _, b = self.req("GET", "/metrics/prometheus")
+        self.assertIn(f"maya:decode_peak_tokens_seconds {peak['tok_s']}", b.decode())
+        # a short answer, however fast, is not the peak
+        self.engine.tok_s = 400000
+        self.req("POST", "/v1/chat/completions", {"model": "m", "max_tokens": 5,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"], peak)
+
+    def test_peak_decode_follows_the_live_figure(self):
+        # a live Decode reading above the peak is the peak in the same /metrics answer (the owner's screenshot: 30.0
+        # live, peak 27.8), rounded as shown; a reading before PEAK_MIN_TOKENS tokens is not
+        from serve.server import PEAK_MIN_TOKENS, RequestStat
+        svc, now = self.svc, time.time()
+        svc.totals["peak_decode"] = {"tok_s": 27.8, "tokens": 400, "time": now - 60}
+        r = RequestStat()
+        r.first_token = now - 10
+        with svc.status_lock:
+            svc.status.update(busy=True, generated=PEAK_MIN_TOKENS - 1)
+            svc.current_requests.add(r)
+            svc.latest_request = r
+        try:
+            r.base = (now - 1, 0); r.samples.append((now, PEAK_MIN_TOKENS - 1))   # 31 tok/s, but only 31 tokens
+            m = json.loads(self.req("GET", "/metrics")[2])
+            self.assertEqual(m["totals"]["peak_decode"]["tok_s"], 27.8)
+            for k, n in enumerate((300, 330, 310)):                   # 300, 330, 310 tok/s live, one a reading
+                r.samples.clear(); r.base = (time.time() - 1, 1000 * k); r.samples.append((time.time(), 1000 * k + n))
+                m = json.loads(self.req("GET", "/metrics")[2])
+                self.assertGreaterEqual(m["totals"]["peak_decode"]["tok_s"], m["live"]["tok_s"])
+            self.assertAlmostEqual(m["totals"]["peak_decode"]["tok_s"], 330, delta=2)
+            self.assertEqual(m["totals"]["peak_decode"]["tokens"], 1330)
+            self.assertEqual(round(m["totals"]["peak_decode"]["tok_s"], 1), m["totals"]["peak_decode"]["tok_s"])
+        finally:
+            with svc.status_lock:
+                svc.status.update(busy=False)
+                svc.current_requests.discard(r)
+
     def test_requests_record_their_api(self):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         s, _, b = self.req("GET", "/metrics")
@@ -272,6 +324,29 @@ class GpuMap(unittest.TestCase):
         self.assertEqual(self.r["pool"], 15536793108)
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
+
+    def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
+        helper = 20_000_000_000
+        r = self.gm.parse(f"VRAM dev=2 pci=0000:0f:00.0 total={32 * GB} free={5 * GB} "
+                          f"weights=0 kv=0 act=0 drafter={4 * GB} pool=0 helper={helper} slots=0 layers=-1--1")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], helper)
+        self.assertEqual(g["parts"]["drafter"], 4 * GB)
+        self.assertEqual(g["parts"]["rest"], 23 * GB - helper)
+        self.assertIsNone(g["layers"])
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        merged = self.gm.merge([r, dict(dev=2, helper=1024, free=5 * GB)])
+        self.assertEqual(merged[0]["helper"], helper + 1024)
+
+    def test_helper_pool_and_primary_pool_on_one_card_do_not_overlap(self):
+        r = dict(self.r, helper=2 * GB)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool", "helper"))
+        card = dict(self.card(engine + GB, {100: engine + GB}), total=32 * GB)
+        (g,) = self.gm.view([r], [card], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], 2 * GB)
+        self.assertEqual(g["parts"]["pool"], r["pool"])
+        self.assertEqual(g["parts"]["rest"], GB)
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
 
     def test_nvml_tells_the_engine_from_other_programs(self):
         engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
@@ -413,7 +488,8 @@ class GpuRelease(unittest.TestCase):
         from serve import server as SV, telemetry as T
         seen = [{4242, 7}, {4242, 7}, {7}]
         with mock.patch.object(T, "gpu_pids", side_effect=lambda: seen.pop(0) if len(seen) > 1 else seen[0]), \
-                mock.patch.object(SV.time, "sleep") as sleep:
+                mock.patch.object(SV.time, "sleep") as sleep, \
+                mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242, timeout=30)
         self.assertEqual(seen, [{7}])
         self.assertEqual(sleep.call_count, 2)
@@ -421,9 +497,31 @@ class GpuRelease(unittest.TestCase):
     def test_without_nvml_a_short_wait(self):
         from unittest import mock
         from serve import server as SV, telemetry as T
-        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep:
+        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep, \
+             mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242)
         sleep.assert_called_once()
+
+    def test_mac_waits_until_free_memory_stops_rising(self):
+        from unittest import mock
+        from serve import server as SV
+        gb = 1 << 30
+        free = [4 * gb, 20 * gb, 40 * gb, 40 * gb, 90 * gb]
+        with mock.patch.object(SV, "mac_free_bytes", side_effect=lambda: free.pop(0)), \
+                mock.patch.object(SV.time, "sleep") as sleep, mock.patch.object(SV.sys, "platform", "darwin"):
+            SV.wait_gpu_release(4242)
+        self.assertEqual(sleep.call_count, 3)                   # rising, rising, settled: started
+        self.assertEqual(free, [90 * gb])
+
+    def test_mac_free_bytes_reads_vm_stat(self):
+        from unittest import mock
+        from serve import server as SV
+        out = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:      10.\n"
+               "Pages active:   99.\nPages inactive:  20.\nPages speculative:  3.\nPages purgeable:  2.\n")
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout=out)):
+            self.assertEqual(SV.mac_free_bytes(), 35 * 16384)
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout="")):
+            self.assertIsNone(SV.mac_free_bytes())
 
 
 class NvmlPids(unittest.TestCase):
@@ -488,6 +586,74 @@ class Offline(unittest.TestCase):
         self.assertTrue((self.WEB / "fonts" / "OFL.txt").is_file())
         index = (self.WEB.parent / "web" / "index.html").read_text(encoding="utf-8")
         self.assertNotIn("fonts.googleapis", index)
+
+
+# the page's own modules in Node (skipped without it), the browser's few globals they touch at load stubbed out
+PAGE_STUBS = """
+const noop = () => {};
+const el = new Proxy({}, {get: (t, k) => (k in t ? t[k] : k === "dataset" || k === "style" ? (t[k] = {})
+  : k === "classList" ? (t[k] = {add: noop, remove: noop, toggle: noop}) : noop)});
+globalThis.matchMedia = () => ({matches: false, addEventListener: noop, addListener: noop});
+globalThis.localStorage = {getItem: () => null, setItem: noop, removeItem: noop};
+globalThis.document = {documentElement: el, body: el, head: el, addEventListener: noop, querySelector: () => null,
+                       createElement: () => el};
+globalThis.window = globalThis; globalThis.addEventListener = noop;
+globalThis.location = {href: "http://x/", hash: "", search: "", pathname: "/"};
+const web = process.argv[2];
+const st = await import(web + "/state.js"), sv = await import(web + "/server.js");
+"""
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "Node.js is not installed")
+class PageLogic(unittest.TestCase):
+    def node(self, body):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.mjs"
+            p.write_text(PAGE_STUBS + body, encoding="utf-8")
+            r = subprocess.run(["node", str(p), (ROOT / "serve" / "web").resolve().as_uri()], capture_output=True,
+                               encoding="utf-8", timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_thinking_pill_covers_the_chosen_level_only(self):
+        # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits
+        # on that level's segment alone
+        got = self.node("""
+const out = {};
+for (const model of ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps"]) {
+  st.setFamily(model);
+  out[model] = st.LEVELS.map((l) => [l.id, st.thinkPill(l.id)]);
+}
+console.log(JSON.stringify(out));""")
+        self.assertEqual([lv for lv, _ in got["glm-5.3-flash"]], ["none", "low", "high", "max"])
+        self.assertEqual(len(got["minimax-m3.1-flash"]), 7)
+        for model, levels in got.items():
+            n = len(levels)
+            for i, (lv, pill) in enumerate(levels):
+                with self.subTest(model=model, level=lv):
+                    self.assertEqual((pill["i"], pill["n"]), (i, n))
+                    self.assertAlmostEqual(pill["at"], 100 * i / n)
+                    self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
+        self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
+    def test_context_slider_reaches_each_models_own_top(self):
+        # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
+        # 1M), the size a config has kept as a stop of its own
+        got = self.node("""
+const r1m = {min: 4096, max: 1048576}, r256 = {min: 4096, max: 262144};
+st.S.ctxInfo = {...r1m, context: 131072};
+console.log(JSON.stringify({m1: sv.ctxStopsIn(r1m, 131072), m256: sv.ctxStopsIn(r256, 131072, 100000),
+                            settings: sv.ctxStops(), none: sv.ctxStopsIn(null, 1),
+                            win: sv.ctxHint(16384, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES}),
+                            past: sv.ctxHint(131072, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES})}));""")
+        self.assertEqual((got["m1"][0], got["m1"][-1]), (4096, 1048576))
+        self.assertEqual(got["m1"], got["settings"])                     # (the same stops as Settings > Model's)
+        self.assertEqual(got["m256"][-1], 262144)
+        self.assertIn(100000, got["m256"])
+        self.assertEqual(got["none"], [])
+        self.assertEqual(got["win"], "Up to 32K the whole cache stays in VRAM.")
+        self.assertTrue(got["past"].startswith("≈ 1.5 GB of RAM for the context"), got["past"])
 
 
 if __name__ == "__main__":

@@ -163,6 +163,40 @@ class Settings(unittest.TestCase):
             M.apply(cfg, {"images": True})
         self.assertEqual(M.choices(M.read(ds4_cfg(self.d, "maya-x.json", drafter=False)))["draft"], ["none"])
 
+    def test_deepseek_prompt_lookup_and_draft_confidence(self):
+        cfg = M.read(ds4_cfg(self.d))
+        s = M.settings_of(cfg)
+        self.assertEqual((s["prompt_lookup"], s["dspark_conf"]), (True, None))   # (the engine's: --suffix-draft 3, 0.5)
+        off = M.apply(cfg, {"prompt_lookup": False, "dspark_conf": "0.6"})
+        self.assertEqual((M.flag(off["args"], "--suffix-draft"), M.flag(off["args"], "--dspark-conf")), ("0", "0.6"))
+        self.assertEqual((M.settings_of(off)["prompt_lookup"], M.settings_of(off)["dspark_conf"]), (False, 0.6))
+        on = M.apply(off, {"prompt_lookup": True, "dspark_conf": None})["args"]
+        self.assertFalse("--suffix-draft" in on or "--dspark-conf" in on)        # (back to the engine's own)
+        own = dict(cfg, args=cfg["args"] + ["--suffix-draft", "5"])              # (a config's own match length: kept)
+        self.assertEqual(M.flag(M.apply(own, {"prompt_lookup": True})["args"], "--suffix-draft"), "5")
+        for bad, why in ((1.5, "from 0 to 1"), ("x", "a number"), (True, "a number")):
+            with self.assertRaisesRegex(ValueError, why):
+                M.apply(cfg, {"dspark_conf": bad})
+        with self.assertRaisesRegex(ValueError, "Prompt lookup"):
+            M.apply(cfg, {"prompt_lookup": "on"})
+
+    def test_minimax_memory_prompt_chunk_and_draft_confidence(self):
+        cfg = M.read(mm3_cfg(self.d))
+        new = M.apply(cfg, {"reserve_gb": "0.5", "cache_gb": 2, "prefill_chunk": 2048, "dspark_conf": 0.65})
+        a = new["args"]
+        for f, v in (("--reserve-gb", "0.5"), ("--cache-gb", "2"), ("--chunk", "2048"), ("--dspark-conf", "0.65")):
+            self.assertEqual(M.flag(a, f), v, f)
+        self.assertNotIn("--prefill-chunk", a)                                    # (maya-mm3's own name: --chunk)
+        s = M.settings_of(new)
+        self.assertEqual((s["reserve_gb"], s["cache_gb"], s["prefill_chunk"], s["dspark_conf"]), (0.5, 2.0, 2048, 0.65))
+        back = M.apply(new, {"reserve_gb": "", "cache_gb": None, "prefill_chunk": None, "dspark_conf": None})["args"]
+        for f in ("--reserve-gb", "--cache-gb", "--chunk", "--dspark-conf"):
+            self.assertNotIn(f, back)
+        with self.assertRaisesRegex(ValueError, "VRAM kept free"):
+            M.apply(cfg, {"reserve_gb": 100})
+        with self.assertRaisesRegex(ValueError, "Prompt chunk"):
+            M.apply(cfg, {"prefill_chunk": 8})
+
     def test_deepseek_answers_at_once(self):
         """maya-ds4 --parallel: read (1 where the config names none), written where it changes, 1-8."""
         cfg = M.read(ds4_cfg(self.d))
@@ -201,7 +235,9 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}), "minimax")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "images": True,
                                               "parallel": 1, "draft": "none", "tp": 4, "kv_cache": "int8",
-                                              "kv_streaming": True, "kv_resident": None, "cpu_threads": None})
+                                              "kv_streaming": True, "kv_resident": None, "cpu_threads": None,
+                                              "reserve_gb": None, "prefill_chunk": None, "cache_gb": None,
+                                              "dspark_conf": None})
         self.assertEqual(M.choices(cfg), {"draft": ["dspark", "none"], "images": True})
         new = M.apply(cfg, {"context": 262144, "draft": "dspark", "images": False, "tp": 2, "kv_cache": "fp8",
                             "kv_resident": 65536, "cpu_threads": 24})
@@ -263,6 +299,28 @@ class Settings(unittest.TestCase):
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
 
 
+    def test_context_range_per_model(self):
+        # the Engine settings' Context size slider: Settings > Model's range for each model - up to what the model was
+        # trained for (MiniMax's pack: 1M), else 256K (a GLM GGUF header it cannot read, a DeepSeek pack that does not
+        # say), never below the config's own size; untested past 256K except on DeepSeek
+        g, ds, mm = glm_cfg(self.d), ds4_cfg(self.d), mm3_cfg(self.d)
+        M._trained.clear()
+        with mock.patch.object(M, "machine_gpus", return_value=[]):
+            got = {m["family"]: m["context_range"] for m in M.listing(self.d, None)["models"]}
+        self.assertEqual(got["minimax"], {"min": 4096, "max": 1048576, "trained": 1048576, "tested": 262144})
+        self.assertEqual(got["glm"], {"min": 4096, "max": 262144, "trained": None, "tested": 262144})
+        self.assertEqual(got["deepseek"], {"min": 4096, "max": 262144, "trained": None, "tested": 1048576})
+        cfg = json.loads(ds.read_text())
+        cfg["args"][cfg["args"].index("--max-context") + 1] = "524288"
+        ds.write_text(json.dumps(cfg))
+        self.assertEqual(M.describe(ds, None)["context_range"]["max"], 524288)
+        # GLM: the GGUF header beside its pack (the server's own reading), kept once read
+        with mock.patch.object(M, "trained_context", return_value=1048576) as tc:
+            for _ in range(2):
+                self.assertEqual(M.describe(g, None)["context_range"]["max"], 1048576)
+        tc.assert_called_once_with(str((self.d / "GLM-5.3-Flash" / "Maya-M").resolve()))
+        M._trained.clear()
+
     def test_installs_the_setup_no_longer_lists_are_still_listed(self):
         """v1.1.34: unsloth's UD-Q4_K_XL (gguf-q4) and GLM's EXL3-sc_4.10bpw are out of the setup's pickers; a config of
         either is listed, shown and settable on the Models page as before."""
@@ -289,8 +347,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
 
 
-class Page(unittest.TestCase):
-    """GET /api/models, POST /api/models/settings and /api/models/switch."""
+class Served(unittest.TestCase):
+    """The server on the mock engine, its config beside another model's."""
 
     def setUp(self):
         os.environ.pop("MAYA_RESTART_ON_UPDATE", None)
@@ -324,6 +382,10 @@ class Page(unittest.TestCase):
         except urllib.error.HTTPError as e:
             with e:
                 return e.code, json.loads(e.read())
+
+
+class Page(Served):
+    """GET /api/models, POST /api/models/settings and /api/models/switch."""
 
     def test_listed(self):
         s, b = self.req("GET", "/api/models")
@@ -448,6 +510,256 @@ class Page(unittest.TestCase):
                         {"Origin": "http://elsewhere.example"})
         self.assertEqual(s, 403)
         self.assertEqual(M.flag(json.loads(self.cfg.read_text())["args"], "--max-context"), "131072")
+
+
+
+def glm_quant(d: Path, quant: str, folder: Path | None = None, pack_name="pack", shards=3, dflash=False,
+              models: Path | None = None) -> Path:
+    """A GLM config as the setup writes it for `quant`: its GGUF shards and pack in <folder> (<models>/<quant>), the
+    image encoder in vision/, the DFlash2 drafter in <models>/GLM-5.3-Flash-DFlash2 when it drafts with it."""
+    models = models or d
+    folder = folder or models / "GLM-5.3-Flash" / quant
+    pack = folder / pack_name
+    pack.mkdir(parents=True, exist_ok=True)
+    names = [f"GLM-5.3-Flash-{quant}-{i:05d}-of-{shards:05d}.gguf" for i in range(1, shards + 1)]
+    for n in names:
+        (folder / n).write_bytes(b"g" * 1000)
+    (pack / "index.txt").write_bytes(b"i" * 100)
+    (pack / "sources.json").write_text(json.dumps({"files": [{"name": n, "size": 1000} for n in names]}))
+    (folder / "vision").mkdir(exist_ok=True)
+    (folder / "vision" / "mmproj.gguf").write_bytes(b"v" * 200)
+    args = ["--glm-pack", str(pack), "--max-context", "65536"]
+    if dflash:
+        drafter = models / "GLM-5.3-Flash-DFlash2" / "GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
+        drafter.parent.mkdir(parents=True, exist_ok=True)
+        drafter.write_bytes(b"f" * 700)
+        args += ["--dflash", str(drafter)]
+    cfg = {"exe": "/b/maya", "args": args, "model_name": "glm-5.3-flash", "gpu": [0],
+           "vision": {"mmproj": str(folder / "vision" / "mmproj.gguf")},
+           "installer": {"models_dir": str(models), "quant": quant, "draft": "dflash2" if dflash else "mtp"}}
+    p = d / f"maya-{quant.lower()}.json"
+    p.write_text(json.dumps(cfg, indent=1))
+    return p
+
+
+class Delete(unittest.TestCase):
+    """A model off the list, and with its files: what its setup downloaded for it and the pack Maya built - never what
+    another model runs from, nor a GGUF of your own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_its_own_folder_and_drafter(self):
+        m = glm_quant(self.d, "Maya-M")
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        (self.d / f"run-{l.stem}.sh").write_text("#!/bin/sh\n")
+        plan = M.delete_plan(self.d, l)
+        folder = self.d / "GLM-5.3-Flash" / "Maya-L"
+        self.assertTrue(plan["ok"])
+        self.assertEqual([(Path(i["path"]).name, i["what"]) for i in plan["items"]],
+                         [("Maya-L", "folder"), ("GLM-5.3-Flash-DFlash2-Q4_K_M.gguf", "drafter")])
+        self.assertEqual((plan["gguf"], plan["pack"], plan["vision"], plan["drafter"], plan["drafter_users"]),
+                         (3, True, True, 700, []))
+        self.assertEqual(plan["bytes"], 3 * 1000 + 100 + len((folder / "pack" / "sources.json").read_bytes()) + 200 + 700)
+        out = M.delete(self.d, l, files=True)
+        self.assertEqual((out["deleted"], out["freed"]), (l.name, plan["bytes"]))
+        self.assertFalse(folder.exists() or l.exists() or (self.d / f"run-{l.stem}.sh").exists())
+        self.assertFalse((self.d / "GLM-5.3-Flash-DFlash2").exists())       # (its folder, empty now)
+        self.assertTrue(m.exists() and (self.d / "GLM-5.3-Flash" / "Maya-M" / "pack").is_dir())
+
+    def test_off_the_list_only(self):
+        l = glm_quant(self.d, "Maya-L")
+        prev, shared = l.with_name(l.name + ".prev"), l.with_name(l.stem + ".shared-settings.json")
+        prev.write_text("{}")
+        shared.write_text("{}")
+        out = M.delete(self.d, l)
+        self.assertEqual((out["freed"], out["files"]), (0, False))
+        self.assertFalse(l.exists() or prev.exists() or shared.exists())
+        self.assertTrue((self.d / "GLM-5.3-Flash" / "Maya-L" / "pack").is_dir())
+
+    def test_a_folder_another_model_runs_from(self):
+        # two quants' files in one folder (the setup's pack-<model>/ beside pack/): only its own pack and GGUF files
+        folder = self.d / "GLM-5.3-Flash"
+        glm_quant(self.d, "Maya-M", folder=folder)
+        l = glm_quant(self.d, "Maya-L", folder=folder, pack_name="pack-maya-l")
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual(sorted(i["what"] for i in plan["items"]), ["gguf", "gguf", "gguf", "pack"])
+        self.assertFalse(plan["vision"])                    # (vision/: Maya-M's too)
+        M.delete(self.d, l, files=True)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         [f"GLM-5.3-Flash-Maya-M-{i:05d}-of-00003.gguf" for i in (1, 2, 3)] + ["pack", "vision"])
+
+    def test_your_own_gguf_stays(self):
+        own = self.d / "elsewhere"
+        l = glm_quant(self.d, "Maya-L", folder=own, models=self.d / "models")
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual([i["what"] for i in plan["items"]], ["pack"])
+        self.assertIn("Your own model files", plan["kept"][0])
+        M.delete(self.d, l, files=True)
+        self.assertEqual(len(list(own.glob("*.gguf"))), 3)
+        self.assertFalse((own / "pack").exists())
+
+    def test_a_drafter_another_model_drafts_with(self):
+        m = glm_quant(self.d, "Maya-M", dflash=True)
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        os.utime(m, (1_700_000_000, 1_700_000_000))
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual(plan["drafter_users"], [m.name])
+        out = M.delete(self.d, l, files=True)
+        self.assertEqual(out["drafter_users"], [m.name])
+        cfg = json.loads(m.read_text())
+        self.assertNotIn("--dflash", cfg["args"])           # (it drafts with MTP now: its drafter is gone)
+        self.assertEqual(M.settings_of(cfg)["draft"], "mtp")
+        self.assertEqual(m.stat().st_mtime, 1_700_000_000)  # (which model starts next: as it was)
+        self.assertIn("--dflash", json.loads(m.with_name(m.name + ".prev").read_text())["args"])
+
+    def test_without_the_setups_record(self):
+        p = ds4_cfg(self.d)                                 # (no models_dir: which files are its own is not known)
+        plan = M.delete_plan(self.d, p)
+        self.assertEqual((plan["ok"], plan["items"]), (False, []))
+        with self.assertRaises(ValueError):
+            M.delete(self.d, p, files=True)
+        self.assertTrue(p.exists())
+
+
+class Leftovers(unittest.TestCase):
+    """The files in the models folder no model here runs from: a whole folder, or one quant's beside another's."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.models = self.d / "models"
+        self.big = mock.patch.object(M, "LEFTOVER_MIN", 500)       # (the fixtures' files are small)
+        self.big.start()
+
+    def tearDown(self):
+        self.big.stop()
+        self.tmp.cleanup()
+
+    def test_what_no_model_uses(self):
+        glm_quant(self.d, "Maya-M", models=self.models)
+        l = glm_quant(self.d, "Maya-L", models=self.models)
+        self.assertEqual(M.leftovers(self.d)["items"], [])     # (both GLM quants are on the list)
+        old = self.models / "DSV4"                            # (a model whose config was deleted by hand)
+        (old / "pack").mkdir(parents=True)
+        (old / "pack" / "tensors.txt").write_text("t blk.0.x\n")
+        (old / "model-00001-of-00002.safetensors").write_bytes(b"s" * 2000)
+        (old / ".cache" / "huggingface").mkdir(parents=True)
+        (self.models / "download.log").write_text("small\n")
+        l.unlink()
+        out = M.leftovers(self.d)
+        self.assertEqual(out["folders"], [str(self.models.resolve())])
+        got = {Path(i["path"]).name: (i["folder"], i["pack"], i["hub"]) for i in out["items"]}
+        self.assertEqual(got, {"DSV4": (True, True, True), "Maya-L": (True, True, False)})
+        self.assertEqual(out["bytes"], sum(i["bytes"] for i in out["items"]))
+        gone = M.delete_leftover(self.d, out["items"][0]["path"])
+        self.assertFalse(Path(gone["deleted"]).exists())
+        self.assertTrue((self.models / "GLM-5.3-Flash" / "Maya-M" / "pack").is_dir())
+
+    def test_never_a_folder_a_model_reads_through_its_pack(self):
+        # DeepSeek's drafter and vision tower beside its GGUF folder: no config names them, the pack reads them
+        p = ds4_cfg(self.d)
+        cfg = json.loads(p.read_text())
+        root = self.models / "DeepSeek-V4.1-Flash"
+        self.models.mkdir(parents=True, exist_ok=True)   # (root itself: the rename makes it; Windows will not rename onto a folder)
+        (self.d / "DeepSeek-V4.1-Flash").rename(root)
+        cfg["args"][1] = str(root / "pack")
+        cfg["installer"]["models_dir"] = str(self.models)
+        p.write_text(json.dumps(cfg))
+        for side in ("dspark", "vision"):
+            (root / side).mkdir()
+            (root / side / f"{side}.bin").write_bytes(b"d" * 2000)
+        self.assertEqual(M.leftovers(self.d)["items"], [])
+
+    def test_only_what_is_listed_is_deleted(self):
+        m = glm_quant(self.d, "Maya-M", models=self.models)
+        with self.assertRaisesRegex(ValueError, "not a file no model uses"):
+            M.delete_leftover(self.d, str(self.models / "GLM-5.3-Flash" / "Maya-M"))
+        with self.assertRaisesRegex(ValueError, "not a file no model uses"):
+            M.delete_leftover(self.d, str(self.d))
+        self.assertTrue(m.exists() and (self.models / "GLM-5.3-Flash" / "Maya-M").is_dir())
+
+
+class DeletePage(Served):
+    """POST /api/models/delete: not the model running, the app's own page only, dry_run deletes nothing."""
+
+    def test_delete(self):
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        s, b = self.req("POST", "/api/models/delete", {"file": l.name, "files": True, "dry_run": True})
+        self.assertEqual((s, b["file"], b["ok"], b["gguf"]), (200, l.name, True, 3))
+        self.assertTrue(l.exists())
+        s, _ = self.req("POST", "/api/models/delete", {"file": l.name, "files": True},
+                        {"Origin": "http://elsewhere.example"})
+        self.assertEqual(s, 403)
+        s, b = self.req("POST", "/api/models/delete", {"file": l.name, "files": True})
+        self.assertEqual((s, b["deleted"], b["freed"] > 3000), (200, l.name, True))
+        s, b = self.req("GET", "/api/models")
+        self.assertNotIn(l.name, [m["file"] for m in b["models"]])
+        self.assertFalse((self.d / "GLM-5.3-Flash" / "Maya-L").exists())
+
+    def test_not_the_one_running(self):
+        for f in (self.cfg.name, "../maya-x.json", "maya-none.json", None):
+            s, _ = self.req("POST", "/api/models/delete", {"file": f})
+            self.assertEqual(s, 400, f)
+        # the running one with a model to switch to: only where Maya can start again by itself
+        s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "then": self.other.name})
+        self.assertEqual(s, 400)
+        self.assertIn("cannot switch", b["error"]["message"])
+        self.assertTrue(self.cfg.exists())
+        self.assertFalse((self.d / M.DELETE_FILE).exists())
+
+    def test_the_running_one_after_a_switch(self):
+        os.environ["MAYA_RESTART_ON_UPDATE"] = "1"
+        with mock.patch.object(Service, "_restart_into") as restart:
+            s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "dry_run": True})
+            self.assertEqual((s, b["running"]), (200, True))
+            s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name})       # (no model to switch to)
+            self.assertEqual(s, 400)
+            s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "then": self.cfg.name})
+            self.assertEqual(s, 400)                                                     # (not itself)
+            self.assertFalse((self.d / M.DELETE_FILE).exists())
+            s, b = self.req("POST", "/api/models/delete", {"file": self.cfg.name, "then": self.other.name})
+        self.assertEqual((s, b["deleting"], b["to"]), (202, self.cfg.name, self.other.name))
+        self.assertEqual(restart.call_args[0][0].name, self.other.name)
+        self.assertTrue(self.cfg.exists())                    # (it runs until the switch)
+        # the next server, on the other model: it deletes it, once
+        self.svc.config_path = str(self.other)
+        self.svc.finish_delete()
+        self.assertFalse(self.cfg.exists() or (self.d / M.DELETE_FILE).exists())
+        self.assertEqual((self.svc.deleted["deleted"], self.svc.deleted["model"]), (self.cfg.name, "glm-5.3-flash"))
+        s, b = self.req("GET", "/api/models")
+        self.assertEqual((b["deleted"]["deleted"], [m["file"] for m in b["models"]]), (self.cfg.name, [self.other.name]))
+
+    def test_a_switch_that_did_not_happen_deletes_nothing(self):
+        note = {"config": str(self.cfg.resolve()), "files": True, "time": time.time()}
+        (self.d / M.DELETE_FILE).write_text(json.dumps(note))
+        self.svc.finish_delete()                              # (the same model runs again)
+        self.assertTrue(self.cfg.exists())
+        self.assertIn("running now", self.svc.deleted["error"])
+        (self.d / M.DELETE_FILE).write_text(json.dumps(dict(note, time=time.time() - 3600)))
+        self.svc.config_path = str(self.other)
+        self.svc.finish_delete()                              # (a stale note: an hour old)
+        self.assertTrue(self.cfg.exists())
+        self.assertFalse((self.d / M.DELETE_FILE).exists())
+
+    def test_leftovers_from_the_page_only(self):
+        models = self.d / "models"
+        glm_quant(self.d, "Maya-S", models=models)            # (the folder stays known: a config downloaded into it)
+        glm_quant(self.d, "Maya-L", models=models).unlink()
+        with mock.patch.object(M, "LEFTOVER_MIN", 500):
+            s, b = self.req("GET", "/api/models")
+            [item] = b["leftovers"]["items"]
+            s, _ = self.req("POST", "/api/models/leftovers", {"path": item["path"]}, {"Origin": "http://elsewhere.example"})
+            self.assertEqual(s, 403)
+            s, out = self.req("POST", "/api/models/leftovers", {"path": item["path"]})
+        self.assertEqual((s, out["freed"]), (200, item["bytes"]))
+        self.assertFalse(Path(item["path"]).exists())
+        s, _ = self.req("POST", "/api/models/leftovers", {"path": item["path"]})
+        self.assertEqual(s, 400)
 
 
 if __name__ == "__main__":

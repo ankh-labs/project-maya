@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
+#include "strata/platform/idle_gate.hpp"
 
 #include "ggml.h"
 
@@ -58,6 +59,11 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#if defined(STRATA_USE_HIP)
+#include <dxgi.h>
+#else
+#include <dxgi1_4.h>
+#endif
 #include "strata/platform/commit.hpp"
 #include "strata/platform/dedicated.hpp"
 #endif
@@ -68,6 +74,46 @@
 #endif
 
 namespace gf = strata::kernels::glmf;
+
+// NON_LOCAL is the process's WDDM system-memory budget, not free VRAM.
+// Match CUDA's adapter by LUID; adapter 0 need not be the CUDA device.
+static bool glm_pin_budget(int device, uint64_t& budget, uint64_t& usage) {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    bool found = false;
+    for (UINT i = 0; !found; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (FAILED(factory->EnumAdapters1(i, &adapter))) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, prop.luid, sizeof prop.luid) == 0) {
+            IDXGIAdapter3* a3 = nullptr;
+            if (SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&a3)))) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+                    budget = info.Budget;
+                    usage = info.CurrentUsage;
+                    found = true;
+                }
+                a3->Release();
+            }
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+#else
+    (void) device;
+    (void) budget;
+    (void) usage;
+    return false;
+#endif
+}
 
 // Keeps the GPU out of its idle P-state for ns nanoseconds.  A consumer card at P8 drops its PCIe link (Gen1 on an
 // RTX 4070 Ti SUPER / 5070 Ti), and copies alone do not wake it, so a link timed at idle reads 3-8x slower than it
@@ -968,11 +1014,26 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->md.ring = dp;
     F->route_error_h = (volatile int*) (F->ring_h + gf::kRingSize);
     F->md.route_error = (volatile int*) ((gf::MoeRequest*) dp + gf::kRingSize);
-    if (cudaHostAlloc(&hp, sizeof(gf::MoeResponse) * 8, cudaHostAllocMapped) != cudaSuccess) {
+    if (cudaMalloc((void**) &F->md.route_err_d, 64) != cudaSuccess || cudaMemset(F->md.route_err_d, 0, 64) != cudaSuccess) {
+        err = "glm fast: the route error flag did not allocate";
+        return false;
+    }
+    // OURS (cd52717): EIGHT responses, one a channel - the rotor's row 1 answers into its own slot, and without this every
+    // row writes slot 0 and one waiter loses its answer.  Upstream allocates ONE.  Both sides only add here, so the union
+    // is the resolution.
+    //
+    // The pointer must come from THIS allocation: at cd52717 `hp` was then re-used for the 64-byte channel words and
+    // resp_h was taken from it, so every answer was written past the end of a 64-byte pinned buffer - the host heap
+    // overflow fixed in bf3b16f and proven neutral against the same-boot n = 1 baseline.
+    gf::MoeResponse* resp8 = nullptr;
+    if (cudaHostAlloc((void**) &resp8, sizeof(gf::MoeResponse) * 8, cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the routing response did not allocate";
         return false;
     }
-    std::memset(hp, 0, sizeof(gf::MoeResponse) * 8);
+    std::memset(resp8, 0, sizeof(gf::MoeResponse) * 8);
+    F->resp_h = resp8;
+    cudaHostGetDevicePointer(&dp, resp8, 0);
+    F->md.resp = (gf::MoeResponse*) dp;
     // [8] one per channel: "the seq I just published", in host memory (the pipeline's host-side readiness read)
     if (cudaHostAlloc(&hp, 64, cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the channel seq words did not allocate";
@@ -982,9 +1043,6 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->need_seq_h = (unsigned int*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.need_seq = (unsigned int*) dp;
-    F->resp_h = (gf::MoeResponse*) hp;
-    cudaHostGetDevicePointer(&dp, hp, 0);
-    F->md.resp = dp;
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->hop_h, (size_t) g.hc * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {
@@ -1535,6 +1593,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->left.assign((size_t) NL * g.n_expert, 0);
         std::vector<size_t> cls_stride;
         std::vector<double> cls_weight;
+        std::vector<int64_t> cls_required;
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             const size_t st = (F->L[(size_t) il].blob + 4095u) & ~(size_t) 4095u;
@@ -1545,12 +1604,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                 c = (int) cls_stride.size();
                 cls_stride.push_back(st);
                 cls_weight.push_back(0.0);
+                cls_required.push_back(0);
             }
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
             cls_weight[(size_t) c] +=
                 (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+            // Peak lending excludes the entire tail and the deferred-promotion
+            // spares. Unlike disk tiers, full residency needs no read-ahead reserve.
+            const int held = glmfast::warm_pool_slots(F->unified_memory, F->lp[(size_t) il].n_main,
+                                                       g.n_expert, gf::kSpares);
+            cls_required[(size_t) c] += std::max<int64_t>(0, (int64_t) g.n_expert - held);
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -1558,6 +1623,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         // (a complete pool too: nothing is outside VRAM to hold - the 8065S's 32 GB of OS RAM keep ~0.6 GB more)
         const bool staging_only = glmfast::minimal_ram_tier(F->unified_memory || F->complete, nmin >= g.n_expert,
                                                            ram_budget_ >= 0 || getenv("STRATA_GLM_RAM_GB") != nullptr);
+        const char* balanced_env = getenv("STRATA_GLM_RAM_BALANCED");
+        const bool balanced_ram = glmfast::balanced_resident_ram(balanced_env && std::atoi(balanced_env) != 0,
+                                                                  F->ram_resident, staging_only);
+        if (balanced_ram && n_parts_ != 1) {
+            err = "glm fast: MAYA_GLM_RAM_BALANCED currently requires one GPU";
+            return false;
+        }
         if (staging_only) {
             // Decode misses and pool-tail lending still need landing slots. Keep
             // only the existing per-class floor; do not duplicate the expert cache.
@@ -1651,6 +1723,39 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        if (balanced_ram) {
+            // Preserve the existing 512 MiB upload guard and leave room for the
+            // update tables, disk staging, and a small allocation overhead. DXGI
+            // is an upper bound only: successful driver pinning is still required.
+            uint64_t wddm_budget = 0, wddm_usage = 0;
+            const uint64_t fixed = FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long)) + (4ull << 20);
+            if (g.n_exp_used <= 0 || !sstride ||
+                (uint64_t) g.n_exp_used > (std::numeric_limits<uint64_t>::max() - fixed) / sstride) {
+                err = "glm fast: invalid balanced RAM staging size";
+                return false;
+            }
+            const uint64_t future = (uint64_t) g.n_exp_used * sstride + fixed;
+            const uint64_t guard = 512ull << 20;
+            if (glm_pin_budget(dev_, wddm_budget, wddm_usage)) {
+                const uint64_t free = wddm_budget > wddm_usage ? wddm_budget - wddm_usage : 0;
+                const uint64_t after_future = free > future ? free - future : 0;
+                const uint64_t usable = after_future > guard ? after_future - guard : 0;
+                budget = (int64_t) std::min<uint64_t>((uint64_t) std::max<int64_t>(0, budget), usable);
+                std::fprintf(stderr, "glm pin budget: Budget=%llu CurrentUsage=%llu future=%llu guard=%llu usable=%lld\n",
+                             (unsigned long long) wddm_budget, (unsigned long long) wddm_usage,
+                             (unsigned long long) future, (unsigned long long) guard, (long long) budget);
+            }
+            for (size_t c = 0; c < cls_stride.size(); ++c) {
+                cls_required[c] = std::max<int64_t>(1, cls_required[c]);  // a landing slot even with a full pool
+                std::fprintf(stderr, "glm RAM plan: class %zu stride=%zu mandatory=%lld preferred=%lld\n", c,
+                             cls_stride[c], (long long) cls_required[c], (long long) cls_cap[c]);
+            }
+            if (!glmfast::ram_class_plan((uint64_t) std::max<int64_t>(0, budget), cls_stride, cls_required, cls_cap, cls_n)) {
+                err = "glm fast: --glm-ram-resident: balanced RAM mandatory class capacity exceeds available pinned budget "
+                      "(including lending and spares)";
+                return false;
+            }
+        }
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
         // have planned (a later part's measurement then sees no tier half pinned)
         if (split_load_ != nullptr) {
@@ -1739,8 +1844,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             R.per_part = piece_mb > 0 ? (int) std::max<int64_t>(1, (piece_mb << 20) / (int64_t) R.stride) : 0;
             int64_t n = cls_n[c];
             const int64_t cap = cls_cap[c];
-            const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
-            if (pin_left >= 0) n = std::max(least, std::min(n, share(c)));
+            // Do not retry below mandatory lending/spare capacity in balanced resident mode.
+            const int64_t least = balanced_ram ? cls_required[c] : std::min<int64_t>(16, cap);
+            if (!balanced_ram && pin_left >= 0) n = std::max(least, std::min(n, share(c)));
             void* p = nullptr;
             // a refusal near a pinning cap: the size measured (above), and should that be refused too, 1/32 less a
             // try for the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
@@ -1768,12 +1874,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                     int64_t planned = 0;
                     for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
                     pin_left = pin_room(planned + (int64_t) kPinRoom);
-                    const int64_t fit = share(c);
-                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, the RAM tier sized to it\n",
-                                 dev_, (double) pin_left / 1073741824.0);
-                    if (fit < n) {
-                        n = std::max(least, fit);
-                        continue;
+                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, %s\n",
+                                 dev_, (double) pin_left / 1073741824.0,
+                                 balanced_ram ? "mandatory RAM slots retained" : "the RAM tier sized to it");
+                    if (!balanced_ram) {
+                        const int64_t fit = share(c);
+                        if (fit < n) {
+                            n = std::max(least, fit);
+                            continue;
+                        }
                     }
                 }
                 const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
@@ -1784,15 +1893,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                 err = "glm fast: the pinned RAM tier did not allocate";
                 return false;
             }
+            R.base = (uint8_t*) p;
+            R.n = (int) n;  // track ownership before a strict-capacity failure, so cleanup can free it
+            if (balanced_ram) {
+                uint64_t b = 0, u = 0;
+                if (glm_pin_budget(dev_, b, u))
+                    std::fprintf(stderr, "glm pin allocated: class %zu slots=%lld Budget=%llu CurrentUsage=%llu\n", c,
+                                 (long long) n, (unsigned long long) b, (unsigned long long) u);
+            }
+            const int64_t required_cap = balanced_ram ? cls_required[c] : cap;
             // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
-            if (F->ram_resident && !staging_only && n < cap) {
+            if (F->ram_resident && !staging_only && n < required_cap) {
                 err = "glm fast: --glm-ram-resident: the RAM tier cannot hold every non-VRAM expert (class " +
-                      std::to_string(c) + ": " + std::to_string(n) + " of " + std::to_string(cap) +
+                      std::to_string(c) + ": " + std::to_string(n) + " of " + std::to_string(required_cap) +
                       " slots pinned; raise MAYA_GLM_RAM_GB, its headroom, or lower --max-context)";
                 return false;
             }
-            R.base = (uint8_t*) p;
-            R.n = (int) n;
             R.key.assign((size_t) n, -1);
             R.st.assign((size_t) n, FastState::kRFree);
             R.tick.assign((size_t) n, 0);
@@ -1819,9 +1935,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         for (auto& R : F->rc) ram_slots += R.n;
         std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
                      (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
-        if (F->ram_resident)
-            std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: every non-VRAM expert gets a slot (+%d slack/layer); disk evictions are OFF\n",
-                         dev_, F->ram_slack);
+        if (F->ram_resident) {
+            if (balanced_ram)
+                std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: mandatory lending/spares reserved; "
+                                     "optional slack budgeted; disk evictions are OFF\n", dev_);
+            else
+                std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: every non-VRAM expert gets a slot (+%d slack/layer); disk evictions are OFF\n",
+                             dev_, F->ram_slack);
+        }
         // the prompt path's lend cap (Strata's, from the share of the expert bytes held pinned), now that it is known
         if (pf_ != nullptr) {
             double held = (double) F->ram_bytes, all = 0;
@@ -3999,7 +4120,8 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
-    if (F->need_seq_h) cudaFreeHost(F->need_seq_h);
+    if (F->need_seq_h) cudaFreeHost(F->need_seq_h);   // ours
+    if (F->md.route_err_d) cudaFree(F->md.route_err_d);   // upstream's
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);
@@ -4293,13 +4415,21 @@ void Glm5Model::fast_service() {
     // system then lacked, and the server's stall watchdog could never see a stuck engine as idle.  A decode's routes
     // come ~1 ms apart (two GPUs: half a token between a card's routes), so it spins all through one.  After
     // STRATA_GLM_SERVICE_IDLE_MS (200; 0 = spin always) without a route it polls every 0.1 ms (Windows' timer: 1 ms),
-    // after 10x that every 2 ms - the first route after a quiet spell is answered up to one sleep later
+    // after 10x that every 2 ms - the first route after a quiet spell is answered up to one sleep later.  After
+    // STRATA_GLM_SERVICE_DEEP_S (60; 0 = never) of quiet - a server nobody is talking to - it sleeps on the idle gate
+    // for STRATA_GLM_SERVICE_DEEP_MS (100) at a time, ~10 wakeups a second instead of 500 (a core's worth of timer
+    // interrupts a GPU on a quiet machine, issue #685); the thread that reads the engine's input pokes the gate at
+    // each line, so the next request's first route finds the thread awake (strata/platform/idle_gate.hpp)
     static const int kIdleMs = [] {
         const char* v = getenv("STRATA_GLM_SERVICE_IDLE_MS");
         return v ? std::max(0, std::atoi(v)) : 200;
     }();
+    static const int kDeepS = strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_S", 60);
+    static const int kDeepMs = std::max(1, strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_MS", 100));
+    strata::platform::IdleGate& gate = strata::platform::idle_gate();
+    uint64_t gate_seen = 0;
     auto last_route = std::chrono::steady_clock::now();
-    int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps
+    int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps, 3 the idle gate
     // a batched verify window's layer with two window lanes: its routes held until the layer's last token routed,
     // then answered together (win_cpu_merged; STRATA_GLM_WIN_CPU=0: each token to a lane as its route comes)
     static const bool win_merge = [] {
@@ -4321,6 +4451,7 @@ void Glm5Model::fast_service() {
     unsigned int kick_polls = 0;
 #endif
     while (!F->quit.load(std::memory_order_relaxed)) {
+        if (idle == 3) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
         const unsigned int sq = rq->seq;
         // the CHANNEL's published seq, in host memory: purely host-side (the device writing host memory broke the plain
@@ -4351,8 +4482,17 @@ void Glm5Model::fast_service() {
                     }
                 }
 #endif
-                if (idle == 2) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (idle == 3) {
+                    if (gate.sleep(kDeepMs, gate_seen)) {   // the engine was written to: awake, as after a route
+                        idle = 0;
+                        polls = 0;
+                        last_route = std::chrono::steady_clock::now();
+                    }
+                } else if (idle == 2) {
+                    if (kDeepS > 0 && std::chrono::steady_clock::now() - last_route > std::chrono::seconds(kDeepS))
+                        idle = 3;
+                    else
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 } else if (idle == 1) {
 #ifdef _WIN32
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -4600,12 +4740,7 @@ void Glm5Model::fast_service() {
                     return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
-                F->workers->run(nr * 3 * rch, [&](int job) {
-                    const int m = rd[job / (3 * rch)], part = job % (3 * rch);
-                    fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
-                });
-                for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
-                if (nw > 0) {
+                const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
                     const auto tw = std::chrono::steady_clock::now();
                     for (int i = 0; i < nw; ++i)
                         while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
@@ -4614,17 +4749,74 @@ void Glm5Model::fast_service() {
                     F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - tw).count(),
                                             std::memory_order_relaxed);
+                };
+                // STRATA_GLM_STREAM_FETCH (on; =0 off - zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE
+                // the reads, each read job sets its chunk's bit of ready[] once the chunk is in the slot, and the
+                // device's fetch copies the chunks as they land - the PCIe pull runs behind the SSD read instead of
+                // after it.  The same bytes reach the same slots (the output is unchanged).  GGUF packs only (EXL3's
+                // chunks are laid out differently), and at most 10 chunks a part (32 bits a ready word).
+                static const bool stream_env = [] {
+                    const char* v = getenv("STRATA_GLM_STREAM_FETCH");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
+                // OURS (cd52717): the waiter's OWN response buffer.  Upstream writes F->resp_h (slot 0) here, which for the rotor
+                // means both rows answer into one slot and the loser of the race never sees its seq.
+                gf::MoeResponse* Rp = F->resp_h + (size_t) (rq->ch & 7);
+                if (stream) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "glm fast: CUDA%d disk misses stream to the GPU behind their reads "
+                                     "(%d chunks a part; MAYA_GLM_STREAM_FETCH=0 turns it off)\n", dev_, rch);
+                    }
+                    if (nw > 0) wait_ahead();
+                    const auto& Lys = F->L[(size_t) il];
+                    Rp->ptr_mask = 0;
+                    Rp->n_upd = 0;
+                    Rp->cpu = 0;
+                    Rp->stream_mask = 0;
+                    Rp->s_gu = (unsigned long long) Lys.gu_bytes;
+                    Rp->s_dn = (unsigned long long) Lys.dn_bytes;
+                    Rp->s_chunks = rch;
+                    for (int m = 0; m < nm; ++m) {
+                        Rp->ptr[mi[m]] = (unsigned long long) dst[m];
+                        Rp->ptr_mask |= 1u << mi[m];
+                        Rp->ready[mi[m]] = 0xffffffffu;   // (landed already)
+                    }
+                    for (int r2 = 0; r2 < nr; ++r2) {
+                        Rp->ready[mi[rd[r2]]] = 0u;
+                        Rp->stream_mask |= 1u << mi[rd[r2]];
+                    }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    Rp->seq = next;
                 }
-                gf::MoeResponse* Rp = F->resp_h + (size_t) (rq->ch & 7);   // the waiter's own buffer
-                Rp->ptr_mask = 0;
-                Rp->n_upd = 0;
-                Rp->cpu = 0;
-                for (int m = 0; m < nm; ++m) {
-                    Rp->ptr[mi[m]] = (unsigned long long) dst[m];
-                    Rp->ptr_mask |= 1u << mi[m];
+                F->workers->run(nr * 3 * rch, [&](int job) {
+                    const int m = rd[job / (3 * rch)], part = job % (3 * rch);
+                    fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
+                    if (stream) {   // the chunk is in the slot: its bit tells the fetch kernel
+                        // (the .cu files build as C++17: no std::atomic_ref - a lock-free atomic over the same word)
+                        static_assert(sizeof(std::atomic<unsigned int>) == sizeof(unsigned int) &&
+                                      std::atomic<unsigned int>::is_always_lock_free, "ready word");
+                        std::atomic_thread_fence(std::memory_order_release);
+                        reinterpret_cast<std::atomic<unsigned int>*>(&Rp->ready[mi[m]])
+                            ->fetch_or(1u << part, std::memory_order_release);
+                    }
+                });
+                for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
+                if (!stream) {
+                    if (nw > 0) wait_ahead();
+                    Rp->ptr_mask = 0;
+                    Rp->n_upd = 0;
+                    Rp->cpu = 0;
+                    Rp->stream_mask = 0;
+                    for (int m = 0; m < nm; ++m) {
+                        Rp->ptr[mi[m]] = (unsigned long long) dst[m];
+                        Rp->ptr_mask |= 1u << mi[m];
+                    }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    Rp->seq = next;
                 }
-                std::atomic_thread_fence(std::memory_order_release);
-                Rp->seq = next;
                 const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - t0).count();
                 F->disk_reads.fetch_add((uint64_t) nr, std::memory_order_relaxed);   // read here (not ahead)

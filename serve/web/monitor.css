@@ -18,6 +18,8 @@
 .pill--warn .status__dot { background: var(--st-warn); }
 .pill--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .pill--danger .status__dot { background: var(--st-danger); }
+.pill--ok { background: var(--st-ok-tint); color: var(--st-ok-text); }
+.pill--ok .status__dot { background: var(--st-ok); }
 .mon__wait { color: var(--st-ink-muted); }
 .banners { display: flex; flex-direction: column; gap: 8px; }
 .mon__h2 { margin: 8px 0 -4px; font-size: var(--st-fs-base); font-weight: 600; }
@@ -109,7 +111,7 @@
    blindnesses, on both themes); the expert pool keeps the experts' VRAM colour, the CUDA context a neutral grey, free the
    bare track */
 .gpumap { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-prompt: #1aa3be; --gm-tp: #5566d0; --gm-drafter: #d55181;
-          --gm-pool: var(--st-accent); --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
+          --gm-pool: var(--st-accent); --gm-helper: #a273d1; --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
           --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); }
 [data-theme="light"] .gpumap { --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-prompt: #0b8fa8; --gm-tp: #3c4bb4;
                                --gm-drafter: #e87ba4; --gm-other: #eb6834; }
@@ -138,6 +140,7 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
 .gpurows[data-focus="weights"] .gpubar__seg[data-k="weights"], .gpurows[data-focus="kv"] .gpubar__seg[data-k="kv"],
 .gpurows[data-focus="act"] .gpubar__seg[data-k="act"], .gpurows[data-focus="drafter"] .gpubar__seg[data-k="drafter"],
 .gpurows[data-focus="prompt"] .gpubar__seg[data-k="prompt"], .gpurows[data-focus="tp"] .gpubar__seg[data-k="tp"],
+.gpurows[data-focus="helper"] .gpubar__seg[data-k="helper"],
 .gpurows[data-focus="pool"] .gpubar__seg[data-k="pool"], .gpurows[data-focus="vision"] .gpubar__seg[data-k="vision"],
 .gpurows[data-focus="rest"] .gpubar__seg[data-k="rest"], .gpurows[data-focus="other"] .gpubar__seg[data-k="other"],
 .gpurows[data-focus="used"] .gpubar__seg[data-k="used"] { opacity: 1; }
@@ -176,6 +179,7 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
+  .speeds { row-gap: 14px; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }

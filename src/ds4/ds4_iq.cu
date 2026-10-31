@@ -1,9 +1,13 @@
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
+#include "ds4_iq1_codes.hpp"
 #include "ds4_pdl.cuh"
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/prefill/moe_fused_rdna4.hpp"
+#endif
 #include <cstring>
 #include <map>
 #include <memory>
@@ -42,11 +46,13 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 
 namespace strata::ds4::gguf::iq {
 namespace {
@@ -62,6 +68,7 @@ template <> struct Ty<kIQ2_S> { static constexpr int B = 82, TAB = 2048, MIN = 0
 template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 0; };
 template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
 template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
+template <> struct Ty<kIQ4_NL> { static constexpr int B = 18, TAB = 4, MIN = 0; };   // (32 values a block: d, 16 bytes)
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ5_K> { static constexpr int B = 176, TAB = 0, MIN = 1; };   // (a GGUF's dense weights in Q5_K)
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
@@ -76,22 +83,23 @@ template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
                   sizeof(block_iq1_m) == 56 && sizeof(block_iq2_xs) == 74 && sizeof(block_q5_K) == 176 &&
-                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34,
+                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34 && sizeof(block_iq4_nl) == 18,
               "ggml's block sizes");
 static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the codes 8 g +- 1 below");
 
 template <int T>
 __host__ __device__ __forceinline__ size_t row_bytes_t(int k) { return (size_t) (k / kQK<T>) * Ty<T>::B; }
 
-// the type's codebook into shared memory (u32 words; IQ4_XS: its 16 values, from bytes - an int8 table's alignment)
+// the type's codebook into shared memory (u32 words; IQ4_XS, IQ4_NL: their 16 values, from bytes - an int8 table's
+// alignment)
 template <int T>
 __device__ __forceinline__ void load_tab(uint32_t* tab) {
-    if constexpr (T == kIQ4_XS) {
+    if constexpr (T == kIQ4_XS || T == kIQ4_NL) {
         if (threadIdx.x < 4) {
             const uint8_t* kv = (const uint8_t*) kvalues_iq4nl + 4 * threadIdx.x;
             tab[threadIdx.x] = (uint32_t) kv[0] | (uint32_t) kv[1] << 8 | (uint32_t) kv[2] << 16 | (uint32_t) kv[3] << 24;
@@ -146,15 +154,10 @@ __device__ __forceinline__ int2 tab16(uint32_t q4, const uint32_t* t) {   // vec
     }
     return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
 }
-// IQ1_S / IQ1_M: 4 grid values as their int8 codes 8 g +- 1 (g in {-1, 0, 1}) - n holds g + 1 (iq1s_grid_gpu's nibble)
-// times 8 in bits 3..6 of each byte (0, 8 or 16); bias 0x79 (delta +1/8: 8 n - 7) or 0x77 (-1/8: 8 n - 9) a byte, its
-// top bit flipped back after: each byte's sum stays below 0x100, so nothing carries into the next
-__device__ __forceinline__ int iq1c(uint32_t n8, uint32_t bias) { return (int) (((n8 & 0x78787878u) + bias) ^ 0x80808080u); }
-__device__ __forceinline__ uint32_t iq1_bias(uint32_t neg) { return neg ? 0x77777777u : 0x79797979u; }
+// IQ1_S / IQ1_M: 4 grid values as their int8 codes 8 g +- 1 (g in {-1, 0, 1}): iq1c, iq1_bias (ds4_iq1_codes.hpp)
 // IQ1_M's F16 block scale: the top nibbles of its 4 scale words (s01: words 0, 1; s23: words 2, 3)
 __device__ __forceinline__ float iq1m_d(uint32_t s01, uint32_t s23) {
-    const uint32_t u = ((s01 >> 12) & 0xFu) | ((s01 >> 24) & 0xF0u) | ((s23 >> 4) & 0xF00u) | ((s23 >> 16) & 0xF000u);
-    return __half2float(__ushort_as_half((unsigned short) u));
+    return __half2float(__ushort_as_half((unsigned short) iq1m_d16(s01, s23)));
 }
 __device__ __forceinline__ int q3k_scale(const uint8_t* sc, int is) {
     const int lo = is < 8 ? sc[is] & 15 : sc[is - 8] >> 4;
@@ -200,7 +203,9 @@ __device__ __forceinline__ void iq1_load(const uint8_t* __restrict__ row, int kb
         r.s23 = ld4(b + 52);
     }
 }
-template <int T>
+// CT: IQ1_M's codes from its code table (tab: kIq1mCodes entries of two words, the persistent kernels') - the grid
+// lookup and the delta's bias in one load, the same codes
+template <int T, bool CT = false>
 __device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t* tab, Sub& s) {
     const int ib = kb & 7;
     if constexpr (T == kIQ1_S) {
@@ -216,19 +221,23 @@ __device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t
     } else {
 #pragma unroll
         for (int l = 0; l < 4; ++l) {   // group l: index bits 4 l .. 4 l + 2 of h, the delta's sign bit 4 l + 3
-            const uint32_t g = tab[((r.q4 >> (8 * l)) & 255u) | (((r.h >> (4 * l)) & 7u) << 8)];
-            const uint32_t bias = iq1_bias((r.h >> (4 * l + 3)) & 1u);
-            s.q[2 * l] = iq1c(g << 3, bias);
-            s.q[2 * l + 1] = iq1c(g >> 1, bias);
+            if constexpr (CT) {
+                const uint2 c = ((const uint2*) tab)[iq1m_entry(r.q4, r.h, l)];
+                s.q[2 * l] = (int) c.x;
+                s.q[2 * l + 1] = (int) c.y;
+            } else {
+                const uint32_t g = tab[((r.q4 >> (8 * l)) & 255u) | (((r.h >> (4 * l)) & 7u) << 8)];
+                const uint32_t bias = iq1_bias((r.h >> (4 * l + 3)) & 1u);
+                s.q[2 * l] = iq1c(g << 3, bias);
+                s.q[2 * l + 1] = iq1c(g >> 1, bias);
+            }
         }
-        const uint32_t w = ((ib >> 1) < 2 ? r.s01 : r.s23) >> (16 * ((ib >> 1) & 1) + 6 * (ib & 1));
-        s.s0 = 2 * (int) (w & 7u) + 1;          // values 0..15
-        s.s1 = 2 * (int) ((w >> 3) & 7u) + 1;   // 16..31
+        iq1m_scales(r.s01, r.s23, ib, s.s0, s.s1);   // (values 0..15, 16..31)
         s.d = iq1m_d(r.s01, r.s23) * 0.125f;
     }
     (void) ib;
 }
-template <int T>
+template <int T, bool CT = false>
 __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
     const int ib = kb & 7;
     const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
@@ -323,6 +332,17 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         }
         s.s0 = s.s1 = ls - 32;
         s.d = h2f(b);
+    } else if constexpr (T == kIQ4_NL) {   // a block of 32 (b: block kb): d, then value j's code in byte j's low nibble
+        const uint8_t* qs = b + 2;           // (j < 16) or byte j - 16's high one; 18-byte blocks: 2-byte aligned
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int2 v = tab16(ld2(qs + 4 * t), tab);
+            s.q[t] = v.x;
+            s.q[4 + t] = v.y;
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        (void) ib;
     } else if constexpr (T == kQ4_K) {
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -371,7 +391,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
     } else if constexpr (T == kIQ1_S || T == kIQ1_M) {
         Raw1 r;
         iq1_load<T>(row, kb, r);
-        iq1_decode<T>(r, kb, tab, s);
+        iq1_decode<T, CT>(r, kb, tab, s);
         (void) b;
     } else if constexpr (T == kQ6_K) {   // quarter ib & 3 of half ib >> 2: ggml's dequantize_row_q6_K's loop
         const int hf = ib >> 2, qt = ib & 3;
@@ -483,7 +503,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
+    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
     if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
@@ -546,6 +566,13 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         const int8_t* kv = (const int8_t*) tab;
 #pragma unroll
         for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+    } else if constexpr (T == kIQ4_NL) {   // (block kb: 32 values, as IQ4_XS's sub-block)
+        const float dl = h2f(b);
+        const uint8_t* qs = b + 2 + 8 * (p & 1);
+        const int8_t* kv = (const int8_t*) tab;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+        (void) ib;
     } else if constexpr (T == kQ4_K) {
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -680,7 +707,8 @@ __device__ __forceinline__ float lanes_sum(float v) {
 constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
 
 // AH: a lane's next sub-block's raw words loaded a step ahead (IQ1 only); else each decoded from the row as before
-template <int T, bool AH>
+// (CT: IQ1_M through its code table)
+template <int T, bool AH, bool CT = false>
 struct Ahead {
     static constexpr bool on = AH && (T == kIQ1_S || T == kIQ1_M);
     Raw1 r{};
@@ -688,8 +716,8 @@ struct Ahead {
         if constexpr (on) iq1_load<T>(row, kb, r);
     }
     __device__ __forceinline__ void get(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) const {
-        if constexpr (on) iq1_decode<T>(r, kb, tab, s);
-        else decode<T>(row, kb, tab, s);
+        if constexpr (on) iq1_decode<T, CT>(r, kb, tab, s);
+        else decode<T, CT>(row, kb, tab, s);
     }
 };
 
@@ -697,10 +725,49 @@ struct Ahead {
 // otherwise rival the weights it reads - 50 or 56 bytes a block).  Every row's sums are the same whatever RP and AH (the
 // same lanes, the same order), so the window's entries keep the token path's bits.
 
+// ---- persistent grids (PS; ds4_iq.cuh's persist_on, DS4_IQ_PERSIST)
+// The kernels below load their type's codebook into shared memory at a block's start; for a large one (8 KiB and more:
+// IQ1_S, IQ1_M, IQ2_S) that load rivals the block's weights.  PS: a grid of the blocks the device holds at once, each
+// block loading its codebook once (when its first live work item comes) and then taking work items round the grid - an
+// item the full grid's block (x, group), group by group.  An item's rows are the same warps' and lanes' as that block's,
+// summed in the same order: every output keeps its bits, whatever the grid.  The smaller codebooks keep the full grid (a
+// block there loads little, and one of an empty group leaves at once).  CUDA's maya-ds4 only: HIP and maya-mm3's build
+// of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's epilogues (EPI 1..3).
+#if defined(STRATA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
+#define DS4_IQ_PERSIST_BUILD 0
+#else
+#define DS4_IQ_PERSIST_BUILD 1
+#endif
+template <int T, int EPI>
+constexpr bool kPersist = DS4_IQ_PERSIST_BUILD && Ty<T>::TAB * 4 >= 8192 && EPI == 0;
+// IQ1_M in a persistent kernel: its codes from a table of kIq1mCodes entries (ds4_iq1_codes.hpp), built once a block
+template <int T, bool PS>
+constexpr bool kCodes = PS && T == kIQ1_M;
+template <int T, bool CT>   // (the words of shared memory the codebook takes)
+constexpr int kTabW = CT ? 2 * kIq1mCodes : Ty<T>::TAB > 0 ? Ty<T>::TAB : 1;
+template <int T, bool CT>
+__device__ __forceinline__ void load_tab_k(uint32_t* tab) {
+    if constexpr (CT) {   // (entry j: grid entry j mod 2048's codes, the delta's sign j >> 11)
+        uint2* c = (uint2*) tab;
+        for (int j = threadIdx.x; j < kIq1mCodes; j += blockDim.x) {
+            uint32_t lo, hi;
+            iq1m_codes(iq1s_grid_gpu[j & 2047], (uint32_t) j >> 11, lo, hi);
+            c[j] = make_uint2(lo, hi);
+        }
+    } else {
+        load_tab<T>(tab);
+    }
+}
+// the groups a token / window kernel's items cover (a window's: those of its count)
+__device__ __forceinline__ int live_groups(const Args& a, int groups) {
+    return a.grp_ptr != nullptr ? min(groups, *a.n_groups) : groups;
+}
+
 // grid (n_ff / (8 RW RP), groups): RW rows of the gate and of the up a warp a pass, NE of the group's entries a pass
-// (each sub-block decoded once for them) -> h = the clamped swiglu (EPI: act_out's)
-template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0>
-__global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
+// (each sub-block decoded once for them) -> h = the clamped swiglu (EPI: act_out's).  PS (RP 1): the persistent grid
+// above, an item the full grid's block (bx, group)
+template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0, bool PS = false>
+__global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int groups) {
 #if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
 #endif
@@ -708,127 +775,149 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
     pdl_trigger();
     constexpr int LPR = 32 / RW;
     constexpr bool TWO = kBoth<EPI>;
-    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    constexpr bool CT = kCodes<T, PS>;
+    static_assert(!PS || RP == 1, "a persistent item: one pass of rows");
+    __shared__ __align__(16) uint32_t tab[kTabW<T, CT>];
     __shared__ int es[NE], xr[NE];
-    const uint8_t* blob;
-    int m0, m1;
-    if (!group(a, blockIdx.y, blob, m0, m1)) return;   // (uniform)
-    load_tab<T>(tab);
     const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
     const size_t rb = row_bytes_t<T>(a.n_embd);
     const int nsb = a.n_embd / 32;
-    for (int mm = m0; mm < m1; mm += NE) {
-        const int ne = min(NE, m1 - mm);
-        __syncthreads();
-        if ((int) threadIdx.x < ne) {
-            const int e = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
-            es[threadIdx.x] = e;
-            xr[threadIdx.x] = a.grp_ptr != nullptr ? e >> 3 : 0;
+    const int nbx = PS ? a.n_ff / (kWarps * RW) : 1;   // (the full grid's blocks a group)
+    const int items = PS ? live_groups(a, groups) * nbx : 1;
+    bool loaded = false;
+    for (int it = PS ? (int) blockIdx.x : 0; it < items; it += PS ? (int) gridDim.x : 1) {
+        const int grp = PS ? it / nbx : (int) blockIdx.y, bx = PS ? it % nbx : (int) blockIdx.x;
+        const uint8_t* blob;
+        int m0, m1;
+        if (!group(a, grp, blob, m0, m1)) continue;   // (uniform; the full grid's block: its one item)
+        if (!loaded) {   // (the codebook once a block; the barrier before the first use is the loop's below)
+            load_tab_k<T, CT>(tab);
+            loaded = true;
         }
-        __syncthreads();
-        for (int p = 0; p < RP; ++p) {
-            const int row = ((blockIdx.x * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
-            if (row >= a.n_ff) continue;   // (a whole warp: n_ff % (8 RW) == 0)
-            const uint8_t* g = blob + a.tr[kRole0<EPI>] + (size_t) row * rb;
-            const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
-            float ag[NE], au[NE];
-#pragma unroll
-            for (int i = 0; i < NE; ++i) ag[i] = au[i] = 0.0f;
-            Ahead<T, AH> pg, pu;
-            if (lane < nsb) {
-                pg.load(g, lane);
-                if constexpr (TWO) pu.load(u, lane);
+        for (int mm = m0; mm < m1; mm += NE) {
+            const int ne = min(NE, m1 - mm);
+            __syncthreads();
+            if ((int) threadIdx.x < ne) {
+                const int e = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+                es[threadIdx.x] = e;
+                xr[threadIdx.x] = a.grp_ptr != nullptr ? e >> 3 : 0;
             }
-            for (int kb = lane; kb < nsb; kb += LPR) {
-                Ahead<T, AH> ng = pg, nu = pu;
-                if (kb + LPR < nsb) {
-                    ng.load(g, kb + LPR);
-                    if constexpr (TWO) nu.load(u, kb + LPR);
+            __syncthreads();
+            for (int p = 0; p < RP; ++p) {
+                const int row = ((bx * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+                if (row >= a.n_ff) continue;   // (a whole warp: n_ff % (8 RW) == 0)
+                const uint8_t* g = blob + a.tr[kRole0<EPI>] + (size_t) row * rb;
+                const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
+                float ag[NE], au[NE];
+#pragma unroll
+                for (int i = 0; i < NE; ++i) ag[i] = au[i] = 0.0f;
+                Ahead<T, AH, CT> pg, pu;
+                if (lane < nsb) {
+                    pg.load(g, lane);
+                    if constexpr (TWO) pu.load(u, lane);
                 }
-                Sub sg, su;
-                pg.get(g, kb, tab, sg);
-                if constexpr (TWO) pu.get(u, kb, tab, su);
+                for (int kb = lane; kb < nsb; kb += LPR) {
+                    Ahead<T, AH, CT> ng = pg, nu = pu;
+                    if (kb + LPR < nsb) {
+                        ng.load(g, kb + LPR);
+                        if constexpr (TWO) nu.load(u, kb + LPR);
+                    }
+                    Sub sg, su;
+                    pg.get(g, kb, tab, sg);
+                    if constexpr (TWO) pu.get(u, kb, tab, su);
+#pragma unroll
+                    for (int i = 0; i < NE; ++i)
+                        if (i < ne) {
+                            const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
+                            const int4 xa = xp[0], xb = xp[1];
+                            const float dx = a.xd[(size_t) xr[i] * nsb + kb];
+                            ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
+                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
+                        }
+                    pg = ng;
+                    if constexpr (TWO) pu = nu;
+                }
 #pragma unroll
                 for (int i = 0; i < NE; ++i)
                     if (i < ne) {
-                        const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
-                        const int4 xa = xp[0], xb = xp[1];
-                        const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                        ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
-                        if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
+                        float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
+                        if constexpr (TWO) {
+                            const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
+                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit);
+                        } else {
+                            const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
+                            if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
+                        }
                     }
-                pg = ng;
-                if constexpr (TWO) pu = nu;
             }
-#pragma unroll
-            for (int i = 0; i < NE; ++i)
-                if (i < ne) {
-                    float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
-                    if constexpr (TWO) {
-                        const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                        if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit);
-                    } else {
-                        const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
-                        if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
-                    }
-                }
         }
     }
 }
 
 // grid (n_embd / (8 RW RP), groups): RW rows of the down a warp a pass for NE entries a pass, against their int8 h ->
-// part
-template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
-__global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
+// part.  PS (RP 1): as gate_up_kernel's
+template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW, bool PS = false>
+__global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups) {
 #if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
 #endif
     pdl_wait();
     pdl_trigger();
     constexpr int LPR = 32 / RW;
-    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    constexpr bool CT = kCodes<T, PS>;
+    static_assert(!PS || RP == 1, "a persistent item: one pass of rows");
+    __shared__ __align__(16) uint32_t tab[kTabW<T, CT>];
     __shared__ int es[NE];
-    const uint8_t* blob;
-    int m0, m1;
-    if (!group(a, blockIdx.y, blob, m0, m1)) return;
-    load_tab<T>(tab);
     const int lane32 = threadIdx.x & 31, lane = lane32 % LPR;
     const size_t rb = row_bytes_t<T>(a.n_ff);
     const int nsb = a.n_ff / 32;
-    for (int mm = m0; mm < m1; mm += NE) {
-        const int ne = min(NE, m1 - mm);
-        __syncthreads();
-        if ((int) threadIdx.x < ne) es[threadIdx.x] = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
-        __syncthreads();
-        for (int p = 0; p < RP; ++p) {
-            const int row = ((blockIdx.x * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
-            if (row >= a.n_embd) continue;
-            const uint8_t* d = blob + a.tr[2] + (size_t) row * rb;
-            float ad[NE];
+    const int nbx = PS ? a.n_embd / (kWarps * RW) : 1;
+    const int items = PS ? live_groups(a, groups) * nbx : 1;
+    bool loaded = false;
+    for (int it = PS ? (int) blockIdx.x : 0; it < items; it += PS ? (int) gridDim.x : 1) {
+        const int grp = PS ? it / nbx : (int) blockIdx.y, bx = PS ? it % nbx : (int) blockIdx.x;
+        const uint8_t* blob;
+        int m0, m1;
+        if (!group(a, grp, blob, m0, m1)) continue;
+        if (!loaded) {
+            load_tab_k<T, CT>(tab);
+            loaded = true;
+        }
+        for (int mm = m0; mm < m1; mm += NE) {
+            const int ne = min(NE, m1 - mm);
+            __syncthreads();
+            if ((int) threadIdx.x < ne) es[threadIdx.x] = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+            __syncthreads();
+            for (int p = 0; p < RP; ++p) {
+                const int row = ((bx * RP + p) * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR;
+                if (row >= a.n_embd) continue;
+                const uint8_t* d = blob + a.tr[2] + (size_t) row * rb;
+                float ad[NE];
 #pragma unroll
-            for (int i = 0; i < NE; ++i) ad[i] = 0.0f;
-            Ahead<T, AH> pd;
-            if (lane < nsb) pd.load(d, lane);
-            for (int kb = lane; kb < nsb; kb += LPR) {
-                Ahead<T, AH> nd = pd;
-                if (kb + LPR < nsb) nd.load(d, kb + LPR);
-                Sub sd;
-                pd.get(d, kb, tab, sd);
-                pd = nd;
+                for (int i = 0; i < NE; ++i) ad[i] = 0.0f;
+                Ahead<T, AH, CT> pd;
+                if (lane < nsb) pd.load(d, lane);
+                for (int kb = lane; kb < nsb; kb += LPR) {
+                    Ahead<T, AH, CT> nd = pd;
+                    if (kb + LPR < nsb) nd.load(d, kb + LPR);
+                    Sub sd;
+                    pd.get(d, kb, tab, sd);
+                    pd = nd;
+#pragma unroll
+                    for (int i = 0; i < NE; ++i)
+                        if (i < ne) {
+                            const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
+                            const int4 ha = hp[0], hb = hp[1];
+                            ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                        }
+                }
 #pragma unroll
                 for (int i = 0; i < NE; ++i)
                     if (i < ne) {
-                        const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
-                        const int4 ha = hp[0], hb = hp[1];
-                        ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                        const float v = lanes_sum<RW>(ad[i]);
+                        if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = v;
                     }
             }
-#pragma unroll
-            for (int i = 0; i < NE; ++i)
-                if (i < ne) {
-                    const float v = lanes_sum<RW>(ad[i]);
-                    if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = v;
-                }
         }
     }
 }
@@ -1120,68 +1209,82 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
 }
 
 // grid (n_ff / 8 or n_embd / 8, n_exp): a light expert's rows, a warp a row of the weights (gate and up, or down), every
-// row of the expert a pass -> h16 (the F16 swiglu) or y
-template <int T, int NE, bool GATE_UP, int EPI = 0>
+// row of the expert a pass -> h16 (the F16 swiglu) or y.  PS: the persistent grid (as the token kernels'), an item the
+// full grid's block (bx, expert)
+template <int T, int NE, bool GATE_UP, int EPI = 0, bool PS = false>
 __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
                                                           const float* __restrict__ xd) {
     pdl_wait();
     pdl_trigger();
     constexpr bool TWO = GATE_UP && kBoth<EPI>;   // (gate and up in this pass; EPI 2 / 3: one of them, as w0)
-    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
-    const int e = blockIdx.y;
-    const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
-    if (ne <= 0 || ne > NE) return;   // (uniform: the tiles take an expert of more rows)
-    load_tab<T>(tab);
-    __syncthreads();
+    constexpr bool CT = kCodes<T, PS>;
+    __shared__ __align__(16) uint32_t tab[kTabW<T, CT>];
     const int K = GATE_UP ? a.n_embd : a.n_ff, N = GATE_UP ? a.n_ff : a.n_embd, nsb = K / 32;
-    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= N) return;
-    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const int lane = threadIdx.x & 31;
     const size_t rb = row_bytes_t<T>(K);
-    const uint8_t* w0 = blob + a.tr[GATE_UP ? kRole0<EPI> : 2] + (size_t) row * rb;
-    const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
-    const size_t q0 = (size_t) e * kLightRows;
-    float a0[NE], a1[NE];
+    const int nbx = PS ? (N + kWarps - 1) / kWarps : 1;
+    const int items = PS ? a.n_exp * nbx : 1;
+    bool loaded = false;
+    for (int it = PS ? (int) blockIdx.x : 0; it < items; it += PS ? (int) gridDim.x : 1) {
+        const int e = PS ? it / nbx : (int) blockIdx.y, bx = PS ? it % nbx : (int) blockIdx.x;
+        const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
+        if (ne <= 0 || ne > NE) continue;   // (uniform: the tiles take an expert of more rows)
+        if (!loaded) {   // (the codebook once a block: the only barrier, at the first live item - every warp is there)
+            load_tab_k<T, CT>(tab);
+            __syncthreads();
+            loaded = true;
+        }
+        const int row = bx * kWarps + (threadIdx.x >> 5);
+        if (row >= N) continue;   // (a warp's)
+        const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+        const uint8_t* w0 = blob + a.tr[GATE_UP ? kRole0<EPI> : 2] + (size_t) row * rb;
+        const uint8_t* w1 = blob + a.tr[1] + (size_t) row * rb;
+        const size_t q0 = (size_t) e * kLightRows;
+        float a0[NE], a1[NE];
 #pragma unroll
-    for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
-    for (int kb = lane; kb < nsb; kb += 32) {
-        Sub s0, s1;
-        decode<T>(w0, kb, tab, s0);
-        if (TWO) decode<T>(w1, kb, tab, s1);
+        for (int i = 0; i < NE; ++i) a0[i] = a1[i] = 0.0f;
+        for (int kb = lane; kb < nsb; kb += 32) {
+            Sub s0, s1;
+            decode<T, CT>(w0, kb, tab, s0);
+            if (TWO) decode<T, CT>(w1, kb, tab, s1);
+#pragma unroll
+            for (int i = 0; i < NE; ++i)
+                if (i < ne) {
+                    const int4* xp = (const int4*) (xq + (q0 + i) * K + (size_t) kb * 32);
+                    const int4 xa = xp[0], xb = xp[1];
+                    const float dx = xd[(q0 + i) * nsb + kb];
+                    a0[i] = fmaf(dx, sub_dot<T>(s0, xa, xb), a0[i]);
+                    if (TWO) a1[i] = fmaf(dx, sub_dot<T>(s1, xa, xb), a1[i]);
+                }
+        }
 #pragma unroll
         for (int i = 0; i < NE; ++i)
             if (i < ne) {
-                const int4* xp = (const int4*) (xq + (q0 + i) * K + (size_t) kb * 32);
-                const int4 xa = xp[0], xb = xp[1];
-                const float dx = xd[(q0 + i) * nsb + kb];
-                a0[i] = fmaf(dx, sub_dot<T>(s0, xa, xb), a0[i]);
-                if (TWO) a1[i] = fmaf(dx, sub_dot<T>(s1, xa, xb), a1[i]);
+                const float v0 = warp_sum(a0[i]);
+                const float v1 = TWO ? warp_sum(a1[i]) : 0.0f;
+                if (lane == 0) {
+                    const size_t lr = (size_t) (lo + i);
+                    if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
+                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
+                    else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
+                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + row], v0, a.limit)));
+                }
             }
     }
-#pragma unroll
-    for (int i = 0; i < NE; ++i)
-        if (i < ne) {
-            const float v0 = warp_sum(a0[i]);
-            const float v1 = TWO ? warp_sum(a1[i]) : 0.0f;
-            if (lane == 0) {
-                const size_t lr = (size_t) (lo + i);
-                if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
-                else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
-                else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
-                else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + row], v0, a.limit)));
-            }
-        }
 }
 
 // (tests: decode_values) each sub-block of n rows decoded as the token kernels (decode: the codes times their scales,
 // sub_dot's roundings) and as the tiles' loader (deq8) read it
-template <int T>
+// (CT: IQ1_M's codes through the persistent kernels' code table, the tiles' values through the grid as theirs)
+template <int T, bool CT = false>
 __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restrict__ w, int k, int n, float* sub,
                                                            float* tile) {
     pdl_wait();
     pdl_trigger();
-    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ __align__(16) uint32_t tab[kTabW<T, false>];
+    __shared__ __align__(16) uint32_t ctab[CT ? kTabW<T, true> : 1];
     load_tab<T>(tab);
+    if constexpr (CT) load_tab_k<T, true>(ctab);
     __syncthreads();
     const int nsb = k / 32;
     const size_t rb = row_bytes_t<T>(k);
@@ -1190,7 +1293,7 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
         const uint8_t* row = w + (size_t) r * rb;
         float* o = sub + (size_t) r * k + (size_t) kb * 32;
         Sub s;
-        decode<T>(row, kb, tab, s);
+        decode<T, CT>(row, kb, CT ? ctab : tab, s);
 #pragma unroll
         for (int t = 0; t < 8; ++t)
 #pragma unroll
@@ -1210,30 +1313,33 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
     }
 }
 
-bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel
-#if defined(STRATA_USE_HIP)
-#if STRATA_HAS_WMMA
-    static const bool ok = [] {
-        int dev = 0;
-        cudaDeviceProp p{};
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-               (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0) &&
-               !(v != nullptr && v[0] == '1');
-    }();
-    return ok;
-#else
+// as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
+// of a run need not be of one generation: one before sm_70 beside newer ones keeps its F32 kernel)
+bool tc_ok() {
+#if defined(STRATA_USE_HIP) && !STRATA_HAS_WMMA
     return false;
-#endif
 #else
-    static const bool ok = [] {
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    static const bool off = [] {
         const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return major >= 7 && !(v != nullptr && v[0] == '1');
+        return v != nullptr && v[0] == '1';
     }();
-    return ok;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+#if defined(STRATA_USE_HIP)
+        cudaDeviceProp p{};
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                        (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0);
+#else
+        int major = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 7;
+#endif
+        k = ok ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k == 2;
 #endif
 }
 
@@ -1253,6 +1359,7 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_
         case kQ3_K: F(kQ3_K); break;       \
         case kIQ1_S: F(kIQ1_S); break;     \
         case kIQ1_M: F(kIQ1_M); break;     \
+        case kIQ4_NL: F(kIQ4_NL); break;   \
         default: return false;       \
     }
 // ... and the dense matrices' types beside them (the GEMVs, the FP16 rows, decode_values)
@@ -1287,30 +1394,114 @@ const Iq1Var& iq1_var() {
     }();
     return v;
 }
+
+// the persistent grids (kPersist): DS4_IQ_PERSIST (MAYA_DS4_IQ_PERSIST, read as STRATA_DS4_IQ_PERSIST): 0 off, 1 on,
+// unset: on for a device of compute capability 8.0 and up (measured about 2% slower on a V100); set_persist over it (tests)
+std::atomic<int> g_persist_set{-1};
+#if DS4_IQ_PERSIST_BUILD
+int persist_env() {   // -1: not set
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_IQ_PERSIST");
+        if (e == nullptr) e = std::getenv("DS4_IQ_PERSIST");
+        return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
+    }();
+    return v;
+}
+// the current device's default: compute capability 8.0 and up
+bool persist_dev_default() {
+    static std::atomic<signed char> known[64];   // 0: not asked yet, 1: off, 2: on
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        v = major >= 8 ? 2 : 1;
+        known[dev].store((signed char) v, std::memory_order_relaxed);
+    }
+    return v == 2;
+}
+#endif
+// the token kernels' persistent form: their plain variant (RP 1, no early loads - DS4_IQ_RP=4 / DS4_IQ_AHEAD=1 keep
+// the full grid's variants they ask for)
+template <int T>
+bool persist_plain() {
+    if (!persist_on()) return false;   // (kPersist's types only)
+    if constexpr (T == kIQ1_S || T == kIQ1_M) {
+        const Iq1Var& v = iq1_var();
+        return v.rp != 4 && !(v.ah >= 0 ? v.ah != 0 : kAhead<T>);
+    }
+    return true;
+}
+#if DS4_IQ_PERSIST_BUILD
+// a persistent grid of kernel K for `items` work items: the blocks the current device holds at once (its SMs times
+// K's occupancy, asked once a device), at most one an item
+template <auto K>
+unsigned persist_blocks(long long items) {
+    static std::atomic<int> known[64];   // 0: not asked yet, -1: not known (a block an item), else the blocks
+    int dev = 0, v = -1;
+    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+        v = known[dev].load(std::memory_order_relaxed);
+        if (v == 0) {
+            int sms = 0, per = 0;
+            if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, K, kThreads, 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                sms = per = 0;
+            }
+            v = sms > 0 && per > 0 ? sms * per : -1;
+            known[dev].store(v, std::memory_order_relaxed);
+        }
+    }
+    return (unsigned) std::max<long long>(1, v > 0 ? std::min<long long>(items, v) : items);
+}
+#endif
+
 // grid.x: the blocks of one pass (n / (kWarps RW))
 template <int T, int NE, int EPI = 0>
 void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
+#if DS4_IQ_PERSIST_BUILD
+    if constexpr (kPersist<T, EPI>)
+        if (persist_plain<T>()) {   // (an item a block (x, group) of the grid below)
+            constexpr auto K = gate_up_kernel<T, NE, 1, false, kGuRW, EPI, true>;
+            pdl_launch(K, persist_blocks<K>((long long) grid.x * grid.y), kThreads, 0, s, a, (int) grid.y);
+            return;
+        }
+#endif
     if constexpr (T == kIQ1_S || T == kIQ1_M) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true, kGuRW, EPI>, g4, kThreads, 0, s, a); return; }
-        if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false, kGuRW, EPI>, g4, kThreads, 0, s, a); return; }
-        if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true, kGuRW, EPI>, grid, kThreads, 0, s, a); return; }
+        const int ng = (int) grid.y;
+        if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true, kGuRW, EPI>, g4, kThreads, 0, s, a, ng); return; }
+        if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false, kGuRW, EPI>, g4, kThreads, 0, s, a, ng); return; }
+        if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true, kGuRW, EPI>, grid, kThreads, 0, s, a, ng); return; }
     }
-    pdl_launch(gate_up_kernel<T, NE, 1, false, kGuRW, EPI>, grid, kThreads, 0, s, a);
+    pdl_launch(gate_up_kernel<T, NE, 1, false, kGuRW, EPI>, grid, kThreads, 0, s, a, (int) grid.y);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
+#if DS4_IQ_PERSIST_BUILD
+    if constexpr (kPersist<T, 0>)
+        if (persist_plain<T>()) {
+            constexpr auto K = down_kernel<T, NE, 1, false, kDnRW, true>;
+            pdl_launch(K, persist_blocks<K>((long long) grid.x * grid.y), kThreads, 0, s, a, (int) grid.y);
+            return;
+        }
+#endif
     if constexpr (T == kIQ1_S || T == kIQ1_M) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { pdl_launch(down_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
-        if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
-        if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
+        const int ng = (int) grid.y;
+        if (rp && ah) { pdl_launch(down_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a, ng); return; }
+        if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a, ng); return; }
+        if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a, ng); return; }
     }
-    pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a);
+    pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a, (int) grid.y);
 }
 template <int T, int EPI = 0>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
@@ -1343,17 +1534,20 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
     }
     pdl_launch(set_kernel<T, GU, BM, EPI>, grid, kThreads, 0, s, a);
 }
-// the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
+// the light sets' int8 rows, per device and stream (kLightMaxExp kLightRows rows of k): the default stream is one handle
+// on every device (and a destroyed stream's handle may come back on another)
 struct LightBuf {
     int8_t* q = nullptr;
     float* d = nullptr;
     size_t cap = 0;
 };
 std::mutex g_lmu;
-std::unordered_map<cudaStream_t, LightBuf> g_light;
+std::map<std::pair<int, cudaStream_t>, LightBuf> g_light;
 LightBuf* light_buf(cudaStream_t s, int k) {
     std::lock_guard<std::mutex> lk(g_lmu);
-    LightBuf& b = g_light[s];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    LightBuf& b = g_light[{dev, s}];
     const size_t need = (size_t) kLightMaxExp * kLightRows * (size_t) std::max(k, 8192);
     if (b.cap < need) {
         if (b.q != nullptr) cudaFree(b.q);
@@ -1377,12 +1571,24 @@ bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
 template <int T, bool GU, int EPI = 0>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
+#if DS4_IQ_PERSIST_BUILD
+    if constexpr (kPersist<T, EPI>)
+        if (a.max_rows <= 4 && persist_on()) {   // (experts of a few rows: the codebook a block is then the cost)
+            constexpr auto K = light_kernel<T, 4, GU, EPI, true>;
+            pdl_launch(K, persist_blocks<K>((long long) grid.x * grid.y), kThreads, 0, s, a, b.q, b.d);
+            return;
+        }
+#endif
     if (a.max_rows <= 4) pdl_launch(light_kernel<T, 4, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
     else if (a.max_rows <= 8) pdl_launch(light_kernel<T, 8, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
     else pdl_launch(light_kernel<T, kLightRows, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
 }
 // a set's gate and up of different types (SetArgs::tu, kActOai only): two passes, the gate's sums in graw between them
 bool split_gu(const SetArgs& a) { return a.act == kActOai && a.tu != 0 && a.tu != a.tg; }
+// the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types (256 values; IQ4_NL's 32)
+bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
+    return n_embd % block_values(tg) == 0 && (tu == 0 || n_embd % block_values(tu) == 0) && n_ff % block_values(td) == 0;
+}
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     if (gu && a.act != kActSwiglu && (a.tg == kMXFP4 || (split_gu(a) && a.graw == nullptr))) return false;
@@ -1455,6 +1661,7 @@ int block_bytes(int t) {
         case kQ3_K: return Ty<kQ3_K>::B;
         case kIQ1_S: return Ty<kIQ1_S>::B;
         case kIQ1_M: return Ty<kIQ1_M>::B;
+        case kIQ4_NL: return Ty<kIQ4_NL>::B;
         default: return 0;
     }
 }
@@ -1475,12 +1682,13 @@ const char* name(int t) {
         case kQ3_K: return "Q3_K";
         case kIQ1_S: return "IQ1_S";
         case kIQ1_M: return "IQ1_M";
+        case kIQ4_NL: return "IQ4_NL";
         default: return "?";
     }
 }
 
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
-    if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
+    if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or (gate and up of different types) two
         if (a.tu == 0 || a.tu == a.tg) {
@@ -1504,7 +1712,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 }
 
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
-    if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
+    if (a.n_ff % block_values(a.td) != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
 #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
     DS4_IQ_SWITCH(a.td, DN_)
@@ -1512,14 +1720,26 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
-bool light_gate_up(const SetArgs& a, cudaStream_t s) {
-    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+bool light_gate_up(const SetArgs& a, cudaStream_t s) {   // (both roles' blocks whole, as for the down)
+    if (a.n_exp > kLightMaxExp || !light_on() || !k_whole(a.n_embd, a.n_ff, a.tg, a.tu, a.td)) return false;
     return light_set(a, true, s);
 }
 bool light_down(const SetArgs& a, cudaStream_t s) {
-    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    if (a.n_exp > kLightMaxExp || !light_on() || !k_whole(a.n_embd, a.n_ff, a.tg, a.tu, a.td)) return false;
     return light_set(a, false, s);
 }
+
+bool persist_on() {
+#if !DS4_IQ_PERSIST_BUILD
+    return false;
+#else
+    const int t = g_persist_set.load(std::memory_order_relaxed);
+    if (t >= 0) return t != 0;
+    const int e = persist_env();
+    return e >= 0 ? e != 0 : persist_dev_default();
+#endif
+}
+void set_persist(int on) { g_persist_set.store(on < 0 ? -1 : on != 0 ? 1 : 0, std::memory_order_relaxed); }
 
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
 // Prompt expert sets through the existing GLM MMQ path (HIP, opt-in).
@@ -1787,11 +2007,125 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 
 #endif
 
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+// Prompt expert sets through the fused int8 experts the GLM prompt uses (strata::prefill::rdna4, gfx1151 / gfx1100 /
+// RDNA4): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to
+// int8 per 32 values (as GLM's), the products on the int8 matrix cores.  On by default where it covers the set's formats
+// (STRATA_DS4_PREFILL_FUSED=0: the FP16 tiles above).  The set's rows are gathered into the scratch of the caller's
+// FusedScratchScope (its down output: unused until the down writes it), H goes into the caller's FP16 rows at their
+// stride (2 n_ff bytes: an int8 row is act_bytes(1, n_ff)), and the down reads it there - both passes decide alike.
+namespace {
+thread_local void* fused_scratch = nullptr;
+thread_local size_t fused_scratch_bytes = 0;
+}
+FusedScratchScope::FusedScratchScope(void* scratch, size_t bytes)
+    : previous_(fused_scratch), previous_bytes_(fused_scratch_bytes) {
+    fused_scratch = scratch;
+    fused_scratch_bytes = bytes;
+}
+FusedScratchScope::~FusedScratchScope() {
+    fused_scratch = previous_;
+    fused_scratch_bytes = previous_bytes_;
+}
+namespace {
+// STRATA_DS4_PREFILL_FUSED: unset = on for gfx1151 (Strix / Gorgon Halo, where it is measured), 1 = on wherever the
+// fused experts run (gfx1100, RDNA4: not measured), 0 = off
+bool fused_on() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_DS4_PREFILL_FUSED");
+        return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (mode >= 0) return mode == 1;
+    static std::mutex mu;
+    static std::map<int, bool> halo;   // (a device's answer, asked once)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = halo.find(dev);
+    if (it != halo.end()) return it->second;
+    cudaDeviceProp prop{};
+    const bool on = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+    halo[dev] = on;
+    return on;
+}
+// (the same decision for the set's two passes: none of what it reads differs between them)
+bool fused_wanted(const SetArgs& a) {
+    if (!fused_on() || fused_scratch == nullptr || a.n_exp <= 0 || a.n_exp > 512 || !mmq_host_bounds || mmq_rows <= 0)
+        return false;
+    if (mmq_host_bounds[0] != a.row0 || mmq_host_bounds[a.n_exp] - a.row0 != mmq_rows) return false;
+    if (a.n_embd != 5120 || a.n_ff != 2304 || a.act != kActSwiglu || (a.tu != 0 && a.tu != a.tg) || a.skip_ge > 0)
+        return false;
+    if (fused_scratch_bytes < strata::prefill::rdna4::act_bytes(mmq_rows, a.n_embd)) return false;
+    return strata::prefill::rdna4::supported(a.tg, a.td);
+}
+strata::prefill::rdna4::Geometry fused_geo(const SetArgs& a, size_t h_ld) {
+    strata::prefill::rdna4::Geometry g;
+    g.gu_type = a.tg;
+    g.d_type = a.td;
+    g.gu_row = (size_t) (a.n_embd / 256) * (size_t) block_bytes(a.tg);
+    g.d_row = (size_t) (a.n_ff / 256) * (size_t) block_bytes(a.td);
+    g.gate_off = a.tr[0];
+    g.up_off = a.tr[1];
+    g.down_off = a.tr[2];
+    g.limit = a.limit;
+    g.n_embd = a.n_embd;
+    g.n_ff = a.n_ff;
+    g.h_ld = h_ld;
+    return g;
+}
+// the tiles' list (two ints a tile), a device's own: at most the rows' tiles and one partial tile an expert
+void* fused_tiles(int rows, int n_exp) {
+    static std::mutex mu;
+    static std::map<int, std::pair<void*, size_t>> per_dev;
+    const size_t need = ((size_t) rows / 64 + (size_t) n_exp + 8) * 2 * sizeof(int);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& t = per_dev[dev];
+    if (t.second < need) {
+        if (t.first != nullptr) {
+            cudaDeviceSynchronize();
+            cudaFree(t.first);
+        }
+        t = {nullptr, 0};
+        if (cudaMalloc(&t.first, need) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        t.second = need;
+    }
+    return t.first;
+}
+bool fused_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
+    void* tiles = fused_tiles(mmq_rows, a.n_exp);
+    if (tiles == nullptr) return false;
+    strata::prefill::rdna4::quantize_rows(a.xf, a.ldx, a.idx, mmq_rows, a.n_embd, fused_scratch, s);
+    strata::prefill::rdna4::experts_gate_up(a.wbase, a.stride, fused_geo(a, (size_t) a.ldo * 2), a.n_exp, a.bounds,
+                                            mmq_host_bounds, tiles, fused_scratch, nullptr, a.h, s);
+    return true;
+}
+bool fused_down(const SetArgs& a, cudaStream_t s) {
+    if (a.xh == nullptr || a.y == nullptr || a.ldo != a.n_embd) return false;
+    void* tiles = fused_tiles(mmq_rows, a.n_exp);
+    if (tiles == nullptr) return false;
+    strata::prefill::rdna4::experts_down(a.wbase, a.stride, fused_geo(a, (size_t) a.ldx * 2), a.n_exp, a.bounds,
+                                         mmq_host_bounds, tiles, a.xh, a.y, s);
+    return true;
+}
+}  // namespace
+#endif
+
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (fused_wanted(a)) {
+        if (fused_gate_up(a, s)) return true;
+        std::fprintf(stderr, "ds4: the fused prompt experts could not run a set\n");
+        std::abort();   // (its down would read H the FP16 tiles never wrote)
+    }
     if (mmq_wanted(a, true) && mmq_gate_up(a, s)) return true;
 #endif
-    if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
+    if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % BN != 0) return false;
     if (split_gu(a) && a.graw == nullptr) return false;
     SetArgs t = a;
     if (light_gate_up(a, s)) {   // the experts of a few rows; the tiles the others
@@ -1822,9 +2156,14 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (fused_wanted(a)) {
+        if (fused_down(a, s)) return true;
+        std::fprintf(stderr, "ds4: the fused prompt experts could not run a set's down\n");
+        std::abort();   // (H is int8 here: the FP16 tiles cannot read it)
+    }
     if (mmq_wanted(a, false) && mmq_down(a, s)) return true;
 #endif
-    if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
+    if (a.n_ff % block_values(a.td) != 0 || a.n_embd % BN != 0) return false;
     SetArgs t = a;
     if (light_down(a, s)) {
         if (a.max_rows <= kLightRows) return true;
@@ -1933,6 +2272,12 @@ void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h
 bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s) {
     if (k % block_values(type) != 0 || k % 32 != 0 || n < 1) return false;
     const unsigned blocks = (unsigned) std::min<int>(1024, (n * (k / 32) + kThreads - 1) / kThreads);
+#if DS4_IQ_PERSIST_BUILD
+    if (type == kIQ1_M && persist_on()) {   // (the persistent kernels' decode: the code table)
+        pdl_launch(values_kernel<kIQ1_M, true>, blocks, kThreads, 0, s, w, k, n, sub, tile);
+        return true;
+    }
+#endif
 #define DV_(T) pdl_launch(values_kernel<T>, blocks, kThreads, 0, s, w, k, n, sub, tile)
     DS4_IQ_SWITCH_MV(type, DV_)
 #undef DV_

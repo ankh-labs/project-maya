@@ -9,7 +9,7 @@ from __future__ import annotations
 # tower runs in the engine's own process: vision_own, and which also tells its prompt chunks' buffers apart (prompt)
 # and what its tensor parallel copies (tp, of a group of tp_n GPUs - out of its weights and kv))
 BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",
-         "vision_own", "prompt", "tp")
+         "vision_own", "prompt", "tp", "helper")
 
 
 def parse(line: str) -> dict | None:
@@ -94,7 +94,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=No
         pool = max(0, r.get("pool", 0) - (r.get("tail", 0) if lent else 0))
         parts = {"weights": r.get("weights", 0), "kv": r.get("kv", 0), "act": r.get("act", 0),
                  "prompt": r.get("prompt", 0), "tp": r.get("tp", 0),
-                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
+                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool, "helper": r.get("helper", 0)}
         engine = sum(parts.values())
         own, enc = held_by(procs, mine), held_by(procs, enc_pids)
         inside = r.get("vision_own", 0) if enc is None else 0   # (a vision tower in the engine's own process)

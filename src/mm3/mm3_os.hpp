@@ -13,6 +13,7 @@
 
 #if !defined(_WIN32)
 #include <cerrno>
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -106,6 +107,27 @@ inline const uint8_t* map_file(const std::string& path, size_t& bytes) {
     sys::close_fd(f);   // (the mapping keeps the file)
     if (m != nullptr) bytes = (size_t) sz;
     return (const uint8_t*) m;
+}
+
+/// Drops the whole pages of [p, p + n) of a read-only file mapping from this process once their bytes are copied
+/// elsewhere (the pinned pool, a GPU): the mapped pages would otherwise count twice in RAM (the pool's copy and the
+/// mapping) and, on Windows, in the working set the available-memory figure misses.  Linux: MADV_DONTNEED (the
+/// mapping's pages leave RSS), then MADV_PAGEOUT where the kernel has it (the clean page-cache copy goes too);
+/// Windows: VirtualUnlock on pages that are not locked takes them out of the working set.  Partial edge pages stay
+/// (a neighbour's bytes).  Advisory: a failure changes nothing, a later read just faults the page in again.
+inline void drop_mapped(const void* p, size_t n) {
+    const uintptr_t pg = 4096;
+    const uintptr_t a = (uintptr_t) p, b = a + n;
+    const uintptr_t lo = (a + pg - 1) / pg * pg, hi = b / pg * pg;
+    if (hi <= lo) return;
+#if defined(_WIN32)
+    (void) VirtualUnlock((LPVOID) lo, (SIZE_T) (hi - lo));
+#else
+    (void) ::madvise((void*) lo, (size_t) (hi - lo), MADV_DONTNEED);
+#if defined(MADV_PAGEOUT)
+    (void) ::madvise((void*) lo, (size_t) (hi - lo), MADV_PAGEOUT);
+#endif
+#endif
 }
 
 /// The calling thread on logical CPU `cpu`.

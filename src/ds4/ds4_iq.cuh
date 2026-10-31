@@ -1,6 +1,6 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
 // IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's
-// layouts: ggml-common.h, llama.cpp MIT); Q5_K and Q6_K for a GGUF's dense matrices.  ds4_gguf.cu sends an expert
+// layouts: ggml-common.h, llama.cpp MIT), IQ4_NL (32 values a block); Q5_K and Q6_K for a GGUF's dense matrices.  ds4_gguf.cu sends an expert
 // layer's gate / up, or its down, here when that role is not MXFP4 (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role
 // r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
 //
@@ -20,8 +20,8 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
-              kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
+              kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 // the dense matrices' types (a GGUF's attention, shared experts, output head - maya-mm3's MiniMax quants): the GEMVs
 // (mv), the FP16 rows (f16_rows) and decode_values only - not the routed experts' kernels
 constexpr int kQ8_0 = 8, kQ6_K = 14;
@@ -37,8 +37,8 @@ constexpr float kOaiAlpha = 1.702f;
 bool supported(int type);
 /// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
 bool mv_supported(int type);
-/// Values a block of the type (32: Q8_0; 256: the others).
-inline int block_values(int type) { return type == kQ8_0 ? 32 : 256; }
+/// Values a block of the type (32: Q8_0, IQ4_NL; 256: the others).
+inline int block_values(int type) { return type == kQ8_0 || type == kIQ4_NL ? 32 : 256; }
 /// Bytes of a block of the type (0: not one of these).
 int block_bytes(int type);
 /// Bytes of a row of k values (k a multiple of the type's block).
@@ -114,6 +114,18 @@ private:
     int previous_rows_;
     const int* previous_bounds_;
 };
+// The prompt set's scratch for its int8 activations (the fused experts, STRATA_DS4_PREFILL_FUSED): the caller's down
+// output rows, which the set's gate / up leaves unused until its down writes them; nested scopes restore their caller's.
+class FusedScratchScope {
+public:
+    FusedScratchScope(void* scratch, size_t bytes);
+    ~FusedScratchScope();
+    FusedScratchScope(const FusedScratchScope&) = delete;
+    FusedScratchScope& operator=(const FusedScratchScope&) = delete;
+private:
+    void* previous_;
+    size_t previous_bytes_;
+};
 #endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
@@ -147,8 +159,19 @@ struct MvJob {
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
-/// the token / window / light kernels' codes times their scales (d s q - m), tile = the prompt tiles' loader (F32,
-/// before their F16) - both ggml's dequantize_row_* values to the bit.  false: a type not covered.
+/// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
+/// code table while those are on), tile = the prompt tiles' loader (F32, before their F16) - both ggml's
+/// dequantize_row_* values to the bit.  false: a type not covered.
 bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s);
+
+/// The token / window kernels and the light sets of experts of <= 4 rows for the types of a large codebook (IQ1_S,
+/// IQ1_M, IQ2_S: 8 KiB and more), maya-ds4's on CUDA: a grid of the blocks the device holds at once, each block loading
+/// its codebook once and taking work items (a group, a tile of rows) round it - IQ1_M's codes then from a table of 4096
+/// entries (ds4_iq1_codes.hpp).  Each output the same lanes' sums in the same order as the full grid's: the same bits.
+/// DS4_IQ_PERSIST=0 (MAYA_DS4_IQ_PERSIST): the full grids, as before (HIP and maya-mm3: always); unset: on for a device of
+/// compute capability 8.0 and up, off below (a V100 is about 2% slower with them); 1: on everywhere.  (tests)
+/// set_persist(1 / 0): on / off for the calls after it, -1: the environment's again.
+bool persist_on();
+void set_persist(int on);
 
 }  // namespace strata::ds4::gguf::iq

@@ -1,26 +1,42 @@
 // serve/web/models.js - the Models page: the models set up on this machine (the run configs the setup wrote, GET
 // /api/models), the running one marked; switching to another (POST /api/models/switch: Maya starts again with it) and
-// each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make).
+// each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make);
+// and deleting one (POST /api/models/delete: off the list, and with its downloaded files if asked; the running one after a
+// switch to another); and the files in the models folders no model uses (POST /api/models/leftovers deletes one).
 import {html, useEffect, useRef} from "./preact.js";
 import {api, ctxfmt, esc, fmt, isPhone, modelName, relTime} from "./lib.js";
 import {S, confirmDialog, copyText, emit, toast} from "./state.js";
 import {newChat} from "./chats.js";
 import {setSide, showView} from "./sidebar.js";
-import {Icon, ModelLogo, Seg, Switch} from "./ui.js";
+import {GLM_KV_BYTES, ctxHint, ctxStopsIn, loadCtxInfo} from "./server.js";
+import {CtxSlider, Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 // the page's own state (beside S: nothing else reads it but the model menu's count)
 export const MS = {data: null, err: null, add: false, details: {}, edit: null, draft: null, tab: 0, preview: null,
-                   check: "", saving: false, restart: null};
+                   check: "", saving: false, restart: null, del: null, gone: null};
 
 export async function loadModels() {
   try {
     MS.data = await api("api/models");
     MS.err = null;
+    saidDeleted(MS.data.deleted);
   } catch (e) {
     MS.err = e.message;
   }
   emit();
   return MS.data;
+}
+
+// the model that was running, deleted by the server after the switch (said once a start, not on every visit)
+function saidDeleted(x) {
+  if (!x || !x.time) return;
+  try {
+    if (sessionStorage.getItem("maya.deleted") === String(x.time)) return;
+    sessionStorage.setItem("maya.deleted", String(x.time));
+  } catch (e) { /* (no storage: said again on the next visit) */ }
+  if (x.error) toast("error", `${x.file} was not deleted`, x.error, 12000);
+  else MS.gone = {name: x.model ? `${modelName(x.model)} ${x.quant || ""}`.trim() : x.deleted, files: x.files, freed: x.freed,
+                  folder: null, users: x.drafter_users || []};
 }
 
 const MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
@@ -100,6 +116,7 @@ function openEditor(m) {
   MS.tab = 0;
   MS.preview = m.command;
   MS.check = "";
+  if (m.running) loadCtxInfo();                     // (the running engine's own measurement: the Context size's line)
   emit();
 }
 function closeEditor() {
@@ -110,12 +127,13 @@ function closeEditor() {
 
 // the draft as the server takes it: "" -> the default (null), a number typed -> a number
 const NUMS = ["context", "parallel", "reserve_mib", "expert_cache", "prefill", "kv_resident", "tp", "prefill_chunk", "cpu_threads"];
+const DECS = ["reserve_gb", "cache_gb", "dspark_conf"];   // (a decimal: 0.7, 1.5)
 function toSend(d) {
   const out = {...d};
-  for (const k of NUMS) {
+  for (const k of [...NUMS, ...DECS]) {
     if (!(k in out)) continue;
     const v = out[k];
-    out[k] = v === "" || v == null ? null : /^\s*\d+\s*$/.test(String(v)) ? Number(v) : v;
+    out[k] = v === "" || v == null ? null : (DECS.includes(k) ? decimal : whole)(v) ? Number(v) : v;
   }
   out.env = Object.fromEntries((d.envRows || Object.entries(d.env || {})).filter(([k]) => String(k).trim()));
   delete out.envRows;
@@ -173,6 +191,7 @@ async function saveSettings(m) {
 }
 
 const whole = (v) => v === "" || v == null || /^\s*\d+\s*$/.test(String(v));
+const decimal = (v) => v === "" || v == null || /^\s*(\d+\.?\d*|\.\d+)\s*$/.test(String(v));
 
 function Row({label, flag, hint, changed, children, below, warn}) {
   return html`<div class="mdl-field">
@@ -189,6 +208,14 @@ function Row({label, flag, hint, changed, children, below, warn}) {
 const Num = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
   <input class=${`input input--num${whole(value) ? "" : " is-bad"}`} inputmode="numeric" aria-label=${label} value=${value ?? ""}
     placeholder=${ph} onInput=${(e) => on(e.target.value)}/>${unit ? html`<span>${unit}</span>` : null}</span>`;
+const Dec = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
+  <input class=${`input input--num${decimal(value) ? "" : " is-bad"}`} inputmode="decimal" aria-label=${label} value=${value ?? ""}
+    placeholder=${ph} onInput=${(e) => on(e.target.value.replace(",", "."))}/>${unit ? html`<span>${unit}</span>` : null}</span>`;
+// a drafter's confidence floor (DeepSeek's and MiniMax's --dspark-conf), shown while it drafts
+const draftConf = (d, ch, dflt) => (d.draft === "dspark" ? html`<${Row} label="Draft confidence" flag="--dspark-conf" changed=${ch("dspark_conf")}
+  hint=${`A draft is checked only while the drafter's confidence in it is at least this, from 0 to 1. Lower checks more drafts. Empty: the engine's ${dflt}.`}
+  warn=${decimal(d.dspark_conf) && !(+d.dspark_conf > 1) ? null : "A number from 0 to 1, or empty."}>
+  <${Dec} label="Draft confidence" value=${d.dspark_conf} ph=${String(dflt)} on=${(v) => setDraft({dspark_conf: v})}/><//>` : null);
 function Stepper({label, value, min, max, on}) {
   const v = Number(value) || min;
   return html`<span class="mdl-step" role="group" aria-label=${label}>
@@ -205,17 +232,28 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
       on=${(v) => setDraft({[k]: v})}/></div>` : null};
 }
 
+// the Context size: Settings > Model's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
+// trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
+// bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
+// none does, the running model's line is the engine's own measurement, as in Settings
+function contextRow(m, d, ch, cost, keys = [], extra = null) {
+  const s = m.settings, r = m.context_range || {min: 4096, max: 262144, tested: 262144};
+  const n = Number(d.context), now = Number(s.context), stops = ctxStopsIn(r, now, n);
+  const warn = [n !== now && n > r.tested ? `Beyond ${ctxfmt(r.tested)} is untested on this engine.` : null, extra].filter(Boolean).join(" ");
+  return html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")} warn=${warn || null}
+    below=${html`<${CtxSlider} id=${`mdl-ctx-${m.file}`} label="" value=${n} now=${now} stops=${stops}
+      hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
+}
+
 function fieldsOf(m, d) {
   const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
-  const ctxs = [...new Set([...(m.contexts || MS.data.contexts || []), s.context, d.context].map(Number))].sort((a, b) => a - b);
-  const context = html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-    hint=${glm && d.kv_streaming ? (d.context <= (Number(d.kv_resident) || 32768) ? `Up to ${ctxfmt(Number(d.kv_resident) || 32768)} the whole cache stays in VRAM.`
-      : `Above ${ctxfmt(Number(d.kv_resident) || 32768)} the cache streams from RAM: about ${fmt((d.context * 12288) / 1e9, 1)} GB of RAM at ${ctxfmt(d.context)}.`)
-      : "More context takes GPU memory from the experts."}>
-    <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-      onChange=${(v) => setDraft({context: v})}/><//>`;
+  const per = Math.max(1, Number(d.parallel) || 1);   // (several answers at once: a cache each)
+  const context = contextRow(m, d, ch, !glm ? {} : d.kv_streaming
+    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: GLM_KV_BYTES * per} : {vram: GLM_KV_BYTES * per},
+    ["kv_streaming", "kv_resident", "parallel"]);
   const images = html`<${Row} label="Images" flag=${glm ? "vision" : "--vision"} changed=${ch("images")}
     hint=${m.choices.images ? "Reads images in chats. Off leaves its memory to the experts."
+      : glm && m.backend === "hip" ? "The setup does not build GLM's image encoder for AMD GPUs (HIP) yet: this model reads text only."
       : glm ? "This model was set up without its image encoder: the setup adds it." : "This pack has no vision tower."}>
     <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`;
   const gpus = html`<${Row} label="GPUs" flag="gpu" changed=${ch("gpus")} hint="The engine splits the model across the GPUs picked. At least one."
@@ -230,8 +268,8 @@ function fieldsOf(m, d) {
     hint=${glm ? "For the driver, the desktop and other programs. Empty: 700 MiB." : "Per GPU, for the driver, the desktop and other programs. Empty: the engine's own."}
     warn=${whole(d.reserve_mib) ? null : "A whole number of MiB, or empty for the default."}>
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
-  if (m.family === "minimax") return mm3Fields(m, d, s, ch, ctxs, images, gpus);
-  if (m.family === "qwen") return qwenFields(m, d, s, ch, ctxs, gpus);
+  if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
+  if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -295,7 +333,11 @@ function fieldsOf(m, d) {
         <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="Set by the calibration (--calibrate) on this PC. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
-        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      html`<${Row} label="Prompt lookup" flag="--suffix-draft" changed=${ch("prompt_lookup")}
+        hint="Where the answer repeats earlier text (code edits, quotes), the words that followed it there are checked as drafts: the same answer, often much faster. Off: --suffix-draft 0.">
+        <${Switch} label="Prompt lookup" on=${d.prompt_lookup} onChange=${(v) => setDraft({prompt_lookup: v})}/><//>`,
+      draftConf(d, ch, 0.5)].filter(Boolean)},
   ];
 }
 
@@ -303,19 +345,16 @@ function fieldsOf(m, d) {
 // context token, by format (maya.py's MM3_KV_BYTES)
 const MM3_KV = [{id: "bf16", label: "BF16", bytes: 122880}, {id: "int8", label: "INT8", bytes: 63360},
                 {id: "fp8", label: "FP8", bytes: 63360}, {id: "fp4", label: "FP4", bytes: 34560}];
-function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
+function mm3Fields(m, d, s, ch, images, gpus) {
   const dspark = m.choices.draft.includes("dspark"), win = Number(d.kv_resident) || 32768;
   const kv = MM3_KV.find((f) => f.id === d.kv_cache);
-  const ram = kv ? `about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB of pinned RAM at ${ctxfmt(d.context)} (${kv.label})` : "pinned RAM";
+  const kvb = kv ? kv.bytes : 63360;                 // (a format of the config's own the page does not list: INT8's size)
   const tps = [...new Set([0, 1, 2, 4].filter((t) => t <= Math.max(1, d.gpus.length)).concat([Number(s.tp), Number(d.tp)]))].sort((a, b) => a - b);
   return [
     {label: "Model", rows: [
-      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM (${fmt((d.parallel * d.context * (kv ? kv.bytes : 63360)) / 2 ** 30, 1)} GB in all at ${ctxfmt(d.context)}), which the experts give up. The engine shortens a context that does not fit.`
-          : d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
-          : "The whole cache in VRAM: more context takes GPU memory from the experts."}>
-        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-          onChange=${(v) => setDraft({context: v})}/><//>`,
+      contextRow(m, d, ch, d.parallel > 1 ? {vram: d.parallel * kvb} : d.kv_streaming ? {win, ram: kvb} : {vram: kvb},
+        ["kv_cache", "kv_streaming", "kv_resident", "parallel"],
+        d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM. The engine shortens a context that does not fit.` : null),
       html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
         hint="Up to 8. Each extra conversation keeps its own context's cache in VRAM, which the experts give up. With more than one the answers are decoded together: no KV streaming and no DSpark."
         warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
@@ -332,7 +371,15 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
         hint="Off splits the layers across the GPUs. 1, 2 or 4: each layer's work shared by a group of that many GPUs; the setup picks 4 or 2 when the GPUs make whole groups."
         warn=${Number(d.tp) > d.gpus.length ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
         <${Seg} label="Tensor parallel" value=${Number(d.tp)} options=${tps.map((n) => ({id: n, label: n ? String(n) : "Off"}))}
-          onChange=${(v) => setDraft({tp: v})}/><//>`]},
+          onChange=${(v) => setDraft({tp: v})}/><//>`,
+      html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
+        hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: 1 GB, 0.3 GB with tensor parallel."
+        warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
+      Number(d.tp) > 0 ? html`<${Row} label="Expert cache" flag="--cache-gb" changed=${ch("cache_gb")}
+        hint="With tensor parallel: each GPU's expert cache, at least this. Where memory is tight the engine makes it larger. Empty: 1.5 GB."
+        warn=${decimal(d.cache_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="Expert cache" value=${d.cache_gb} ph="1.5" unit="GB / GPU" on=${(v) => setDraft({cache_gb: v})}/><//>` : null].filter(Boolean)},
     {label: "Prompts and cache", rows: [
       html`<${Row} label="KV cache" flag="--kv-cache" changed=${ch("kv_cache")}
         hint="The attention cache's format: BF16 is the model's own, INT8 the engine's default, FP8 and FP4 smaller.">
@@ -348,25 +395,31 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
     {label: "Speed", rows: [
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
-        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most. Empty: the size this PC's prompt calibration picked."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      draftConf(d, ch, 0.7)].filter(Boolean)},
   ];
 }
 
-// CYBER-FROST's (the `maya` engine's Qwen path; text only).  Its KV cache's VRAM a context token, by format: 12 attention
+// CYBER-FROST's (the `maya` engine's Qwen path; pictures through maya-vision and the base model's mmproj).  Its KV cache's VRAM a context token, by format: 12 attention
 // layers' K and V plus the sparse attention's pooled keys (maya.py's QWEN_KV_BYTES for FP16)
 const QWEN_KV = [{id: "fp16", label: "FP16", bytes: 26112}, {id: "int8", label: "INT8", bytes: 14208},
                  {id: "k8v4", label: "K8 V4", bytes: 11328}, {id: "q4_0", label: "Q4_0", bytes: 8448}];
-function qwenFields(m, d, s, ch, ctxs, gpus) {
+function qwenFields(m, d, s, ch, gpus) {
   const mtp = m.choices.draft.includes("mtp");
   const kv = QWEN_KV.find((f) => f.id === d.kv) || QWEN_KV[0];
   const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 8000, unit: "experts", subLabel: "Experts in the GPU's pool"});
   const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 4096, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
   return [
     {label: "Model", rows: [
-      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${`The attention cache sits in VRAM: about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB at ${ctxfmt(d.context)} (${kv.label}), taken from the experts.`}>
-        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-          onChange=${(v) => setDraft({context: v})}/><//>`,
+      contextRow(m, d, ch, {vram: kv.bytes}, ["kv"]),
+      html`<${Row} label="Images" flag="vision" changed=${ch("images")}
+        hint=${m.choices.images ? "Reads images in chats: the image encoder starts when a picture arrives, no VRAM kept for it. Off reads text only."
+          : "This model was set up without its image encoder: the setup adds it."}>
+        <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--mtp-max-t" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC."
           : "This pack has no MTP drafter: the setup builds it from the model file."}>
@@ -432,7 +485,7 @@ function Editor({m}) {
   const keys = Object.keys(s);
   const changed = keys.filter((k) => !same(sent[k], s[k]));
   const envChanged = !same(sent.env, s.env);
-  const bad = Object.entries(d).some(([k, v]) => NUMS.includes(k) && !whole(v));
+  const bad = Object.entries(d).some(([k, v]) => (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v)));
   const canSave = changed.length > 0 && !bad && !MS.check && !MS.saving && !MS.restart;
   const restarts = m.running && MS.data.restarts;
   const tabDot = (t) => (t.adv ? envChanged : t.rows.some((r) => r && r.props && r.props.changed));
@@ -487,6 +540,160 @@ function Editor({m}) {
   </div>`;
 }
 
+// ------------------------------------------------------------------ deleting a model (POST /api/models/delete)
+// MS.del: the dialog ({m, plan: what its files are (a dry run), files: the box ticked, then: the model to switch to
+// when m is the one running, busy, err, from: the button}); MS.gone: what was deleted, said at the top of the page
+const bytes = (b) => (b >= 1e9 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : b >= 1e6 ? `${fmt(b / 1e6)} MB`
+  : b >= 1e3 ? `${fmt(b / 1e3)} KB` : `${fmt(b || 0)} bytes`);
+const nameOf = (file) => { const x = MS.data && MS.data.models.find((m) => m.file === file); return x ? titleOf(x) : file; };
+const and = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs[0] || "");
+// the models the running one can be switched to before it is deleted (the most recently used first)
+const startable = () => (MS.data ? MS.data.models.filter((x) => !x.running && x.ok) : []);
+
+async function askDelete(m) {
+  const d = {m, plan: null, files: false, then: m.running ? (startable()[0] || {}).file || null : null, busy: false,
+             err: null, from: document.activeElement};
+  MS.del = d;
+  emit();
+  try {
+    d.plan = await api("api/models/delete", {method: "POST", body: {file: m.file, files: true, dry_run: true}});
+  } catch (e) {
+    d.plan = {ok: false, why: e.message, items: []};
+  }
+  if (MS.del === d) emit();
+}
+
+function closeDelete() {
+  const d = MS.del;
+  if (!d || d.busy) return;
+  MS.del = null;
+  emit();
+  if (d.from && d.from.focus && document.contains(d.from)) d.from.focus();
+}
+
+async function deleteModel() {
+  const d = MS.del;
+  if (!d || d.busy || !d.plan) return;
+  d.busy = true;
+  d.err = null;
+  emit();
+  try {
+    const out = await api("api/models/delete", {method: "POST", body: {file: d.m.file, files: d.files, then: d.then}});
+    if (out.deleting) {                              // (the running one: Maya switches, the next start deletes it)
+      MS.del = null;
+      watchRestart({why: "switch", file: out.to, name: nameOf(out.to)});
+      return;
+    }
+    MS.gone = {name: titleOf(d.m), files: d.files, freed: out.freed, folder: d.m.folder,
+               users: (out.drafter_users || []).map(nameOf)};
+    MS.del = null;
+    if (MS.edit === d.m.file) closeEditor();
+    delete MS.details[d.m.file];
+    await loadModels();
+    const h = document.querySelector(".mdl__page h1");
+    if (h) { h.tabIndex = -1; h.focus(); }         // (its card is gone: the keyboard goes to the page's top)
+  } catch (e) {
+    d.busy = false;
+    d.err = `It was not deleted: ${e.message}`;
+    emit();
+  }
+}
+
+// its files, said: "Its 3 GGUF files, the pack Maya built from them, its image encoder and its DFlash2 drafter (0.7 GB)."
+function filesSaid(p) {
+  const parts = [];
+  if (p.gguf) parts.push(p.gguf === 1 ? "its GGUF file" : `its ${p.gguf} GGUF files`);
+  if (p.pack) parts.push(p.gguf ? "the pack Maya built from them" : "the pack Maya built");
+  if (p.vision) parts.push("its image encoder");
+  if (p.drafter != null) parts.push(`its DFlash2 drafter (${bytes(p.drafter)})`);
+  const s = and(parts);
+  return s ? `${s[0].toUpperCase()}${s.slice(1)}.` : "";
+}
+
+function DeleteDialog() {
+  const box = useRef(null);
+  useEffect(() => {   // (it destroys something: the keyboard starts on Cancel, so a stray Enter does not confirm it)
+    setTimeout(() => { const b = box.current && box.current.querySelector(".dialog__actions .btn--secondary"); if (b) b.focus(); }, 0);
+  }, []);
+  const d = MS.del;
+  if (!d) return null;
+  const m = d.m, p = d.plan;
+  const can = !!(p && p.ok && p.items.length);
+  const files = can && d.files;
+  const users = (p && p.drafter_users || []).map(nameOf);
+  const to = m.running ? startable() : [];
+  const keys = (e) => {
+    if (e.key === "Tab") trapTab(e, box.current);
+    else if (e.key === "Escape") { e.stopPropagation(); closeDelete(); }
+  };
+  return html`<div class="dialog-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) closeDelete(); }}>
+    <div ref=${box} class="dialog mdl-del" role="dialog" aria-modal="true" aria-labelledby="mdl-del-title" onKeyDown=${keys}>
+      <div class="dialog__head"><h2 id="mdl-del-title">Delete ${titleOf(m)}?</h2>
+        <button type="button" class="icon-btn dialog__close" aria-label="Close" onClick=${closeDelete}><${Icon} name="close"/></button></div>
+      <div class="dialog__body">
+        <p>Maya takes it off this list: its config <code>${m.file}</code>${m.script ? html` and its start script <code>${m.script}</code>` : null}. Your chats stay.</p>
+        ${m.running ? html`<div class="mdl-del__to" role="radiogroup" aria-labelledby="mdl-del-to">
+          <p id="mdl-del-to">It is running now. Maya switches to another model first (a few minutes), then deletes it:</p>
+          ${to.map((x) => html`<button type="button" role="radio" aria-checked=${String(d.then === x.file)} key=${x.file} disabled=${d.busy}
+            class=${`mdl-del__box mdl-del__box--radio${d.then === x.file ? " is-on" : ""}`} onClick=${() => { d.then = x.file; emit(); }}>
+            <span class="mdl-del__check" aria-hidden="true"></span>
+            <span class="mdl-del__text"><span class="mdl-del__top"><b>${titleOf(x)}</b></span><code>${x.file}</code></span></button>`)}</div>` : null}
+        ${!p ? html`<p class="mdl-del__note" role="status">Looking at its files…</p>`
+          : can ? html`<button type="button" role="checkbox" aria-checked=${String(files)} class=${`mdl-del__box${files ? " is-on" : ""}`}
+              disabled=${d.busy} onClick=${() => { d.files = !d.files; emit(); }}>
+              <span class="mdl-del__check" aria-hidden="true">${files ? html`<${Icon} name="check" sm/>` : null}</span>
+              <span class="mdl-del__text">
+                <span class="mdl-del__top"><b>Also delete its downloaded files</b><b class="mdl-del__size">${bytes(p.bytes)}</b></span>
+                <code>${p.folder}</code>
+                <span>${filesSaid(p)}${users.length ? "" : " No other model uses them."}</span></span></button>`
+          : html`<p class="mdl-del__note">${p.ok ? "Its files are not on this PC any more." : `Its files stay: ${p.why}.`}</p>`}
+        ${can ? (p.kept || []).map((k) => html`<p class="mdl-del__note">${k}</p>`) : null}
+        ${can && users.length ? html`<p class="mdl-del__note">${and(users)} ${users.length > 1 ? "draft" : "drafts"} with the same DFlash2
+          drafter: with its files deleted, ${users.length > 1 ? "they draft" : "it drafts"} with MTP until the setup downloads it again.</p>` : null}
+        ${files ? html`<div class="mdl-warn">This cannot be undone. To use this model again, the setup ${p.gguf
+          ? `downloads its ${bytes(p.bytes)} again` : "builds its pack again"}.</div>` : null}
+        ${d.err ? html`<div class="mdl-warn mdl-warn--err" role="alert">${d.err}</div>` : null}
+      </div>
+      <div class="dialog__actions">
+        <button type="button" class="btn btn--secondary" disabled=${d.busy} onClick=${closeDelete}>Cancel</button>
+        <button type="button" class="btn btn--danger" disabled=${d.busy || !p || (m.running && !d.then)} onClick=${deleteModel}>
+          ${d.busy ? (m.running ? "Switching…" : "Deleting…") : `${m.running ? "Switch, then delete " : "Delete "}${files ? `it and ${bytes(p.bytes)}` : "it from the list"}`}</button>
+      </div>
+    </div></div>`;
+}
+
+// ------------------------------------------------------------------ files no model uses (POST /api/models/leftovers)
+async function deleteLeftover(x) {
+  const what = [x.pack ? "a pack Maya built" : null, x.hub ? "a download from Hugging Face" : null].filter(Boolean);
+  const ok = await confirmDialog(`Delete ${x.name}?`,
+    `<p>Maya deletes ${x.folder ? "this folder and everything in it" : "this file"}: <b>${esc(bytes(x.bytes))}</b> at ` +
+    `<code>${esc(x.path)}</code>.</p><p>${what.length ? `It holds ${esc(and(what))}. ` : "Maya's setup may not have made it. "}` +
+    "No model on this list runs from it. This cannot be undone.</p>", `Delete ${bytes(x.bytes)}`, true);
+  if (!ok) return;
+  try {
+    const out = await api("api/models/leftovers", {method: "POST", body: {path: x.path}});
+    toast("success", `${x.name} is deleted`, `${bytes(out.freed)} freed on the disk.`, 6000);
+  } catch (e) {
+    toast("error", `${x.name} was not deleted`, e.message, 10000);
+  }
+  loadModels();
+}
+
+function Leftovers({L}) {
+  if (!L || !L.items || !L.items.length) return null;
+  return html`<section class="card mdl-left" aria-labelledby="mdl-left-title">
+    <div class="mdl-left__head"><b id="mdl-left-title">Files no model uses</b><b class="mdl-del__size">${bytes(L.bytes)}</b></div>
+    <span class="mdl-left__sub">In ${and(L.folders)}, and no model on this list runs from them: a model deleted by hand, or set up
+      again somewhere else. Maya may not have downloaded all of them, so look before you delete.</span>
+    <ul class="mdl-left__list">${L.items.map((x) => html`<li key=${x.path}>
+      <span class="mdl-left__text"><span class="mdl-left__name"><${Icon} name=${x.folder ? "folder" : "disk"} sm/><b>${x.name}</b>
+        ${x.pack ? html`<span class="mdl-badge">Maya pack</span>` : null}${x.hub ? html`<span class="mdl-badge">Hugging Face</span>` : null}</span>
+        <code>${x.path}</code><span>${bytes(x.bytes)} · changed ${relTime(x.modified * 1000)}</span></span>
+      <button type="button" class="btn btn--ghost btn--sm" aria-label=${`Delete ${x.name}`} disabled=${!!MS.restart}
+        onClick=${() => deleteLeftover(x)}><${Icon} name="trash" sm/>Delete</button></li>`)}</ul>
+  </section>`;
+}
+
 // ------------------------------------------------------------------ a model's card
 function Card({m}) {
   const s = m.settings, open = !!MS.details[m.file], editing = MS.edit === m.file, r = MS.restart;
@@ -518,6 +725,8 @@ function Card({m}) {
           onClick=${() => openEditor(m)}><${Icon} name="sliders" sm/>Engine settings</button>
         <button type="button" class="btn btn--ghost btn--sm" aria-expanded=${String(open)} onClick=${() => { MS.details[m.file] = !open; emit(); }}>
           Details<${Icon} name="chevron" sm cls=${`chev${open ? "" : " is-closed"}`}/></button>
+        ${m.running && !(MS.data.restarts && startable().length) ? null : html`<button type="button" class="btn btn--ghost btn--sm" aria-haspopup="dialog"
+          aria-label=${`Delete ${titleOf(m)}`} disabled=${!!r} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>Delete</button>`}
       </span>
     </div>
     ${open ? html`<dl class="mdl-facts">${facts.map(([k, v, mono]) => html`<dt>${k}</dt><dd style=${mono ? `font-family:${MONO}` : ""}>${v}</dd>`)}</dl>` : null}
@@ -553,13 +762,20 @@ export function ModelsPage() {
       ${r ? html`<div class="callout callout--info" role="status"><${Icon} name="info" sm/><span>
           <b>${r.why === "switch" ? `Switching to ${r.name}.` : `Restarting ${r.name} with the new engine settings.`}</b>
           ${" "}Maya finishes the answer it is writing, then loads the model (a few minutes). This page reloads when it is back.</span></div>` : null}
+      ${MS.gone ? html`<div class="callout callout--ok" role="status"><${Icon} name="check" sm/><span>
+          <b>${MS.gone.name} is deleted.</b>${" "}${MS.gone.files ? `${bytes(MS.gone.freed)} freed on the disk.`
+            : MS.gone.folder ? `Its files stay in ${MS.gone.folder}.` : ""}${MS.gone.users.length
+            ? ` ${and(MS.gone.users)} ${MS.gone.users.length > 1 ? "draft" : "drafts"} with MTP now.` : ""}</span>
+          <button type="button" class="icon-btn icon-btn--sm" aria-label="Dismiss" onClick=${() => { MS.gone = null; emit(); }}><${Icon} name="close" sm/></button></div>` : null}
       ${MS.err && !D ? html`<div class="card mon__wait">${MS.err}</div>`
         : !D ? html`<div class="card mon__wait">Reading the models…</div>`
         : !D.models.length ? html`<div class="card mon__wait">No model is set up in this folder yet. The setup writes one: <code>./maya.sh --setup</code> (Windows: <code>START-MAYA.bat --setup</code>)</div>`
         : D.models.map((m) => html`<${Card} m=${m} key=${m.file}/>`)}
+      ${D ? html`<${Leftovers} L=${D.leftovers}/>` : null}
       ${D && D.models.length ? html`<p class="mdl-foot"><${Icon} name="info" sm/><span>${D.restarts
         ? "Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings."
         : "This server was not started by maya.sh or START-MAYA.bat, so it cannot start again by itself: a switch or new settings apply from Maya's next start."}</span></p>` : null}
     </div></div>
+    ${MS.del ? html`<${DeleteDialog} key=${MS.del.m.file}/>` : null}
   </main>`;
 }

@@ -308,6 +308,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
 
+bool Verifier::read_head_logits(int rows, float* host, std::string& err) {
+    if (next_ != nullptr) return next_->read_head_logits(rows, host, err);
+    if (rows < 0 || rows > max_t_ || head_logits_ == nullptr) {
+        err = "verify: no head logits for that many rows";
+        return false;
+    }
+    if (rows == 0) return true;
+    if (cudaSetDevice(device_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess ||
+        cudaMemcpy(host, head_logits_, (size_t) rows * (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+        err = std::string("verify: reading the head logits failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and

@@ -5,18 +5,22 @@
 # wrong resolution faithfully, and forward recordings reinstate the newer side when replaying backwards. This file is the
 # mechanical check, so the next upstream merge is "merge, run this, three boots" instead of archaeology.
 #
+# SCOPE: this manifest describes the RELEASE branch — a merge of upstream onto cd52717, the tree verified to run 796 clean
+# rotor entries. On that lineage ALL of our code is expected to be present, because cd52717 already contains it; the two
+# entries that once read "0" belonged to the v1.1.41-replay tree, where upstream had replaced our slot_load read and
+# butterfly. Expectation changes with the branch, so re-derive them from the tree you are gating, not from memory.
+#
 # FORMAT:  pattern | file | expected_occurrences | status
 #   status REQUIRED                - count must match exactly; a miss is a dropped hunk
-#   status ACKNOWLEDGED-DIVERGENT  - count must ALSO match exactly; it records a deliberate divergence from cd52717 so
-#                                    that it reads as acknowledged rather than as a failure. A miss is still a failure.
+#   status ACKNOWLEDGED-DIVERGENT  - count must ALSO match exactly; it records a deliberate divergence so that it reads
+#                                    as acknowledged rather than as a failure. A miss is still a failure.
 #
-# RULES: fail closed. A missing file, a malformed line, a non-integer count or a pattern found zero times are failures,
-# never skips. Counts were derived from cd52717 (the tree verified to run 796 clean rotor entries) unless noted.
+# RULES: fail closed. A missing file, a malformed line, a non-integer count or an unknown status is a failure, never a
+# skip. Counts were derived from cd52717 (the tree verified to run 796 clean rotor entries) unless noted.
 #
 # PROVENANCE, verified against maya-patches/reference/ALL-our-changes-vs-upstream-base.diff (the authoritative
-# e16dec85a..cd52717 export): every entry below except one traces to a hunk there, as an added or a removed line. The
-# exception is marked POST-BASE with the commit that introduced it - it is a new invariant of our own, not a restoration.
-# If an entry is neither in the export nor marked POST-BASE, it does not belong in this file.
+# e16dec85a..cd52717 export): every entry below traces to a hunk there, as an added or a removed line, except the
+# POST-BASE one, which is labelled with its commit and the reason it is absent here.
 
 # --- losses found on 2026-10-30, restored; the ones that must never vanish again ---
 std::min<size_t>(8, F->stage.size()) | src/core/glm_fast_path.cu | 1 | REQUIRED
@@ -28,11 +32,11 @@ h.part = per_row_bufs ? nullptr : F->part; | src/core/glm_rows.cu | 1 | REQUIRED
 h.counter = per_row_bufs ? nullptr : F->counter; | src/core/glm_rows.cu | 1 | REQUIRED
 S->hc_part_n = (4 * E / 512) * 26 + 64; | src/core/glm_rows.cu | 1 | REQUIRED
 
-# --- POST-BASE: not in the export, introduced by 8ae4b91. The rotor's BF16 fallback must stay conditioned on this, or the
-# fallback pre-empts the rotation and n = 2 measures the fallback instead. Needed on any tree whose loader keeps BF16
-# tensors out of ws_map_ - which 50a3313 made true, so it applies to v1.1.42.
-rotor_will_run | src/core/glm_rows.cu | 2 | REQUIRED
+# --- our own work that a replay replaced elsewhere; present here because the base is the tree that worked ---
+A single sequential read reached only | src/core/glm_fast_path.cu | 1 | REQUIRED
+s_qa[tid ^ stride] | src/kernels/cuda/glm_fast.cu | 1 | REQUIRED
 
-# --- acknowledged divergences: deliberately NOT what cd52717 had. Expected counts are for the CURRENT tree. ---
-A single sequential read reached only | src/core/glm_fast_path.cu | 0 | ACKNOWLEDGED-DIVERGENT
-s_qa[tid ^ stride] | src/kernels/cuda/glm_fast.cu | 0 | ACKNOWLEDGED-DIVERGENT
+# --- POST-BASE and ABSENT BY DESIGN on this lineage (8ae4b91 added it): it conditions the BF16 output fallback, and the
+# cd52717 base has no such fallback. BF16 is handled here by the q8_1->float pre-pass that cd52717 carries in mv(), which
+# is what those helpers exist for. Present on feat/rows-de-fused-pf, where the fallback exists.
+rotor_will_run | src/core/glm_rows.cu | 0 | ACKNOWLEDGED-DIVERGENT

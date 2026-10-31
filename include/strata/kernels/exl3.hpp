@@ -165,9 +165,12 @@ bool several_ok();
 
 /// The prompt path's tensor-core GEMMs (sm_80 and later; mma_supported() says whether this device runs them).
 bool mma_supported();
-/// Whether the prompt path's set kernels (set_gate_up / set_down) run on this device's tensor cores: sm_80 and later
-/// (mma_supported), or sm_7x through wmma (EXL3_WMMA=0: not); otherwise they are the CUDA-core portable kernels.
+/// CUDA prompt-planning query: sm_80+ MMA or sm_7x WMMA; deliberately false on HIP.
+/// This is separate from the HIP grouped-kernel dispatch (prompt_wmma), so querying it does not change planning.
 bool prompt_tc();
+/// Whether grouped expert kernels select WMMA on the current device, including HIP gfx11/gfx12.
+/// On HIP, EXL3_WMMA=0 disables both; gfx12 only with EXL3_WMMA_GFX12=1 (opt-in).
+bool prompt_wmma();
 /// A set of n_exp routed experts in VRAM, expert e's blob at wbase + e * stride (the layout in lay), owning the sorted
 /// rows [bounds[e], bounds[e + 1]) (device, n_exp + 1 entries); a sorted row's LOCAL row is bounds[e] - row0 + r.
 struct SetArgs {

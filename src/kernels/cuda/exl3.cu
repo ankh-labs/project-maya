@@ -24,6 +24,9 @@
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
 #endif
+#if defined(STRATA_USE_HIP)
+#include "exl3_hip_scalar.hpp"
+#endif
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
@@ -343,6 +346,21 @@ __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1,
 }
 #endif
 
+#if defined(STRATA_USE_HIP)
+// Preserve the scalar fallback rounding tree when one-row specialization changes compiler scheduling.
+// Empty VGPR constraints prevent reassociation without adding arithmetic instructions.
+__device__ __forceinline__ float dot4_acc_exact(float a, const float* v, float x0, float x1, float x2, float x3) {
+    float p = __fmul_rn(v[0], x0);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[1], x1, p);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[2], x2, p);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[3], x3, p);
+    asm volatile("" : "+v"(p));
+    return __fadd_rn(a, p);
+}
+#endif
 // a tile's words, and a lane's share of them (word lane + 32 r)
 template <int K2>
 struct Words {
@@ -408,17 +426,17 @@ constexpr int kMinBlocksMv = 2;
 #endif
 
 // the shared memory of a block_gemv block
-template <int K2>
+template <int K2, int Tokens = kTok>
 struct BlockSmem {
-    __half xb[2 * kTok * kCols];       // two chunk buffers, kTok activations each
+    __half xb[2 * Tokens * kCols];       // two chunk buffers, kTok activations each
     uint32_t stage[kWarps * 4 * K2];   // a tile per warp (K != 4)
-    float out[kTok * kCols];
+    float out[Tokens * kCols];
 };
 
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
-template <int K2, int cb, class Input = Xin, int kTag = 0>
+template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
-                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K2>& sm) {
+                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const size_t sstride = (size_t) ld * W;
@@ -433,12 +451,12 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
-    float acc[kTok][2];
+    float acc[Tokens][2];
 #pragma unroll
-    for (int cc = 0; cc < kTok; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
+    for (int cc = 0; cc < Tokens; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
 #endif
     for (int q = 0; q < nq; ++q) {
-        __half* xq = sm.xb + (q & 1) * (kTok * kCols);
+        __half* xq = sm.xb + (q & 1) * (Tokens * kCols);
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
@@ -461,7 +479,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #elif defined(EXL3_DOT2)
             // the pairs straight from FP16 (f[i]: steps 2i, 2i + 1; the activation's 2t, 2t + 1 / 2t + 8, 2t + 9)
 #pragma unroll
-            for (int cc = 0; cc < kTok; ++cc)
+            for (int cc = 0; cc < Tokens; ++cc)
                 if (cc < nc) {
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const uint32_t xa = *reinterpret_cast<const uint32_t*>(xr);
@@ -478,13 +496,21 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                 v[2 * i + 1] = d.y;
             }
 #pragma unroll
-            for (int cc = 0; cc < kTok; ++cc)
+            for (int cc = 0; cc < Tokens; ++cc)
                 if (cc < nc) {
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
                     const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
-                    acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
-                    acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    #if defined(STRATA_USE_HIP)
+                    if constexpr (Tokens == 1) {
+                        acc[cc][0] = dot4_acc_exact(acc[cc][0], v, x0, x1, x2, x3);
+                        acc[cc][1] = dot4_acc_exact(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    } else
+#endif
+                    {
+                        acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
+                        acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    }
                 }
 #endif
         }
@@ -507,7 +533,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #else
     // the 4 lanes of one g hold parts of the same two outputs
 #pragma unroll
-    for (int cc = 0; cc < kTok; ++cc)
+    for (int cc = 0; cc < Tokens; ++cc)
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -561,16 +587,25 @@ struct KBatch {
     const int* skip;   // set_skip's flag: non-zero = a pipelined window's token past a wrong draft (nullptr: none)
 };
 
+// AMD CDNA3 / CDNA4 (gfx942, gfx950): a split's sums, a gate / up pair's swiglu and the experts' combine run as kernels
+// of their own after the GEMVs (mv_reduce_kernel's note), and the experts' input split (EXL3_XSPLIT) is offered - the
+// device code of those GPUs (EXL3_SEP_DEV) and the host's choice per GPU (sep_sums) go together.  Every other GPU keeps
+// the last block's hand-off (on a Radeon 8060S, gfx1151, the same bits but not faster: the routed experts ~4% slower)
+#if defined(STRATA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
+#define EXL3_SEP_DEV 1
+#endif
+
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
 // (block_gemv).  S > 1: the partial sums go to the scratch and the last block of an output block adds them up in split
 // order (deterministic) and runs the epilogue
-template <int K2, int cb>
+template <int K2, int cb, bool Single = false>
 __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Single ? 1 : kTok> sm;
     __shared__ int last;
     int ji = 0;
     while ((int) blockIdx.x >= b.blk_end[ji]) ++ji;
     const KJob& J = b.j[ji];
+    const int nc = Single ? 1 : J.nc;
     const int local = (int) blockIdx.x - (ji > 0 ? b.blk_end[ji - 1] : 0);
     const int g = local / J.S, sp = local % J.S;
     const int k0 = sp * J.kr, k1 = min(J.k, k0 + J.kr);
@@ -579,20 +614,23 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     // every block of the launch returns and no split counter moves
     if (b.skip != nullptr && *b.skip) return;
     Xin x;
-    if (warp < J.nc) {
+    if (warp < nc) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, J.nc, sm);
+    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
-        if (warp < J.nc)
+        if (warp < nc)
             epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
         return;
     }
     if (threadIdx.x < kCols)
-        for (int c = 0; c < J.nc; ++c)
+        for (int c = 0; c < nc; ++c)
             J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = sm.out[c * kCols + threadIdx.x];
+#if defined(EXL3_SEP_DEV)
+    return;   // (mv_reduce_kernel adds them up)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&J.cnt[g], 1u) == (unsigned) (J.S - 1);
@@ -600,17 +638,55 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (!last) return;
     __threadfence();
     if (threadIdx.x < kCols)
-        for (int c = 0; c < J.nc; ++c) {
+        for (int c = 0; c < nc; ++c) {
             float s = 0.0f;
             for (int i = 0; i < J.S; ++i)
                 s += *(volatile const float*) &J.part[((size_t) c * J.S + i) * J.n + g * kCols + threadIdx.x];
             sm.out[c * kCols + threadIdx.x] = s;
         }
     __syncthreads();
-    if (warp < J.nc)
+    if (warp < nc)
         epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
+
+#if defined(STRATA_USE_HIP)
+// AMD: a split launch's sums, added up by a second kernel.  mv_kernel's last-block hand-off costs a fence per block,
+// and at agent scope that is a write-back and an invalidate of the XCD's whole L2 (buffer_wbl2 / buffer_inv: on a
+// MI350X most of a 6-bit attention GEMV's time - DeepSeek-V4.1's wq_b, 512 blocks: 77.7 -> 30.1 us, wo_b 125.8 -> 40.9
+// us; its decode with DSpark 52.0 -> 74.3 tok/s); the launch boundary orders them once instead.  The same sums in split order and the same epilogue: the same bits.  Block: one output
+// block of a split job for one activation (blockIdx.y), a thread a column; the split's loads go out 8 at a time ahead
+// of their adds (a block for all the activations, a thread's nc x S loads one after another: 19.3 us a call with
+// DSpark, half the GEMV's own)
+__global__ void __launch_bounds__(kCols) mv_reduce_kernel(const KBatch b) {
+    __shared__ float out[kCols];
+    if (b.skip != nullptr && *b.skip) return;
+    int ji = 0, g = (int) blockIdx.x;
+    for (;; ++ji) {
+        const int groups = b.j[ji].S > 1 ? b.j[ji].n / kCols : 0;
+        if (g < groups) break;
+        g -= groups;
+    }
+    const KJob& J = b.j[ji];
+    const int c = (int) blockIdx.y;
+    if (c >= J.nc) return;
+    const float* p = J.part + (size_t) c * J.S * J.n + g * kCols + threadIdx.x;
+    float s = 0.0f;
+    int i = 0;
+    for (; i + 8 <= J.S; i += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = p[(size_t) (i + u) * J.n];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) s += v[u];
+    }
+    for (; i < J.S; ++i) s += p[(size_t) i * J.n];
+    out[threadIdx.x] = s;
+    __syncthreads();
+    const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
+    if (threadIdx.x < 32) epilogue(out, J.svh + g * kCols, J.alpha, bias, J.y + c * J.y_cs + g * kCols);
+}
+#endif
 
 // ---------------------------------------------------------------- the routed experts
 struct KMoe {
@@ -630,6 +706,10 @@ struct KMoe {
     int k, n_embd, n_ff;
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
+#if defined(STRATA_USE_HIP)
+    float* xp;           // gS / dS > 1: the input splits' partial sums (xsplit, AMD)
+    int gS, gkr, dS, dkr;   // gate / up and down: the input splits and their width (1, the whole input: none)
+#endif
 };
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
@@ -653,6 +733,11 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
 }
 // ... the second block of a (gate, up) pair to finish (its counter back at zero for the next launch) ...
 __device__ __forceinline__ bool pair_last(unsigned* cnt, int& last) {
+#if defined(EXL3_SEP_DEV)
+    (void) cnt;
+    (void) last;
+    return false;   // (moe_swiglu_kernel / win_swiglu_kernel: mv_reduce_kernel's note)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(cnt, 1u) == 1u;
@@ -670,6 +755,28 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
     if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
     return __fadd_rn(m, sh);
 }
+#if defined(STRATA_USE_HIP)
+// an input split's sums for one output in split order (p: split 0's, the next split's `stride` floats on), the loads
+// 8 at a time ahead of their adds
+__device__ __forceinline__ float split_sum(const float* p, int S, size_t stride) {
+    float s = 0.0f;
+    int i = 0;
+    for (; i + 8 <= S; i += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = p[(size_t) (i + u) * stride];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) s += v[u];
+    }
+    for (; i < S; ++i) s += p[(size_t) i * stride];
+    return s;
+}
+// a block's raw sums (before block_out) for nc activations into the split scratch: activation c's at row(c)
+template <class Row>
+__device__ __forceinline__ void split_store(const float* out, int nc, Row row) {
+    for (int i = threadIdx.x; i < nc * kCols; i += kThreads) row(i / kCols)[i % kCols] = out[i];
+}
+#endif
 
 // grid (n_ff / 128, k, 2): expert blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values; the pair's
 // second block to finish turns them into the clamped swiglu, in h
@@ -677,7 +784,11 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
+#if defined(EXL3_SEP_DEV)
+    const int ei = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
+#else
     const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+#endif
     const unsigned long long ptr = a.plan_ptr[ei];
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
@@ -685,8 +796,17 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
+#if defined(EXL3_SEP_DEV)
+    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
+                      min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), 1, sm);
+    if (a.gS > 1) {   // (moe_gu_red_kernel)
+        split_store(sm.out, 1, [&](int) { return a.xp + (((size_t) ei * 2 + r) * a.gS + sp) * a.n_ff + g * kCols; });
+        return;
+    }
+#else
     block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                       (const uint16_t*) (blob + a.suh[r]), 1, sm);
+#endif
     const size_t row = (size_t) ei * a.n_ff + g * kCols;
     if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[r]) + g * kCols, (r == 0 ? a.h : a.u) + row);
     if (!pair_last(a.cnt_gu + ei * (a.n_ff / kCols) + g, last)) return;
@@ -706,16 +826,32 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
+#if defined(EXL3_SEP_DEV)
+    const int sp = blockIdx.z;
+    if (a.dS > 1 && ptr == 0ull) return;        // (moe_down_red_kernel writes its zeros)
+#endif
     if (ptr != 0ull) {
         const uint8_t* blob = (const uint8_t*) ptr;
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
+#if defined(EXL3_SEP_DEV)
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
+                          min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), 1, sm);
+        if (a.dS > 1) {
+            split_store(sm.out, 1, [&](int) { return a.xp + ((size_t) ei * a.dS + sp) * a.n_embd + g * kCols; });
+            return;
+        }
+#else
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                           (const uint16_t*) (blob + a.suh[2]), 1, sm);
+#endif
         if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
+#if defined(EXL3_SEP_DEV)
+    return;   // (moe_combine_kernel)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
@@ -757,6 +893,10 @@ struct KWin {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
+#if defined(STRATA_USE_HIP)
+    float* xp;           // (KMoe's)
+    int gS, gkr, dS, dkr;
+#endif
 };
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
@@ -765,7 +905,11 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
+#if defined(EXL3_SEP_DEV)
+    const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
+#else
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+#endif
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
@@ -775,9 +919,19 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+#if defined(EXL3_SEP_DEV)
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
+                          min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        if (a.gS > 1)   // (win_gu_red_kernel)
+            split_store(sm.out, nc, [&](int c) {
+                return a.xp + (((size_t) a.grp_ent[mm + c] * 2 + r) * a.gS + sp) * a.n_ff + g * kCols;
+            });
+        else if (warp < nc)
+#else
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                           (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
+#endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
                       dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
         __syncthreads();
@@ -795,6 +949,9 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
+#if defined(EXL3_SEP_DEV)
+    const int sp = blockIdx.z;
+#endif
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
@@ -803,9 +960,19 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
+#if defined(EXL3_SEP_DEV)
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
+                          min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        if (a.dS > 1)   // (win_down_red_kernel)
+            split_store(sm.out, nc, [&](int c) {
+                return a.xp + ((size_t) a.grp_ent[mm + c] * a.dS + sp) * a.n_embd + g * kCols;
+            });
+        else if (warp < nc)
+#else
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                           (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
+#endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
                       a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
         __syncthreads();
@@ -825,6 +992,128 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
                 a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
+
+#if defined(STRATA_USE_HIP)
+// AMD: the pieces the last block of a pair / an output block runs elsewhere, as kernels of their own after the GEMVs
+// (mv_reduce_kernel's note: a fence a block is a write-back of the XCD's L2) - the same arithmetic, the same bits.
+// grid (n_ff / 128, k): moe_gate_up_kernel's clamped swiglu
+__global__ void __launch_bounds__(kCols) moe_swiglu_kernel(const KMoe a) {
+    const int ei = blockIdx.y;
+    if (a.plan_ptr[ei] == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;
+    const size_t row = (size_t) ei * a.n_ff + blockIdx.x * kCols + threadIdx.x;
+    a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+}
+// grid (n_embd / 128): moe_down_kernel's combine
+__global__ void __launch_bounds__(kCols) moe_combine_kernel(const KMoe a) {
+    if (a.skip != nullptr && *a.skip) return;
+    const int r = blockIdx.x * kCols + threadIdx.x;
+    float p[8];
+    for (int i = 0; i < a.k; ++i) p[i] = a.part[(size_t) i * a.n_embd + r];
+    a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
+                       a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
+}
+// grid (n_ff / 128, groups at most): win_gu_kernel's clamped swiglu, each entry of the group
+__global__ void __launch_bounds__(kCols) win_swiglu_kernel(const KWin a) {
+    const int grp = blockIdx.y;
+    if (grp >= *a.n_groups) return;
+    for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
+        const size_t row = (size_t) a.grp_ent[m] * a.n_ff + blockIdx.x * kCols + threadIdx.x;
+        a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+    }
+}
+// whether this GPU's device code runs those pieces as kernels of their own (EXL3_SEP_DEV above): gfx942 / gfx950,
+// cached per device
+static bool sep_sums() {
+    thread_local int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p{};
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     (std::strncmp(p.gcnArchName, "gfx942", 6) == 0 || std::strncmp(p.gcnArchName, "gfx950", 6) == 0)
+                         ? 2 : 1;
+    }
+    return known[dev] == 2;
+}
+#define EXL3_MOE_SWIGLU(a, s) \
+    do { if (sep_sums()) moe_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (a).k), kCols, 0, s>>>(a); } while (0)
+#define EXL3_MOE_COMBINE(a, s) \
+    do { if (sep_sums()) moe_combine_kernel<<<(unsigned) ((a).n_embd / kCols), kCols, 0, s>>>(a); } while (0)
+#define EXL3_WIN_SWIGLU(a, groups, s) \
+    do { if (sep_sums()) win_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (groups)), kCols, 0, s>>>(a); } while (0)
+#else
+#define EXL3_MOE_SWIGLU(a, s) (void) 0
+#define EXL3_MOE_COMBINE(a, s) (void) 0
+#define EXL3_WIN_SWIGLU(a, groups, s) (void) 0
+#endif
+
+#if defined(STRATA_USE_HIP)
+// an input split's (xsplit) sums, added up in split order and then on as the unsplit kernels: block_out into h / u
+// (gate / up) or the part rows (down).  grid (n_ff / 128, k): moe_gate_up_kernel's
+__global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
+    __shared__ float red[2][kCols];
+    const int ei = blockIdx.y, g = blockIdx.x, warp = threadIdx.x >> 5;
+    const unsigned long long ptr = a.plan_ptr[ei];
+    if (ptr == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;
+    for (int r = 0; r < 2; ++r)
+        red[r][threadIdx.x] =
+            split_sum(a.xp + ((size_t) ei * 2 + r) * a.gS * a.n_ff + g * kCols + threadIdx.x, a.gS, a.n_ff);
+    __syncthreads();
+    const uint8_t* blob = (const uint8_t*) ptr;
+    if (warp < 2)
+        block_out(red[warp], (const uint16_t*) (blob + a.svh[warp]) + g * kCols,
+                  (warp == 0 ? a.h : a.u) + (size_t) ei * a.n_ff + g * kCols);
+}
+// grid (n_embd / 128, k): moe_down_kernel's
+__global__ void __launch_bounds__(kCols) moe_down_red_kernel(const KMoe a) {
+    __shared__ float red[kCols];
+    const int ei = blockIdx.y, g = blockIdx.x;
+    if (a.skip != nullptr && *a.skip) return;
+    const unsigned long long ptr = a.plan_ptr[ei];
+    float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
+    if (ptr == 0ull) {
+        part[threadIdx.x] = 0.0f;
+        return;
+    }
+    red[threadIdx.x] = split_sum(a.xp + (size_t) ei * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
+    __syncthreads();
+    if (threadIdx.x < 32) block_out(red, (const uint16_t*) ((const uint8_t*) ptr + a.svh[2]) + g * kCols, part);
+}
+// grid (n_ff / 128, groups at most): win_gu_kernel's, each entry of the group
+__global__ void __launch_bounds__(kCols) win_gu_red_kernel(const KWin a) {
+    __shared__ float red[2][kCols];
+    const int grp = blockIdx.y, g = blockIdx.x, warp = threadIdx.x >> 5;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
+        const size_t e = (size_t) a.grp_ent[m];
+        for (int r = 0; r < 2; ++r)
+            red[r][threadIdx.x] = split_sum(a.xp + (e * 2 + r) * a.gS * a.n_ff + g * kCols + threadIdx.x, a.gS, a.n_ff);
+        __syncthreads();
+        if (warp < 2)
+            block_out(red[warp], (const uint16_t*) (blob + a.svh[warp]) + g * kCols,
+                      (warp == 0 ? a.h : a.u) + e * a.n_ff + g * kCols);
+        __syncthreads();
+    }
+}
+// grid (n_embd / 128, groups at most): win_down_kernel's, each entry of the group into its part row
+__global__ void __launch_bounds__(kCols) win_down_red_kernel(const KWin a) {
+    __shared__ float red[kCols];
+    const int grp = blockIdx.y, g = blockIdx.x;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
+        const size_t e = (size_t) a.grp_ent[m];
+        red[threadIdx.x] = split_sum(a.xp + e * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
+        __syncthreads();
+        if (threadIdx.x < 32)
+            block_out(red, (const uint16_t*) (blob + a.svh[2]) + g * kCols, a.part + e * a.n_embd + g * kCols);
+        __syncthreads();
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- a mixed-precision layer's experts (MixedLayouts)
 // Each expert's layout by its class (the class whose VRAM range holds its blob), each part's K picked per block - the
@@ -922,6 +1211,9 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
+#if defined(EXL3_SEP_DEV)
+    return;   // (moe_combine_kernel)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
@@ -1428,6 +1720,157 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
+#if defined(STRATA_USE_HIP)
+// Wider scalar tiles reuse each decoded fragment across more routed rows.
+// Keep DOT2/FMA order, rotations and output rounding identical to block_gemv.
+template <int K2, int NR> struct HipScalarSmem {
+    __half xb[2 * NR * kCols];
+    uint32_t stage[kWarps * 4 * K2];
+    float out[NR * kCols];
+};
+template <int K2, int cb, int NR, class Input = Xin>
+__device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&x)[(NR + 7) / 8],
+                           const uint16_t* __restrict__ suh, int nc, HipScalarSmem<K2, NR>& sm) {
+    constexpr int W = Words<K2>::W, R = Words<K2>::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const size_t sstride = (size_t) ld * W;
+    const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
+    uint32_t* st = sm.stage + warp * W;
+
+    const int nq = (k1 - k0) / kCols;
+    uint32_t wc[8][R], wn[8][R];
+    float xv[(NR + 7) / 8][4], xs4[(NR + 7) / 8][4];
+    load_tiles<K2>(tile, sstride, lane, wc);
+    for (int j = 0; j < (NR + 7) / 8; ++j)
+        if (warp + j * 8 < nc) chunk_load(x[j], suh, k0, lane, xv[j], xs4[j]);
+    float acc[NR][2];
+#pragma unroll
+    for (int cc = 0; cc < NR; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
+
+    for (int q = 0; q < nq; ++q) {
+        __half* xq = sm.xb + (q & 1) * (NR * kCols);
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) chunk_store(xv[j], xs4[j], lane, xq + (warp + j * 8) * kCols);
+        __syncthreads();
+        if (q + 1 < nq) {
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+            for (int j = 0; j < (NR + 7) / 8; ++j)
+                if (warp + j * 8 < nc) chunk_load(x[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs4[j]);
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t f[4];
+            slice_frags<K2, cb>(wc[s], st, lane, f);
+#if defined(EXL3_DOT2)
+#pragma unroll
+            for (int cc = 0; cc < NR; ++cc)
+                if (cc < nc) {
+                    const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+                    const uint32_t xa = *reinterpret_cast<const uint32_t*>(xr);
+                    const uint32_t xb = *reinterpret_cast<const uint32_t*>(xr + 8);
+                    acc[cc][0] = dot2_acc(f[1], xb, dot2_acc(f[0], xa, acc[cc][0]));
+                    acc[cc][1] = dot2_acc(f[3], xb, dot2_acc(f[2], xa, acc[cc][1]));
+                }
+#else
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 d = __half22float2(u2h(f[i]));
+                v[2 * i] = d.x;
+                v[2 * i + 1] = d.y;
+            }
+#pragma unroll
+            for (int cc = 0; cc < NR; ++cc)
+                if (cc < nc) {
+                    const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+                    const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
+                    const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
+                    acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
+                    acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                }
+#endif
+
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+    }
+    const int o = warp * 16 + g;
+    // the 4 lanes of one g hold parts of the same two outputs
+#pragma unroll
+    for (int cc = 0; cc < NR; ++cc)
+        if (cc < nc) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
+                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+            }
+            if (t == 0) {
+                sm.out[cc * kCols + o] = acc[cc][0];
+                sm.out[cc * kCols + o + 8] = acc[cc][1];
+            }
+        }
+
+    __syncthreads();
+}
+
+template <int K2, int cb, bool gate_up, int NR>
+__global__ void __launch_bounds__(kThreads) hip_scalar_set_kernel(SetArgs a, const float* x, int ldx,
+                                                          const int* idx, uint16_t* h, int ldh,
+                                                          float* y, int ldy) {
+    __shared__ __align__(16) HipScalarSmem<K2, NR> sm;
+    __shared__ float gate[NR * kCols];
+    const int e = blockIdx.z, g = blockIdx.y, warp = threadIdx.x >> 5;
+    const int start = a.bounds[e], end = a.bounds[e + 1];
+    const int row = start - a.row0 + (int) blockIdx.x * NR;
+    const int nc = min(NR, end - start - (int) blockIdx.x * NR);
+    if (nc <= 0) return;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    if constexpr (gate_up) {
+        Xin in[(NR + 7) / 8];
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) in[j].f = x + (size_t) idx[row + warp + j * 8] * ldx;
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[0]), a.n_ff / 16,
+                              g * 8, 0, a.n_embd, in, (const uint16_t*) (blob + a.lay.suh[0]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int c = warp + j * 8;
+            if (c < nc) block_out(sm.out + c * kCols, (const uint16_t*) (blob + a.lay.svh[0]) + g * kCols,
+                                  gate + c * kCols);
+        }
+        __syncthreads();
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[1]), a.n_ff / 16,
+                              g * 8, 0, a.n_embd, in, (const uint16_t*) (blob + a.lay.suh[1]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int r = warp + j * 8;
+            if (r < nc) {
+                const int lane = threadIdx.x & 31;
+                float v[4];
+                for (int i = 0; i < 4; ++i) v[i] = sm.out[r * kCols + lane * 4 + i];
+                had128(v, lane);
+                for (int i = 0; i < 4; ++i) {
+                    const int c = lane * 4 + i;
+                    const float up = v[i] * h2f(((const uint16_t*) (blob + a.lay.svh[1]))[g * kCols + c]);
+                    h[(size_t) (row + r) * ldh + g * kCols + c] =
+                        __half_as_ushort(__float2half_rn(swiglu(gate[r * kCols + c], up, a.limit)));
+                }
+            }
+        }
+    } else {
+        XinHalf in[(NR + 7) / 8];
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) in[j].h = h + (size_t) (row + warp + j * 8) * ldh;
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[2]), a.n_embd / 16,
+                              g * 8, 0, a.n_ff, in, (const uint16_t*) (blob + a.lay.suh[2]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int c = warp + j * 8;
+            if (c < nc) block_out(sm.out + c * kCols, (const uint16_t*) (blob + a.lay.svh[2]) + g * kCols,
+                                  y + (size_t) (row + c) * ldy + g * kCols);
+        }
+    }
+}
+#endif
+
 // set_mix_kernel's share of SetArgs: the fields it reads.  The whole SetArgs (its MixedLayouts ~3.9 KB) beside KMix
 // made 5.8 KB of kernel parameters - over the 4 KB Pascal (sm_6x) allows, so a Pascal build stopped there (#479;
 // Volta and newer take 32 KB).  The same values, the same arithmetic: the same bits everywhere.
@@ -1493,12 +1936,13 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
     }
 }
 
-// ---------------------------------------------------------------- the prompt path on RDNA 3's matrix cores
+// ---------------------------------------------------------------- the prompt path on RDNA matrix cores
 // gfx11's v_wmma_f32_16x16x16_f16: hip_set_kernel's work with NR (16 or 32) routed rows a block - each weight tile
 // decoded once for all of them - and the products on the matrix cores.  A warp's decoded tile goes through LDS into
 // A's layout (lane m and m + 16: output m's 16 inputs); each 16 activations of the slice are a B (lane n and n + 16:
 // activation n's 16 inputs); D's element i is output 2i + lane / 16 of the tile for activation lane % 16.  The host
-// takes it on gfx11 only (wmma_now; EXL3_WMMA_ROWS 16 or 32, by default 16); the decode and verify kernels keep
+// uses this layout on gfx11; the gfx12 implementation follows below. Both use EXL3_WMMA_ROWS 16 or 32
+// (by default 16). The decode and verify kernels keep
 // block_gemv (their bits are the token path's).
 // Volta / Turing (sm_70 .. sm_75: no mma.m16n8k16, so not the tensor-core kernels below) run the same kernel on
 // nvcuda::wmma's 16x16x16 FP16 product with F32 sums: A the warp's decoded tile from wt (row-major, output by input),
@@ -1529,12 +1973,104 @@ typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
 #define EXL3_WMMA_V70 1
 #endif
 
+// RDNA4's WMMA has eight FP16 inputs per lane and a different accumulator layout.
+// Keep compressed weight words in registers; decode only the tile being consumed.
+// Padded activation rows retain 8-byte alignment for two exact 64-bit LDS loads.
+// Numerical contract: the EXL3 weights, FP16 operands (including chunk_store's activation rounding),
+// and FP32 accumulation are the same formats as block_gemv's RDNA4 DOT2 path. WMMA groups the products
+// and additions differently from DOT2's partial accumulators and warp reduction, so rounding and
+// low output bits can differ. Full-model routing can amplify those differences in later layers.
+// Bitwise equality with the DOT2 path is therefore not the accuracy contract; the existing
+// CPU-reference tolerances, finite checks and output guards remain the operator contract.
+#if defined(STRATA_USE_HIP) && defined(__GFX12__)
+#define EXL3_WMMA_RDNA4 1
+typedef _Float16 rdna4_h8 __attribute__((ext_vector_type(8)));
+typedef float rdna4_f8 __attribute__((ext_vector_type(8)));
+constexpr int kRdna4Stride = kCols + 4;
+template <int NR> struct Rdna4Smem {
+    __half xb[NR * kRdna4Stride];
+    float out[NR * kCols];
+};
+__device__ __forceinline__ rdna4_h8 rdna4_load_operand(const __half* p, bool valid) {
+    if (!valid) return rdna4_h8{};
+    const uint2 lo = *reinterpret_cast<const uint2*>(p);
+    const uint2 hi = *reinterpret_cast<const uint2*>(p + 4);
+    return __builtin_bit_cast(rdna4_h8, make_uint4(lo.x, lo.y, hi.x, hi.y));
+}
+template <int K2>
+__device__ __forceinline__ uint32_t rdna4_tile_word(const uint32_t (&w)[Words<K2>::R], int index) {
+    index %= Words<K2>::W;
+    const uint32_t lo = __shfl_sync(0xffffffffu, w[0], index & 31);
+    if constexpr (Words<K2>::R > 1) {
+        const uint32_t hi = __shfl_sync(0xffffffffu, w[1], index & 31);
+        return index < 32 ? lo : hi;
+    }
+    return lo;
+}
+template <int K2, int cb, int Rows, class Input>
+__device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, int k1, const Input (&x)[Rows / kWarps],
+                              const uint16_t* suh, int nc, Rdna4Smem<Rows>& sm) {
+    constexpr int W = Words<K2>::W, R = Words<K2>::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, col = lane & 15;
+    const int kh = (lane >> 4) * 8;
+    const size_t stride = (size_t) ld * W;
+    rdna4_f8 acc[Rows / 16] = {};
+    for (int q = k0; q < k1; q += kCols) {
+#pragma unroll
+        for (int j = 0; j < Rows / kWarps; ++j) {
+            const int row = warp + j * kWarps;
+            if (row < nc) {
+                float v[4], scales[4];
+                chunk_load(x[j], suh, q, lane, v, scales);
+                chunk_store(v, scales, lane, sm.xb + row * kRdna4Stride);
+            }
+        }
+        __syncthreads();
+        uint32_t words[8][R];
+        load_tiles<K2>(tr + ((size_t) (q / 16) * ld + tc0 + warp) * W, stride, lane, words);
+#pragma unroll
+        for (int step = 0; step < 8; ++step) {
+            rdna4_h8 av, bv;
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const int row = kh + pair * 2;
+                const int p = (col & 7) * 32 + (col & 8) / 2 + (row & 6) * 4 + (row & 8) / 4;
+                // K2 = twice the bitrate, including half-integer codes.
+                const int b0 = (p + 257) * K2 / 2 - 16, b2 = (p + 258) * K2 / 2;
+                const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, shift = (i2 + 1) * 32 - b2;
+                const uint32_t lo = rdna4_tile_word<K2>(words[step], i0), hi = rdna4_tile_word<K2>(words[step], i2);
+                const uint32_t bits = h2u(decode2h<cb>(fsh(hi, lo, shift + (K2 + 1) / 2) & 0xffffu, fsh(hi, lo, shift) & 0xffffu));
+                bv[2 * pair] = __builtin_bit_cast(_Float16, (uint16_t) bits);
+                bv[2 * pair + 1] = __builtin_bit_cast(_Float16, (uint16_t) (bits >> 16));
+            }
+#pragma unroll
+            for (int m = 0; m < Rows / 16; ++m) {
+                av = rdna4_load_operand(sm.xb + (m * 16 + col) * kRdna4Stride + step * 16 + kh, m * 16 + col < nc);
+                acc[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv, acc[m]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = 8 * (lane >> 4) + i;
+#pragma unroll
+        for (int m = 0; m < Rows / 16; ++m)
+            if (m * 16 + row < nc) sm.out[(m * 16 + row) * kCols + warp * 16 + col] = acc[m][i];
+    }
+    __syncthreads();
+}
+
+#endif
+
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, class Input>
+template <int K2, int cb, int KS, int NR, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
-                             const uint16_t* __restrict__ suh, int nc, WmmaSmem<KS, NR>& sm) {
-#if defined(EXL3_WMMA)
+                             const uint16_t* __restrict__ suh, int nc, Smem& sm) {
+#if defined(EXL3_WMMA_RDNA4)
+    rdna4_block_wmma<K2, cb, NR>(tr, ld, tc0, k0, k1, in, suh, nc, sm);
+#elif defined(EXL3_WMMA)
     static_assert(K2 <= KS, "the shared memory's stage holds K2 words a lane");
     constexpr int W = Words<K2>::W, R = Words<K2>::R, NJ = NR / 8, NB = NR / 16;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, m = lane & 15;
@@ -1702,7 +2238,11 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
 template <int K2, int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
                                                          uint16_t* h, int ldh, float* y, int ldy) {
+#if defined(EXL3_WMMA_RDNA4)
+    __shared__ __align__(16) Rdna4Smem<NR> sm;
+#else
     __shared__ __align__(32) WmmaSmem<K2, NR> sm;   // (wmma: 256-bit aligned operands)
+#endif
     __shared__ float gate[NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
@@ -1724,7 +2264,11 @@ template <int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
                                                              const int* idx, uint16_t* h, int ldh, float* y,
                                                              int ldy) {
+#if defined(EXL3_WMMA_RDNA4)
+    __shared__ __align__(16) Rdna4Smem<NR> sm;
+#else
     __shared__ __align__(16) WmmaSmem<8, NR> sm;
+#endif
     __shared__ float gate[NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
@@ -1772,14 +2316,64 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
         }
     }
 }
+#if defined(STRATA_USE_HIP)
+static const char* hip_scalar_env(const char* internal, const char* maya, const char* native) {
+    const char* v = std::getenv(internal);
+    if (v == nullptr) v = std::getenv(maya);
+    return v != nullptr ? v : std::getenv(native);
+}
+// RDNA4 only for now. Each launch thread caches capability per visible device, not a workstation GPU ID.
+static bool hip_scalar_device() {
+    thread_local int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p{};
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     std::strncmp(p.gcnArchName, "gfx12", 5) == 0 ? 2 : 1;
+    }
+    return known[dev] == 2;
+}
+template <int K2, int cb, bool GU>
+static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh,
+                            float* y, int ldy, cudaStream_t s) {
+    // Only the tested integer 3/4-bit mul1 layouts. Mixed and other layouts retain their original path.
+    if constexpr ((K2 == 6 || K2 == 8) && cb == 2) {
+        const int mode = hip_scalar::mode(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_ROWS",
+            "MAYA_EXL3_HIP_SCALAR_ROWS", "EXL3_HIP_SCALAR_ROWS"));
+        if (mode == 8 || !hip_scalar_device()) return false;
+        int gu_min = 48, down_min = 128;
+        if (mode == -1) {
+            gu_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
+                "MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS", "EXL3_HIP_SCALAR_GU_MIN_ROWS"), gu_min);
+            down_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
+                "MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS", "EXL3_HIP_SCALAR_DOWN_MIN_ROWS"), down_min);
+        }
+        const int nr = hip_scalar::rows(mode, GU, a.max_rows, gu_min, down_min);
+        if (nr == 8) return false;
+        const dim3 grid((a.max_rows + nr - 1) / nr, (GU ? a.n_ff : a.n_embd) / kCols, a.n_exp);
+        if (nr == 12) hip_scalar_set_kernel<K2, cb, GU, 12><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        else if (nr == 16) hip_scalar_set_kernel<K2, cb, GU, 16><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        else hip_scalar_set_kernel<K2, cb, GU, 24><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        return true;
+    }
+    return false;
+}
+#endif
 template <int K2, int cb> struct RunHipGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (hip_scalar_set<K2, cb, true>(a, x, ldx, idx, h, ldh, nullptr, 0, s)) return;
+#endif
         hip_set_kernel<K2, cb, true><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>
             (a, x, ldx, idx, h, ldh, nullptr, 0);
     }
 };
 template <int K2, int cb> struct RunHipDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (hip_scalar_set<K2, cb, false>(a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy, s)) return;
+#endif
         hip_set_kernel<K2, cb, false><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_embd / kCols, a.n_exp), kThreads, 0, s>>>
             (a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
     }
@@ -1818,26 +2412,53 @@ bool dispatch(int K2, int cb, A&&... args) {
 }
 
 template <int K2, int cb> struct RunMv {
-    static void run(const KBatch& b, int blocks, cudaStream_t s) { mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
+    static void run(const KBatch& b, int blocks, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        // A one-row batch needs only one row of accumulators/scratch. Keep the input-split planner
+        // and reduction order unchanged; a mixed/multi-row batch always uses the generic kernel.
+        // Enabled by default on HIP; DS4_EXL3_MV1=0 is the explicit rollback.
+        static const bool enabled = [] { const char* v = std::getenv("DS4_EXL3_MV1"); return !v || std::atoi(v) != 0; }();
+        bool single = enabled;
+        for (int i = 0; i < b.n && single; ++i) single = b.j[i].nc == 1;
+        if (single) { mv_kernel<K2, cb, true><<<blocks, kThreads, 0, s>>>(b); return; }
+#endif
+        mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b);
+    }
 };
+// AMD: the experts' launches with their input split (xsplit) - its blocks' z and the kernel that adds them up
+#if defined(STRATA_USE_HIP)
+#define EXL3_XS(n) (n)
+#define EXL3_XS_RED(on, kernel, grid, a, s) \
+    if (on) kernel<<<grid, kCols, 0, s>>>(a)
+#else
+#define EXL3_XS(n) 1u
+#define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
+#endif
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
+        EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(a);
+        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
 };
 template <int K2, int cb> struct RunGU {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(a);
+        moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.gS > 1, moe_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), a, s);
+        EXL3_MOE_SWIGLU(a, s);
     }
 };
 template <int K2, int cb> struct RunDown {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
+        moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.dS > 1, moe_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), a, s);
+        EXL3_MOE_COMBINE(a, s);
     }
 };
 template <int K2, int cb> struct RunRows {
@@ -1875,7 +2496,21 @@ constexpr size_t kCounters = 16384;
 constexpr size_t kCntGU = 8192;                    // the counters from here on: the experts' gate / up pairs
 constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
 constexpr size_t kUFloats = (size_t) 128 * 4096;   // the experts' up values: a window's 16 tokens x 8, n_ff <= 4096
+#if defined(STRATA_USE_HIP)
+constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit, AMD): 24 MB
+// the split EXL3_XSPLIT asks for (1: none) - on gfx942 / gfx950 only (sep_sums: elsewhere the device code has no split)
+int xsplit_want() {
+    static const int env = [] {
+        const char* v = std::getenv("EXL3_XSPLIT");
+        return v != nullptr ? std::max(1, std::min(8, std::atoi(v))) : 1;
+    }();
+    return env > 1 && sep_sums() ? env : 1;
+}
+#endif
 struct Scratch {
+#if defined(STRATA_USE_HIP)
+    float* xp = nullptr;   // (xsplit_want() > 1 only)
+#endif
     float* part = nullptr;
     unsigned* cnt = nullptr;
     float* h = nullptr;
@@ -1908,6 +2543,9 @@ Scratch* scratch(cudaStream_t s) {
         cudaMalloc(&sc.cnt, kCounters * sizeof(unsigned)) != cudaSuccess ||
         cudaMalloc(&sc.h, kHFloats * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&sc.u, kUFloats * sizeof(float)) != cudaSuccess ||
+#if defined(STRATA_USE_HIP)
+        (xsplit_want() > 1 && cudaMalloc(&sc.xp, kXPFloats * sizeof(float)) != cudaSuccess) ||
+#endif
         cudaMemsetAsync(sc.cnt, 0, kCounters * sizeof(unsigned), s) != cudaSuccess) {
         std::fprintf(stderr, "exl3: scratch did not allocate\n");
         return nullptr;
@@ -2142,10 +2780,36 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         b.n = nb;
         b.skip = g_skip;
         if (!dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)) return false;
+#if defined(STRATA_USE_HIP)
+        int rblocks = 0, rnc = 0;
+        for (int j = 0; j < nb; ++j)
+            if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
+        if (rblocks > 0 && sep_sums()) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
+#endif
     }
     launch_check("mv");
     return true;
 }
+
+#if defined(STRATA_USE_HIP)
+// the routed experts' input split for an input of k (EXL3_XSPLIT, default 1 - the whole input a block): S blocks of
+// kr inputs, their partial sums added up in split order by the *_red kernels
+static void xsplit(int k, int& S, int& kr) {
+    const int want = xsplit_want();
+    kr = ((k + want - 1) / want + kCols - 1) / kCols * kCols;
+    S = (k + kr - 1) / kr;
+}
+static bool xsplit_set(int rows, int n_embd, int n_ff, float* xp, float*& dst, int& gS, int& gkr, int& dS, int& dkr) {
+    xsplit(n_embd, gS, gkr);
+    xsplit(n_ff, dS, dkr);
+    dst = xp;
+    if ((size_t) rows * 2 * gS * n_ff > kXPFloats || (size_t) rows * dS * n_embd > kXPFloats) {
+        std::fprintf(stderr, "exl3: the experts' input split takes more than its scratch (%d rows)\n", rows);
+        return false;
+    }
+    return true;
+}
+#endif
 
 static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     Scratch* sc = scratch(s);
@@ -2176,7 +2840,11 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_ff = a.n_ff;
     m.limit = a.limit;
     m.skip = g_skip;
+#if defined(STRATA_USE_HIP)
+    return xsplit_set(a.k, a.n_embd, a.n_ff, sc->xp, m.xp, m.gS, m.gkr, m.dS, m.dkr);
+#else
     return true;
+#endif
 }
 
 // a mixed layer's launch: the classes' codebook (one for all of them; mixed_ok checked it), as a template argument
@@ -2215,6 +2883,7 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
         mix_launch(a.mix, [&](auto cb) {
             moe_gate_up_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(m, k);
         });
+        EXL3_MOE_SWIGLU(m, s);
         launch_check("moe_gate_up (mixed)");
         return;
     }
@@ -2243,6 +2912,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
         mix_launch(a.mix, [&](auto cb) {
             moe_down_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(m, k);
         });
+        EXL3_MOE_COMBINE(m, s);
         launch_check("moe_down (mixed)");
         return;
     }
@@ -2302,10 +2972,14 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_embd = a.n_embd;
     w.n_ff = a.n_ff;
     w.limit = a.limit;
+#if defined(STRATA_USE_HIP)
+    if (!xsplit_set(a.T * 8, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
+#endif
     if (a.mix.n > 0) {
         const KMix k = kmix(a.mix);
         mix_launch(a.mix, [&](auto cb) {
             win_gu_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(w, k);
+            EXL3_WIN_SWIGLU(w, groups, s);
             win_down_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(w, k);
         });
     } else if (!dispatch<RunWin>(a.lay.k2[0], a.lay.cb, w, groups, s) ||
@@ -2332,7 +3006,11 @@ bool mma_now() {
 #endif
 }
 
-// the prompt path on the matrix cores (wmma_set_kernel): an RDNA 3 GPU (gfx11), unless EXL3_WMMA=0 - cached a device
+// Matrix prompt path: gfx11 by default, gfx12 with EXL3_WMMA_GFX12=1 (opt-in until it is measured on an RDNA4 GPU
+// of ours; unset or 0 keeps gfx12 on the portable path); EXL3_WMMA=0 disables both. The RDNA4 numerical
+// differences are accumulation grouping/rounding, as documented above rdna4_block_wmma,
+// with the same weight and operand formats. Decode/verify kernels keep their arithmetic;
+// a changed prefill state can still change later routing or generated tokens.
 static bool wmma_now() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA") != nullptr && std::atoi(std::getenv("EXL3_WMMA")) == 0;
@@ -2342,8 +3020,11 @@ static bool wmma_now() {
     if (off || dev < 0 || dev >= 64) return false;
     if (known[dev] == 0) {
         cudaDeviceProp p{};
-        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0
-                         ? 2 : 1;
+        const char* v = std::getenv("EXL3_WMMA_GFX12");
+        const bool rdna4 = v != nullptr && std::atoi(v) != 0;
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
+                      (rdna4 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;
     }
     return known[dev] == 2;
 #else
@@ -2403,6 +3084,8 @@ bool prompt_tc() {
     return mma_supported() || wmma_now();
 #endif
 }
+
+bool prompt_wmma() { return wmma_now(); }
 
 bool mma_supported() {
 #if defined(STRATA_USE_HIP)

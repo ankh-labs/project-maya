@@ -248,6 +248,18 @@ class Config(unittest.TestCase):
         self.assertEqual(maya.config_family(c), "deepseek")
         self.assertIn("maya.py", (self.root / ("run-maya-ds4" + (".bat" if maya.WIN else ".sh"))).read_text())
 
+    def test_exl3_pictures_on_v100(self):
+        """The EXL3 quant's vision tower is the GGUF's (the same BF16 cuBLAS GEMMs): pictures on V100s too, and a setup
+        again after a config with --vision off turns them on; --no-vision keeps them off."""
+        pc = {"gpus": [{"index": i, "arch": "70"} for i in range(3)]}
+        old = {"args": ["--pack", "/old", "--max-context", "65536", "--vision", "off"]}
+        (self.root / "maya-ds4.json").write_text(json.dumps(old))
+        for no_vision in (False, True):
+            p = maya.write_config_ds4(args(no_vision=no_vision), pc, {"lib_dirs": []}, Path("/m/DS/maya-ds4"), 131072,
+                                      Path("/models"), Path("/m/DS"), "exl3")
+            a = json.loads(p.read_text())["args"]
+            self.assertEqual("--vision" in a, no_vision)
+
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old/maya-ds4", "--max-context", "262144", "--tp", "1", "--prefill-chunk", "4096"],
                "gpu": [0, 1, 2], "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",

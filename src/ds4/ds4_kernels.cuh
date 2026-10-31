@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "strata/kernels/sampler.hpp"
+#include "ds4_logprobs.hpp"
 
 #include <vector>
 
@@ -74,6 +75,12 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s);
+/// (DS4_HC_MIX_SPLIT) hc_mix then hc_split in one launch, the same values: the block that ends a token's mixes runs its
+/// split.  cnt: T unsigned counters on the device, 0 before and left 0 (one set per stream: launches on two streams
+/// at once may not share them); n_mix <= 32, hc <= 8.
+void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
+                  const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre, float* post,
+                  float* comb, cudaStream_t s);
 /// x[t][e] = sum_s mix[t][s] h[t][s][e], then x = rmsnorm(x) * w (w null: no norm).
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s);
@@ -228,6 +235,20 @@ struct AttnRows {
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+/// Whether sparse_attn (kKvFp4, heads_per_block 0) takes T queries through the few-queries path: the selected rows
+/// decoded into scr, then the BF16 rows' kernel.
+bool attn_few(int T, int sel_stride, const AttnScratch* scr);
+/// (DS4_MULTI_ATTN, --parallel) that path for T rows of several conversations in one launch each: row t's compressed
+/// rows from its own cache ckv[t] (kKvFp4; null with nsel 0), its window rows a.win0 / a.nwin of `win`, its selection
+/// sel[t], its scratch rows scr's t-th - the kernels sparse_attn runs for a run of one query (`one`) or of a few, each
+/// row's arithmetic theirs.  false, nothing launched: not that path's shapes (d 512, a.gen 0, T <= scr->max_t,
+/// sel_stride <= scr->cap)
+struct AttnCkv {
+    const void* ckv[kWin] = {};
+};
+bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, const int* sel, int sel_stride,
+                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+                      cudaStream_t s, bool one, const AttnScratch* scr);
 /// The window buffer: ext[r] = ring[(p0 - n + r) % n] for the n rows before p0 (zeros before position 0); afterwards
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
@@ -235,6 +256,34 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s);
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s,
                  uint8_t* backup = nullptr);
+
+/// (DS4_MULTI_ATTN, --parallel) a multi step's runs at once - run k one conversation's T[k] rows from position p0[k],
+/// its ring ring[k], its window buffer the rows e0[k] .. e0[k] + n + T[k] - 1 of one shared buffer (ds4_multi_attn.hpp):
+/// ring_to_ext's and ext_to_ring's rows (bak[k]: run k's backups, or null) for every run in one launch each, every row
+/// those kernels' own code.
+struct RingRuns {
+    uint8_t* ring[kWin] = {};
+    uint8_t* bak[kWin] = {};
+    long long p0[kWin] = {};
+    int e0[kWin] = {}, T[kWin] = {};
+    int runs = 0;
+};
+void ring_to_ext_runs(const RingRuns& r, uint16_t* ext, int n, int d, cudaStream_t s);
+void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cudaStream_t s);
+/// (DS4_MULTI_ATTN) finish over the rows of several conversations: vector v is row v / f.vpp's, which takes the rope
+/// position pos[row] (f.pos and f.pos_step not read) and with f.dst writes to f.dst + (dst[row] f.vpp + v % f.vpp)
+/// f.dst_stride - each vector finish's own code.  No pdst, no q8 (false, nothing launched; also more than kWin rows)
+struct FinishRows {
+    int pos[kWin] = {};
+    int dst[kWin] = {};
+};
+bool finish_rows(float* x, int n_vec, int len, long long stride, const Finish& f, const FinishRows& r, cudaStream_t s);
+/// out[t][i] = base[t] + i for i < n[t], rows `stride` apart (DS4_MULTI_ATTN: drafter blocks' rows in a shared window
+/// buffer as their queries' selection, iota_rows' for each block).
+struct IotaRows {
+    int base[kWin] = {}, n[kWin] = {};
+};
+void iota_rows_at(int* out, int T, const IotaRows& r, int stride, cudaStream_t s);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
 /// The same for up to kMaxRingBatch layers' rings at once (one launch).
@@ -384,9 +433,19 @@ void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s);
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s);
+/// (DS4_MARKOV_Q8) markov_add / markov_share with the head as Q8_0 blocks (Hq: rows of R / 32 blocks of 34 bytes,
+/// an F16 scale and 32 int8 - ds4_markov_q8.hpp's; R % 32 == 0): half the bytes, the sums off by the quantisation.  A
+/// share's rows give markov_add_q8's bits for them.
+void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, cudaStream_t s);
+void markov_share_q8(float* logits, const uint8_t* Hq, const uint16_t* erow, int vn, int R, cudaStream_t s);
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);
+/// A request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp): T logit rows (V each) -> out[t], the row's
+/// logprob of the token ids[t] and its top k (0 .. kTopLogprobs), over the logits after the penalties (hist: the rows
+/// of sample_tokens' penalty windows, h ids each, or nullptr), at temperature 1.  One block a row; only when asked.
+void logprob_rows(const float* logits, int V, int T, const int* hist, int h, float repeat, float freq, float present,
+                  const int* ids, int k, LogprobRow* out, cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
 /// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units
@@ -432,6 +491,46 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
+#if defined(STRATA_USE_HIP)
+constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
+// Optional diagnostic written only by the first block to set the timeout bit.
+struct PeerArFailure {
+    unsigned captured = 0, sequence = 0, observed = 0, block = 0, n4 = 0, rank = 0;
+    uint64_t elapsed_ticks = 0, timeout_ticks = 0;
+};
+/// Experimental exact two-rank push/reduce. All payload/flag buffers are fine-grained device memory,
+/// and both devices must have peer access enabled. Each rank owns two `stride`-float receive slots
+/// and 2*kPeerArBlocks*kPeerArFlagStride flags; `peer_*` points to the other rank's allocations.
+/// Calls on each rank's single stream must have matching shapes/sequence, with no skipped calls.
+/// Initialize all flags to first_seq-1. Sequence wraps modulo2^32, with live distances below2^31.
+/// Two slots are safe because completing a call requires the peer to have started that call: a rank
+/// cannot start call k+2 before the peer has finished reading call k. This is not graph-replay safe
+/// with a frozen host sequence. The bounded wait sets sticky *error on timeout; caller MUST check it.
+struct PeerAr {
+    float* recv = nullptr;
+    float* peer_recv = nullptr;
+    unsigned* flags = nullptr;
+    unsigned* peer_flags = nullptr;
+    unsigned* error = nullptr;
+    PeerArFailure* failure = nullptr; // optional first-timeout record; read only after stream synchronization
+    size_t stride = 0;
+    uint64_t timeout_ticks = 0; // HIP wall_clock64 ticks, calibrated with hipDeviceAttributeWallClockRate.
+};
+bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s);
+enum class PeerTransport { host, ar2, peer };
+struct PeerCalibration {
+    PeerTransport selected = PeerTransport::host;
+    bool complete = false, quiescent = true, valid = true;
+    int samples = 0;
+    double ms[3] = {0, 0, 0}, elapsed_ms = 0;
+};
+// Startup only, before requests: private input rows/streams, original exact-F32 transport and optional AR2.
+// Both ranks' production flags are reset before returning. budget_ms bounds submission/polling;
+// driver API calls themselves cannot be interrupted by a userspace deadline.
+PeerCalibration calibrate_peer(const int ids[2], const ArGroup& host, const ArGroup* ar2,
+                               const PeerAr peer[2], int n, double budget_ms);
+#endif
+
 /// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
 /// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where
 /// ar_rs16_kernel's loads read host memory a round trip at a time.  scratch: n * 4 + nm * 8 bytes on the device.

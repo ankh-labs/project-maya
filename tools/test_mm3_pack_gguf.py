@@ -236,6 +236,17 @@ class PackGguf(unittest.TestCase):
             files, _ = tensors(m / "maya-mm3")
             self.assertEqual(files[-1], "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.gguf")
 
+    def test_named_shards_still_find_the_side_file(self):
+        """Setup names the set's shards (--shards); the indexers' .bin beside them is found all the same (#555, #580:
+        up to v1.1.32 a named list never picked it up and the pack stopped at "the indexer of layer 0")."""
+        with tempfile.TemporaryDirectory() as d:
+            m = model(pathlib.Path(d))
+            r = run(m, "--shards", "MiniMax-M3.1-Flash-Maya-XS-00001-of-00002.gguf",
+                    "MiniMax-M3.1-Flash-Maya-XS-00002-of-00002.gguf")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            files, _ = tensors(m / "maya-mm3")
+            self.assertEqual(files[-1], "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.bin")
+
     def test_no_side_file(self):
         with tempfile.TemporaryDirectory() as d:
             m = model(pathlib.Path(d), side=False)

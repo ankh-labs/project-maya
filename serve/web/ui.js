@@ -1,7 +1,7 @@
 // serve/web/ui.js - the small pieces every view is built from: icons, menus, switches, segmented choices, the dialog,
 // the toasts, the model's logo and the thinking speedometer.
 import {html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
-import {SPRITE, modelLogo} from "./lib.js";
+import {SPRITE, ctxfmt, modelLogo} from "./lib.js";
 import {S, closeDialog, dismissToast} from "./state.js";
 
 export const Icon = ({name, sm, lg, cls = ""}) => html`
@@ -122,6 +122,15 @@ export function Seg({options, value, onChange, label, cls = ""}) {
     ${options.map((o) => html`<button type="button" role="radio" aria-checked=${String(o.id === value)} title=${o.title}
       tabIndex=${o.id === value || (none && o === options[0]) ? 0 : -1} onClick=${() => onChange(o.id)}>${o.label}</button>`)}</div>`;
 }
+// the Context size slider (Settings > Model, and each model's Engine settings on the Models page): one stop per size in
+// `stops` (server.js' ctxStopsIn), the size picked and "now" when it is the one the model has, the range's ends, and
+// `hint` (server.js' ctxHint) under it.  `label`: the name beside the size (empty where the row around it names it).
+export const CtxSlider = ({id, label = "Context size", value, now, stops, disabled, hint, onChange}) => html`<div class="ctx-slider">
+  <label for=${id} class="set-split"><span>${label}</span><b class="num">${ctxfmt(value)} tokens${value === now ? " · now" : ""}</b></label>
+  <input id=${id} type="range" class="range" min="0" max=${stops.length - 1} step="1" disabled=${disabled} aria-label="Context size"
+    aria-valuetext=${`${ctxfmt(value)} tokens`} value=${Math.max(0, stops.indexOf(value))} onInput=${(ev) => onChange(stops[+ev.target.value])}/>
+  <span class="set-split set-split--muted"><span>${ctxfmt(stops[0])}</span><span>${ctxfmt(stops[stops.length - 1])}</span></span>
+  ${hint ? html`<span class="set-row__sub">${hint}</span>` : null}</div>`;
 
 // ------------------------------------------------------------------ the dialog (confirmations, a text to type, the preview)
 function focusables(root) {

@@ -125,6 +125,19 @@ def label(k: str, v, unit: str = "", width: int = 0) -> Text:
                          (unit if unit == "%" else f" {unit}" if unit else "", MUTED))
 
 
+def shape(content):
+    """What decides a box's height, without drawing it: the lines of a text, the rows of a table, the parts of a group
+    (None: not known - the box is laid out)."""
+    if isinstance(content, Text):
+        return content.plain.count("\n")
+    if isinstance(content, Table):
+        return ("table", content.row_count)
+    if isinstance(content, Group):
+        parts = tuple(shape(r) for r in content.renderables)
+        return None if None in parts else parts
+    return None
+
+
 def speed(m: dict, width: int):
     """The Monitor's hero: the decode speed in big (now, else the last request's), the prefill, the last minute,
     what the model is doing, and four headline numbers."""
@@ -414,6 +427,8 @@ class Dashboard(VerticalScroll):
 
     def on_mount(self) -> None:
         self.metrics, self.fails, self.drawn, self.load = None, 0, None, LoadWatch(None, [])
+        self.noted = None                               # the banner's notes as drawn
+        self.shapes, self.puts = {}, {}                 # each box's shape as drawn (put), and how often it was drawn
         for box, name in (("load", "Loading the model"), ("speed", "Throughput"), ("tiers", "Where the experts live"),
                           ("gpus", "GPUs"), ("hw", "Hardware"), ("reqs", "Recent requests")):
             self.query_one(f"#dash-{box}").border_title = title(name)
@@ -456,6 +471,7 @@ class Dashboard(VerticalScroll):
         try:
             self.fill(m)
         except Exception as e:                         # noqa: BLE001 - numbers it cannot show never stop the screen
+            self.noted = None
             self.query_one("#dash-banner", Static).update(Text(f"! the dashboard could not show these numbers ({e})",
                                                                DANGER))
             self.query_one("#dash-banner").display = True
@@ -464,14 +480,29 @@ class Dashboard(VerticalScroll):
         half = (self.size.width - 1) // (1 if self.screen.has_class("narrow") else 2) - 4
         full = self.size.width - 5
         note = banners(m, self.fails)
-        self.query_one("#dash-banner", Static).update(note)
-        self.query_one("#dash-banner").display = bool(note.plain)
-        self.query_one("#dash-speed", Static).update(speed(m, half))
-        self.query_one("#dash-tiers", Static).update(tiers(m, half))
+        if note != self.noted:                          # (the same notes, or none, every second: nothing to lay out)
+            self.noted = note
+            self.query_one("#dash-banner", Static).update(note)
+            self.query_one("#dash-banner").display = bool(note.plain)
+        self.put("#dash-speed", speed(m, half))
+        self.put("#dash-tiers", tiers(m, half))
         self.query_one("#dash-tiers").border_subtitle = tiers_sub(m)
         gpu_count = len((m.get("hardware") or {}).get("gpus") or [])
         self.query_one("#dash-gpus").border_subtitle = Text(f"{gpu_count} cards" if gpu_count > 1 else "",
                                                             f"italic {FAINT}")
-        self.query_one("#dash-gpus", Static).update(gpus(m))
-        self.query_one("#dash-hw", Static).update(hardware(m, full))
-        self.query_one("#dash-reqs", Static).update(requests(m, full))
+        self.put("#dash-gpus", gpus(m))
+        self.put("#dash-hw", hardware(m, full))
+        self.put("#dash-reqs", requests(m, full))
+
+    def put(self, box: str, content) -> None:
+        """A box's new numbers.  The screen is laid out again only when the box's shape changed (the lines of its text,
+        the rows of its table, its width): a new reading of the same boxes - once a second, all day - only draws them,
+        and the layout of the whole screen was most of an idle dashboard's CPU.  Every tenth reading is laid out all
+        the same, so a line that wrapped differently never stays wrong for long."""
+        w = self.query_one(box, Static)
+        key = (shape(content), w.content_size.width)
+        n = self.puts.get(box, 0) + 1
+        self.puts[box] = n
+        same = key[0] is not None and self.shapes.get(box) == key and n % 10 != 0
+        self.shapes[box] = key
+        w.update(content, layout=not same)

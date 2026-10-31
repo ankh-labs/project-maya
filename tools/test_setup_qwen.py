@@ -106,6 +106,10 @@ class Setup(unittest.TestCase):
         self.assertEqual(maya.qwen_recommended_context(16), 131072)
         self.assertEqual(maya.qwen_recommended_context(8), 65536)
         self.assertEqual(maya.qwen_recommended_context(4), 32768)
+        # (the experts do not all fit in VRAM and RAM: the VRAM goes to expert slots, the context shrinks)
+        self.assertEqual(maya.qwen_recommended_context(32, True), 131072)
+        self.assertEqual(maya.qwen_recommended_context(96, True), 262144)
+        self.assertEqual(maya.qwen_recommended_context(8, True), 32768)
         self.assertIn(maya.QWEN_DEFAULT_CONTEXT, maya.QWEN_CONTEXTS)
 
     def test_drafting_chosen(self):
@@ -160,10 +164,30 @@ class Dashboard(unittest.TestCase):
             self.assertEqual(off["args"][off["args"].index("--mtp-max-t") + 1], "1")
             self.assertEqual(M.settings_of(off)["draft"], "none")
             self.assertEqual(out["env"], {"MAYA_EXPERT_RAM_GB": "40"})
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError):             # (a config set up without the encoder)
                 M.apply(cfg, {"images": True})
             with self.assertRaises(ValueError):
                 M.apply(qwen_cfg(Path(t) / "b", mtp=False), {"draft": "mtp"})
+
+    def test_models_page_images(self):
+        """Images on a config with the setup's encoder: on, off (kept as vision_off, the engine's --vision dropped) and
+        on again."""
+        from serve import models as M
+        with tempfile.TemporaryDirectory() as t:
+            cfg = qwen_cfg(Path(t))
+            cfg["args"].append("--vision")
+            cfg["vision"] = {"exe": "/b/maya-vision", "mmproj": "/m/vision/mmproj-F16.gguf", "model": "/m/x.gguf",
+                             "gpu": True}
+            self.assertEqual(M.choices(cfg)["images"], True)
+            self.assertTrue(M.settings_of(cfg)["images"])
+            off = M.apply(cfg, {"images": False})
+            self.assertNotIn("--vision", off["args"])
+            self.assertEqual((off.get("vision"), off["vision_off"]), (None, cfg["vision"]))
+            self.assertFalse(M.settings_of(off)["images"])
+            self.assertTrue(M.choices(off)["images"])          # (it can be switched on again)
+            on = M.apply(off, {"images": True})
+            self.assertEqual((on["vision"], on.get("vision_off")), (cfg["vision"], None))
+            self.assertEqual(on["args"].count("--vision"), 1)
 
     def test_thinking_always_on_and_off_form(self):
         from serve.frontend import ChatTemplate
@@ -175,6 +199,65 @@ class Dashboard(unittest.TestCase):
             msgs = [{"role": "user", "content": "hi"}]
             self.assertTrue(tpl.render(msgs, reasoning_effort="max").endswith("<|im_start|>assistant\n<think>\n"))
             self.assertTrue(tpl.render(msgs, enable_thinking=False).endswith("<think>\n\n</think>\n\n"))
+
+
+class Vision(unittest.TestCase):
+    """Pictures: the base model's vision tower (the fine-tune kept it byte for byte) as a pinned mmproj, on by default."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.patches = [patch.object(maya, n, lambda *a, **k: None) for n in ("say", "ok", "warn", "step")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def a(self, **kw):
+        return type("A", (), dict(dict(no_vision=False, rebuild=False, download_model=False, yes=False), **kw))()
+
+    def test_manifest_pinned(self):
+        m = maya.qwen_vision_model()
+        self.assertEqual((m["repo"], len(m["revision"]), list(m["files"])),
+                         ("unsloth/Qwen3.8-Flash-Next-GGUF", 40, ["mmproj-F16.gguf"]))
+        self.assertRegex(m["sha256"]["mmproj-F16.gguf"], r"^[0-9a-f]{64}$")
+        self.assertEqual(maya.file_url(m, "mmproj-F16.gguf"), "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/"
+                         "resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/mmproj-F16.gguf")
+
+    def test_no_vision(self):
+        self.assertIsNone(maya.qwen_vision_step(self.a(no_vision=True), {}, {}, self.d, self.d, self.d / "m.gguf"))
+
+    def test_download_declined(self):
+        with patch.object(maya, "offer_download", lambda *a, **k: False):
+            self.assertIsNone(maya.qwen_vision_step(self.a(), {}, {}, self.d, self.d, self.d / "m.gguf"))
+
+    def test_on_by_default(self):
+        mm = self.d / "vision" / "mmproj-F16.gguf"
+        with patch.object(maya, "file_incomplete", lambda *a: None), patch.object(maya, "sha256_checked", lambda *a: True), \
+                patch.object(maya, "vision_encoder_ready", lambda *a: True):
+            v = maya.qwen_vision_step(self.a(), {}, {}, self.d, self.d, self.d / "m.gguf")
+        self.assertEqual(v, {"exe": str(maya.VEXE), "mmproj": str(mm), "model": str(self.d / "m.gguf"), "gpu": True})
+        with patch.object(maya, "file_incomplete", lambda *a: None), patch.object(maya, "sha256_checked", lambda *a: True), \
+                patch.object(maya, "vision_encoder_ready", lambda *a: False):   # (the encoder did not compile: said)
+            self.assertIsNone(maya.qwen_vision_step(self.a(), {}, {}, self.d, self.d, self.d / "m.gguf"))
+
+    def test_config(self):
+        """The config: "vision" and the engine's --vision with the encoder, neither without; a setup again writes them
+        from this setup's step 7 (an earlier text-only config turns pictures on)."""
+        pack = self.d / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        v = {"exe": "/b/maya-vision", "mmproj": "/m/vision/mmproj-F16.gguf", "model": "/m/x.gguf", "gpu": True}
+        a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
+        with patch.object(maya, "ROOT", self.d), patch.object(maya, "write_run_script", lambda *x: self.d / "run"):
+            old = self.d / (maya.Q.config_stem("qwen", "q5_k_m") + ".json")
+            old.write_text(json.dumps({"args": ["--pack", str(pack)], "vision_off": v}))
+            for vision in (v, None):
+                p = maya.write_config_qwen(a, {"gpus": [{"index": 0}]}, {}, pack, self.d / "x.gguf", 65536,
+                                           self.d, self.d, vision)
+                c = json.loads(p.read_text())
+                self.assertEqual((c.get("vision"), "--vision" in c["args"]), (vision, vision is not None))
 
 
 if __name__ == "__main__":

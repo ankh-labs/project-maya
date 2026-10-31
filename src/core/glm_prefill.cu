@@ -1278,9 +1278,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (T < kPreMinT || gstride == 0) return ring_max;   // (a chunk this short carves no prestage buffer)
             return std::min<int64_t>(ring_max, (int64_t) ((lendable - nr - 256) / gstride));
         };
-        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid
+        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid.
+        // A test for a prestage buffer (floor > 0) is searched from kPreMinT up: a shorter chunk carves none, so it
+        // "passed" any floor, the test was not monotonic there, and a card whose pool could not hold the whole ring
+        // beside a 1024-token chunk got 768-token chunks with no ring at all instead of the largest chunk with a part
+        // of it (#673: a 20 GB card, Maya-S24 at 256K: 768 where 10240 fit, half the prompt speed)
         const auto biggest = [&](int64_t floor) -> int64_t {
-            int64_t lo = 1, hi = ceiling / 256, best = 0;
+            int64_t lo = floor > 0 && gstride > 0 ? kPreMinT / 256 : 1, hi = ceiling / 256, best = 0;
             while (lo <= hi) {
                 const int64_t mid = lo + (hi - lo) / 2;
                 if (room(mid * 256) >= floor) {
@@ -1537,7 +1541,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T * 16);
     a.take<float>(T);
     a.take<float>(T * 24);
-    a.take<int>(T * (size_t) g.n_exp_used);      // iota
+    a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // iota (MMQ reads whole tiles of ids past its last row)
     a.take<uint8_t>(kv_stage);
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
@@ -1621,7 +1625,7 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->comb = a.take<float>(T * 16);
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
-    S->iota = a.take<int>(T * (size_t) g.n_exp_used);
+    S->iota = a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // (see mmq::IDS_PAD)
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
     blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
@@ -1685,7 +1689,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
         }
     }
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
-    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used, F->cs);
+    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + mmq::IDS_PAD, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
     if (S->ev_pfree) cudaEventRecord(S->ev_pfree, F->cs);
     S->pre_layer = -1;
@@ -4622,7 +4626,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             PrefillState* S = m->pf_;
             cudaSetDevice(m->dev_);
             if (m == owner && S->cb_used) {
-                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used, m->fast_->cs);
+                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used + mmq::IDS_PAD, m->fast_->cs);
                 S->cb_used = false;
             }
             cudaEventRecord(S->ev_turn, m->fast_->cs);

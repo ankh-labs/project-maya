@@ -89,6 +89,13 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 
+/// The readable entries an `ids` table needs after its last row.  MMQ reads whole column tiles of row ids (up to 128
+/// each) without checking them against the group's last row: the product past the chunk's last row when the last
+/// group's tile is not full, its stream-k fixup up to about two tiles (issue #645: 2 GPUs, 2048-token chunks,
+/// compute-sanitizer flagged mul_mat_q reading up to 80 ids and the fixup ~190 past the table's end, which a card where
+/// the next page is not mapped turns into "an illegal memory access").  The values there are never used.
+constexpr int64_t IDS_PAD = 512;
+
 /// llama.cpp's dequantizer to FP16 (ggml-cuda convert.cu) has `ggml_type`.
 bool to_f16_supported(int ggml_type);
 /// The `n` weights at `w` (whole blocks of `ggml_type`, row-major) as FP16 at `dst` (IEEE half bits); false when the

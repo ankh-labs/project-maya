@@ -131,6 +131,44 @@ class Contexts(unittest.TestCase):
         self.assertEqual(maya.mm3_recommended_context(48, 0, "bf16"), maya.MM3_DEFAULT_CONTEXT)   # (RAM unknown)
         self.assertGreater(maya.mm3_recommended_context(48, 214, "int8"), maya.mm3_recommended_context(48, 214, "bf16"))
 
+    def test_recommended_by_host(self):
+        """#663: the pinned cache is RAM - a VRAM with room beyond the model does not hold it; a Windows APU maps at
+        most half its RAM for the GPU; the VRAM a longer context adds is bounded where experts would leave VRAM."""
+        xs, s = 100, 130                                                   # (download_gguf.json's memory_gb)
+        win, linux = "win", "linux"
+        # the #663 PC and Sun: Radeon 8065S, Windows, a ~160 GB carve-out and 31.7 GB of RAM - 128K, not 256K
+        for need in (xs, s):
+            self.assertEqual(maya.mm3_recommended_context(159.8, 31.7, "int8", need, apu=win), 131072)
+            self.assertEqual(maya.mm3_context_limit(262144, 159.8, 31.7, "int8", need, win), "shared")
+            self.assertIsNone(maya.mm3_context_limit(131072, 159.8, 31.7, "int8", need, win))
+        # the same PC seen without the APU rule: still the RAM, not VRAM + RAM (15.5 GB of 31.7: fits)
+        self.assertEqual(maya.mm3_recommended_context(159.8, 31.7, "int8", s), 262144)
+        self.assertEqual(maya.mm3_recommended_context(159.8, 12, "int8", s), 131072)   # (was 256K: VRAM's room counted)
+        # a Windows APU with more RAM beside its carve-out keeps 256K
+        self.assertEqual(maya.mm3_recommended_context(96, 64, "int8", 93, apu=win), 262144)
+        # a Linux APU (a small carve-out, the GPU's memory drawn from the RAM): as before
+        self.assertEqual(maya.mm3_recommended_context(0.5, 123, "int8", xs, apu=linux), 262144)
+        self.assertEqual(maya.mm3_recommended_context(0.5, 123, "int8", s, apu=linux), 32768)
+        # unchanged: Jupiter (3x V100, 183 GB), Uranus (RTX 3050 8 GB, 61 GB), a 24 GB card with 64 GB
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", xs), 262144)
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", s), 262144)
+        self.assertEqual(maya.mm3_recommended_context(8, 61, "int8", xs), 32768)
+        self.assertEqual(maya.mm3_recommended_context(24, 64, "int8", xs), 32768)
+        # a 24 GB card with 128 GB: 256K's index keys would take 3.3 GB more VRAM from the experts (> 12%): 128K
+        self.assertEqual(maya.mm3_recommended_context(24, 128, "int8", xs), 131072)
+        self.assertEqual(maya.mm3_context_limit(262144, 24, 128, "int8", xs), "vram")
+        self.assertAlmostEqual(maya.mm3_kv_vram_gb(262144, "int8"),
+                               (32768 * maya.MM3_KV_BYTES["int8"] + 262144 * 15360) / 2**30)   # (#663's kv=6.1e9)
+
+    def test_apu_kind(self):
+        halo = {"arch": "gfx1151", "name": "AMD Radeon(TM) 8065S Graphics", "vram_gb": 159.8}
+        v100 = {"arch": "70", "name": "Tesla V100-SXM2-32GB", "vram_gb": 32}
+        self.assertIsNone(maya.apu_kind([v100, v100]))
+        with patch.object(maya, "WIN", True):
+            self.assertEqual(maya.apu_kind([halo]), "win")
+        with patch.object(maya, "WIN", False):
+            self.assertEqual(maya.apu_kind([halo]), "linux")
+
     def test_kv_format_from_the_config(self):
         self.assertEqual(maya.mm3_kv_format(["--kv-cache", "int8"]), "int8")
         self.assertEqual(maya.mm3_kv_format([]), maya.MM3_KV_FORMAT)
@@ -240,6 +278,9 @@ class Config(unittest.TestCase):
         c = self.write(args(), old)
         a = c["args"]
         self.assertEqual(a[a.index("--kv-cache") + 1], "int8")
+        # (pictures: a setup again turns them on - the owner's rule for every model; --no-vision keeps them off)
+        self.assertEqual(a[a.index("--vision") + 1], "on")
+        a = self.write(args(no_vision=True), old)["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
         # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions)
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},

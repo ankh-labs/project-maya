@@ -577,7 +577,9 @@ export function stopAnswer() {
 
 // ------------------------------------------------------------------ attachments: the + menu, a drop, a pasted picture
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
-const MAX_TEXT_FILE = 512 * 1024;
+// the server says how big a text file the context holds (health.max_text_file: about 4 bytes a token); 512 KB before it did
+const textLimit = () => S.health.max_text_file || 512 * 1024;
+const sizeLabel = (n) => n >= 1048576 ? `${(n / 1048576).toFixed(n >= 10485760 ? 0 : 1)} MB` : `${Math.round(n / 1024)} KB`;
 function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
@@ -594,7 +596,12 @@ export function addFiles(files) {
       continue;
     }
     if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or images" : ""}.`); continue; }
-    if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
+    if (f.size > textLimit()) {
+      const ctx = S.health.max_context;
+      toast("warn", "File too large", `${f.name} (${sizeLabel(f.size)}) is over the limit for this model's ${ctx ? ctxfmt(ctx) + "-token " : ""}context ` +
+        `(${sizeLabel(textLimit())}).${ctx ? " A larger context size in Settings raises it; or attach a part of the file." : ""}`);
+      continue;
+    }
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);

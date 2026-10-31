@@ -15,14 +15,39 @@
 // compressed KV included), and across runs in MAYA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.  A kept conversation holds its pictures' marks too (a
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
-// the same places.
+// the same places.  `marks=<pos>,...` and `shared=<pos>` on a GEN ask for restore points besides the end of the last
+// prompt (the server's MAYA_DS4_RESTORE_POINTS: the start of the last user message, a point near the prompt's tail,
+// the end of the system prompt and tools): the read stops at each to keep the state there, and a later prompt that
+// leaves this one past one of them goes back to it (ds4_marks.hpp).  `logprobs=<k>` (0 .. 20) asks for an
+// `LP <id> <logprob> <id>:<logprob> ...` line after each T line: the token's log-probability and its row's k most likely
+// (ds4_logprobs.hpp; INFO logprobs=20 says the engine has them).
+#include "ds4_evt.hpp"
+#include "ds4_logprobs.hpp"
+#include "ds4_marks.hpp"
+#include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
+#include "ds4_iq.cuh"
 #include "ds4_model.hpp"
+#include "ds4_packinfo.hpp"
 #include "ds4_watchdog.hpp"
+#include "strata/core/vram_mark.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/idle_gate.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_profiler_api.h>
+
+// the commit and the release this binary was built from (--version, the --verbose "ds4: build" line):
+// cmake/build_id.cmake writes them at every build
+#if __has_include("maya_build_id.h")
+#include "maya_build_id.h"
+#endif
+#ifndef MAYA_BUILD_ID
+#define MAYA_BUILD_ID "unknown"
+#endif
+#ifndef MAYA_RELEASE
+#define MAYA_RELEASE "?"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +64,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,6 +80,9 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace {
@@ -98,10 +128,35 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--suffix-draft N]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
+                 "           [--parallel N (--serve: N conversations at once)]\n"
+                 "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
-                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
-                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
+                 "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
+                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
+                 "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
+                 "weights read\n"
+                 "maya-ds4 --version   the release and the commit it was built from\n"
+                 "maya-ds4 --pack ... --profile-run FILE [--profile-out OUT]   an expert profile from a corpus (a line "
+                 "of ids each)\n"
+                 "           [--profile-readonly] [--profile-out OUT]   any run: the profile never written back; this "
+                 "run's counts alone to OUT\n"
+                 "maya-ds4 --pack ... --spec-eval FILE [--n N]   the drafter's acceptance over prompts, every draft "
+                 "verified (DS4_ROUND_LOG=<file>: a line a round)\n"
+                 "maya-ds4 --pack ... --sampler-test N --ids I,J,...   speculative sampling against the model's own "
+                 "draws\n");
+}
+
+// --pack-info: the types the kernels take, asked of them (ds4_gguf / ds4_iq: the routed experts' and the dense GEMVs'
+// ggml types; the EXL3 kernels' bitrates with the mul1 codebook)
+strata::ds4::KernelTypes kernel_types() {
+    namespace gg = strata::ds4::gguf;
+    strata::ds4::KernelTypes kt;
+    kt.name = [](int t) { return gg::type_name(t); };
+    kt.expert = [](int t) { return gg::expert_type_ok(t); };
+    kt.dense = [](int t) { return t != gg::kTypeMXFP4 && gg::iq::mv_supported(t); };
+    kt.exl3_k2 = [](int k2) { return strata::kernels::exl3::k2_supported(k2, 2); };
+    return kt;
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
@@ -123,15 +178,6 @@ struct Lines {
     void forget(long long rid) {   // (the request is over: a late STOP of it changes nothing)
         std::lock_guard<std::mutex> lk(mu);
         stop_rids.erase(std::remove(stop_rids.begin(), stop_rids.end(), rid), stop_rids.end());
-    }
-    // the next line if one is waiting (false: none now) - the several-conversation loop reads between its steps
-    bool poll(std::string& l, bool& end) {
-        std::lock_guard<std::mutex> lk(mu);
-        end = q.empty() && eof;
-        if (q.empty()) return false;
-        l = q.front();
-        q.pop_front();
-        return true;
     }
     void start() {
         std::thread([this] {
@@ -161,6 +207,7 @@ struct Lines {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
@@ -255,31 +302,120 @@ struct Lookup {
     }
 };
 
+// DS4_ROUND_LOG=<file>: a line a decoding round that drafted (appended) - the tag (ids: the CLI's run, p<n>: a
+// --spec-eval prompt, r<n> / rid<n>: a serve request), the position, the drafts' source (dspark / lookup), how many
+// were made, verified and kept, and the drafter's confidences for its drafts (- for the lookup's): the drafter's
+// acceptance read off afterwards, for any confidence floor.  The rounds of one conversation at a time (a --parallel
+// step of several is not logged).  --spec-eval reads the last round's note (record) without a file too
+struct RoundLog {
+    std::FILE* f = nullptr;
+    bool record = false;
+    std::string tag = "-";
+    // the last round's note: drafts made (-1: no drafter round), verified, kept; the drafter's confidences
+    int made = -1, verified = 0, kept = 0;
+    bool lookup = false;
+    std::vector<float> conf;
+    bool on() const { return f != nullptr || record; }
+    void note(long long pos, bool lk, int made_, int verified_, int kept_, const std::vector<float>& c) {
+        made = made_, verified = verified_, kept = kept_, lookup = lk;
+        conf = c;
+        if (f == nullptr) return;
+        std::fprintf(f, "%s\t%lld\t%s\t%d\t%d\t%d\t", tag.c_str(), pos, lk ? "lookup" : "dspark", made_, verified_, kept_);
+        if (lk || c.empty()) std::fputc('-', f);
+        for (size_t i = 0; !lk && i < c.size(); ++i) std::fprintf(f, "%s%.4f", i ? "," : "", c[i]);
+        std::fputc('\n', f);
+        std::fflush(f);
+    }
+};
+RoundLog& round_log() {
+    static RoundLog r = [] {
+        RoundLog x;
+        if (const char* p = std::getenv("DS4_ROUND_LOG")) {
+            x.f = std::fopen(p, "a");
+            if (x.f == nullptr) std::fprintf(stderr, "maya-ds4: DS4_ROUND_LOG=%s: cannot open it\n", p);
+            else std::fprintf(x.f, "# tag\tposition\tsource\tmade\tverified\tkept\tconfidences\n");
+        }
+        return x;
+    }();
+    return r;
+}
+
+// a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself (the model's ds4_env)
+const char* ds4_env(const char* name) {
+    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    return v != nullptr ? v : std::getenv(name);
+}
+
+// DS4_DRAFT_COST=1 (MAYA_DS4_DRAFT_COST): DSpark's window by what a verified row costs on this PC, in place of the
+// fixed cut on the product of the confidences (MAYA_DS4_DSPARK_CUM) - the cost-aware window of
+// strata/spec/draft_policy.hpp.  Under the floor on each draft's own confidence (dspark_conf), a request alone verifies
+// the drafts that commit the most tokens a millisecond at the measured round time of its window's rows; with
+// --parallel the windows of a step are planned together at the measured time of a step of that many requests by its
+// rows in all, so a request's extra rows are charged for the time they add to the others' tokens too, and a request
+// whose drafts are likelier to hold may take more than an even share of the 16 rows.  Every draft is still verified:
+// the same tokens, only the speed moves.  A request's own dspark_cum key keeps the fixed cut for it.  Off by default
+// (opt-in until measured on GPUs: a choice made from timings)
+struct DraftCost {
+    strata::spec::DraftPolicy alone;                 // a request alone (and the drafter's acceptance table for all)
+    std::vector<strata::spec::DraftPolicy> shared;   // --parallel: steps of n requests at [n - 2], by their rows in all
+    explicit DraftCost(int max_t) : alone(max_t), shared(7, strata::spec::DraftPolicy(max_t)) {}
+    std::string text() const {   // (the log's line: the measured round times by rows, ms (rounds))
+        std::string s = "alone " + alone.cost_text();
+        for (size_t i = 0; i < shared.size(); ++i)
+            if (!shared[i].cost_text().empty()) s += "; " + std::to_string(i + 2) + " at once " + shared[i].cost_text();
+        return s;
+    }
+};
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them) - or the lookup's (lk, above) - verified together; else a plain step.
 // `out` gets the tokens that follow tok (the accepted drafts, then the trunk's next), the last of them the next round's
-// tok.
+// tok.  dc (DS4_DRAFT_COST, above): how many of the drafts by their cost
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr) {
+           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr, DraftCost* dc = nullptr) {
     out.clear();
     offered = accepted = 0;
     const double t0 = now_ms();
     int match = 0;
     const bool drafter = spec && room > 1 && m.draft_block() > 0;
+    RoundLog& rl = round_log();   // (DS4_ROUND_LOG, --spec-eval)
+    const long long pos0 = rl.on() ? (long long) m.pos() : 0;
+    if (rl.on()) rl.made = -1;
     if (drafter) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        // (the lookup's proposal first: with one, the drafter makes its first row even past the cut - the lazy head
+        //  would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
+        const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        // the round's cut for the lazy drafter: the drafts-cost window keeps the drafts under the floor alone (no
+        // running product), the plain cut the product too
+        const bool dc_win = dc != nullptr && cum_min < 0;
+        if (!dc_win && cum_min < 0) cum_min = dspark_cum_default();
+        const int max_n = dc_win ? std::min(room - 1, strata::spec::DraftPolicy::kMaxT - 1) : room - 1;
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, max_n, conf_min,
+                     dc_win ? 0.0f : cum_min, k > 0 ? 1 : 0))
+            return false;
+        const int made = (int) drafts.size();
         int keep = 0;
-        if (cum_min < 0) cum_min = dspark_cum_default();
-        float cum = 1.0f;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
-               (cum *= conf[(size_t) keep]) >= cum_min)
-            ++keep;
+        if (dc != nullptr) dc->alone.set_context(m.pos());
+        if (dc != nullptr && cum_min < 0) {   // (the drafts under the floor; of those, the window that pays best)
+            int n = 0;
+            while (n < (int) drafts.size() && n < room - 1 && n < strata::spec::DraftPolicy::kMaxT - 1 &&
+                   conf[(size_t) n] >= conf_min)
+                ++n;
+            double q[strata::spec::DraftPolicy::kMaxT];
+            dc->alone.chain(conf.data(), n, q);
+            keep = dc->alone.window(q, n, room) - 1;
+        } else {
+            if (cum_min < 0) cum_min = dspark_cum_default();
+            float cum = 1.0f;
+            while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+                   (cum *= conf[(size_t) keep]) >= cum_min)
+                ++keep;
+        }
         bool from_lk = false;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
-            const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
             match = lk->sfx.last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
                 const strata::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);
@@ -294,11 +430,16 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (rl.on()) rl.note(pos0, from_lk, from_lk ? keep : made, keep, acc, conf);
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
             offered = keep;
             accepted = acc;
+            if (dc != nullptr) {   // (the round's time by its rows, the lookup's windows too; DSpark's drafts' verdicts)
+                dc->alone.observe_cost(keep + 1, now_ms() - t0);
+                if (!from_lk) dc->alone.observe_drafts(conf.data(), keep, acc);
+            }
             if (lk != nullptr) {
                 lk->policy.observe(from_lk, keep + 1, acc, match, now_ms() - t0);
                 if (from_lk) {
@@ -309,6 +450,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             }
             return true;
         }
+        if (rl.on() && made > 0) rl.note(pos0, false, made, 0, 0, conf);   // (drafts made, none confident enough)
     }
     // no drafter this round (DSpark not loaded or off, or resting after a round of drafts below its confidence): the
     // lookup's drafts alone, where the policy expects more committed tokens a millisecond from them than from a plain
@@ -322,6 +464,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             const std::vector<int> drafts(lk->buf.begin(), lk->buf.begin() + (pk.t - 1));
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (rl.on()) rl.note(pos0, true, k, (int) drafts.size(), acc, {});
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -337,6 +480,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
     if (lk != nullptr) lk->policy.observe(false, 1, 0, match, now_ms() - t0);
+    if (dc != nullptr && drafter) dc->alone.observe_cost(1, now_ms() - t0);   // (drafted, none verified)
     return true;
 }
 
@@ -360,6 +504,17 @@ struct Req {
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
     long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
+    // marks=<pos>,... and shared=<pos>: restore points the read keeps (the server's: the start of the last user
+    // message, a point near the prompt's tail; the end of a start other conversations share, given up last) - a later
+    // prompt that leaves this one past one of them goes back there (ds4_marks.hpp); none: as before
+    std::vector<int64_t> marks;
+    long long shared = -1;
+    // tail=<pos>: the point near the prompt's tail (MAYA_DS4_RESTORE_TAIL), kept as the marks are unless its read stop
+    // costs more on this PC than reading its tokens again (TailCost, ds4_marks.hpp); -1: none
+    long long tail = -1;
+    // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
+    // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
+    int logprobs = -1;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -480,8 +635,30 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
         else if (k == "rid") r.rid = std::atoll(v.c_str());
+        else if (k == "marks") {
+            for (int x : parse_ids(v))
+                if (x > 0) r.marks.push_back(x);
+        } else if (k == "shared") r.shared = std::atoll(v.c_str());
+        else if (k == "tail") r.tail = std::atoll(v.c_str());
+        else if (k == "logprobs") {
+            const int n = std::atoi(v.c_str());
+            r.logprobs = n < 0 ? -1 : std::min(n, strata::ds4::kTopLogprobs);
+        }
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
+}
+
+// logprobs=<k>: a pick's rows for its n tokens, the last first (as the serve loop keeps a round's tokens); a row the
+// pick did not leave is empty (id -1), and its token gets no LP line
+std::vector<strata::ds4::LogprobRow> lp_take(const strata::ds4::Model& m, size_t n) {
+    std::vector<strata::ds4::LogprobRow> v = m.logprobs();
+    v.resize(n);
+    std::reverse(v.begin(), v.end());
+    return v;
+}
+// ... and a token's LP line after its T line (rid >= 0: --parallel's tag)
+void lp_out(long long rid, int tok, const strata::ds4::LogprobRow& row) {
+    if (row.id == tok) std::printf("%s\n", strata::ds4::lp_line(rid, row).c_str());
 }
 
 // the serve watchdog (#539, #494): a request whose heartbeat - its prompt's progress, its tokens, the steps between -
@@ -515,10 +692,13 @@ void start_watchdog(const strata::ds4::Model& m) {
     }).detach();
 }
 
+std::vector<int> g_vram_gpus;   // --gpus (empty: every visible GPU): the cards the prompt line's free VRAM is asked of
+
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
-          Lookup* lk) {
+          Lookup* lk, DraftCost* dc) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -530,6 +710,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     in.start();
     std::string line;
     unsigned long long counter = 0;
+    long long log_req = 0;   // (DS4_ROUND_LOG's tags)
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
@@ -656,7 +837,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
             return false;
         toks.resize(nt);
-        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) ||
+            nc > 3 + (uint64_t) strata::ds4::kMarksMax)   // (the three checkpoints and the marks)
             return false;
         cks.resize(nc);
         if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &np, 8)) return false;
@@ -907,6 +1089,90 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         note(msg);
         return len;
     };
+    // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared= restore point of a
+    // prompt read from token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same
+    // start - after an unrelated one, in another --parallel conversation, with or without MAYA_DS4_SLOT_KEEP - takes it
+    // back and reads only the rest.  It is the state the read itself keeps at that point (a whole read up to it), so
+    // the rest is read as a cold read of the same prompt reads it: the same tokens.  MAYA_DS4_PREFIX_KEEP (2) starts at
+    // most, the least recently used giving way, MAYA_DS4_PREFIX_GB (2) their bytes at most, MAYA_DS4_PREFIX_MIN (1024)
+    // the shortest start kept; MAYA_DS4_PREFIX_KEEP=0: none.  Starts with pictures are not kept.
+    struct Prefix {
+        std::vector<int32_t> tokens;
+        std::vector<uint8_t> data;
+        uint64_t used = 0;
+    };
+    std::vector<Prefix> prefixes;
+    uint64_t prefix_clock = 0;
+    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("STRATA_DS4_PREFIX_KEEP", 2)) : 0;
+    const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("STRATA_DS4_PREFIX_GB", 2)) * 1073741824.0);
+    const size_t prefix_min = (size_t) std::max(1.0, env_num("STRATA_DS4_PREFIX_MIN", 1024));
+    // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
+    const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor) -> int {
+        int best = -1;
+        for (size_t i = 0; i < prefixes.size(); ++i) {
+            const auto& t = prefixes[i].tokens;
+            if (t.size() <= floor || t.size() + 1 > prompt.size() ||
+                (best >= 0 && t.size() <= prefixes[(size_t) best].tokens.size()))
+                continue;
+            if (!std::equal(t.begin(), t.end(), prompt.begin())) continue;
+            bool pic = false;   // (a picture inside the start: its KV needs that picture - none is kept)
+            for (const Pic& q : want) pic = pic || (size_t) q.start < t.size();
+            if (!pic) best = (int) i;
+        }
+        return best;
+    };
+    // the state as the read keeps it at a shared start: kept apart (a copy of it), unless it already is
+    const auto prefix_keep = [&]() {
+        const std::vector<int32_t>& t = m.tokens();
+        if (prefix_max <= 0 || t.size() < prefix_min) return;
+        for (Prefix& p : prefixes)
+            if (p.tokens == t) {
+                p.used = ++prefix_clock;
+                return;
+            }
+        const auto t0 = std::chrono::steady_clock::now();
+        Prefix p;
+        std::string e;
+        const uint64_t bytes = m.slot_save(p.data, e);
+        if (bytes == 0) {
+            std::fprintf(stderr, "ds4: keeping the shared start failed (%s)\n", e.c_str());
+            return;
+        }
+        if (bytes > prefix_budget) return;
+        p.tokens = t;
+        p.used = ++prefix_clock;
+        prefixes.push_back(std::move(p));
+        uint64_t total = 0;
+        for (const Prefix& x : prefixes) total += x.data.size();
+        while (prefixes.size() > 1 && ((int) prefixes.size() > prefix_max || total > prefix_budget)) {
+            size_t lru = 0;
+            for (size_t i = 1; i < prefixes.size(); ++i)
+                if (prefixes[i].used < prefixes[lru].used) lru = i;
+            total -= prefixes[lru].data.size();
+            prefixes.erase(prefixes.begin() + (long) lru);
+        }
+        std::fprintf(stderr, "ds4: kept a %zu-token shared start (%s in RAM in %.2f s); %zu kept, %s\n", t.size(),
+                     gb(bytes).c_str(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                     prefixes.size(), gb(total).c_str());
+    };
+    // kept start i back in the model (false: it did not load - the state is reset, and the start is dropped)
+    const auto prefix_take = [&](int i) -> bool {
+        Prefix& p = prefixes[(size_t) i];
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string e;
+        std::vector<strata::ds4::PicMark> marks;
+        if (!m.slot_load(p.data.data(), p.data.size(), (int64_t) p.tokens.size(), e, &marks) || !marks.empty() ||
+            (size_t) m.pos() != p.tokens.size()) {
+            std::fprintf(stderr, "ds4: taking a shared start back failed (%s) - reading it again\n", e.c_str());
+            prefixes.erase(prefixes.begin() + i);
+            m.reset();
+            return false;
+        }
+        p.used = ++prefix_clock;
+        std::fprintf(stderr, "ds4: took back a %zu-token shared start (%.2f s)\n", p.tokens.size(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        return true;
+    };
     if (slot_max > 0) {
         slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
@@ -983,6 +1249,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#else
+        // (Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too; the server stops
+        // on them and ends the engine with QUIT)
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
 #endif
     }
     // STAT for the Monitor over a decode so far (from t1, the counters s_dec and the storage's io_dec then): the GLM
@@ -1005,6 +1276,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         out += b;
         if (sx > 0) {   // (the PCIe lane: experts a token streamed to the GPU)
             std::snprintf(b, sizeof b, " pcie=%.3f", sx / fed);
+            out += b;
+        }
+        if (s.store_slots > 0) {   // (--ssd-cache: a token's CPU-lane experts from the RAM store, read into it; the
+                                   //  lane's wait for its reads, ms a token)
+            std::snprintf(b, sizeof b, " store_hit=%.3f store_miss=%.3f store_wait_ms=%.3f",
+                          (double) (s.store_hits - s_dec.store_hits) / fed, (double) (s.store_misses - s_dec.store_misses) / fed,
+                          (s.store_wait_ms - s_dec.store_wait_ms) / fed);
             out += b;
         }
         if (s.helper_held > 0) {   // (DS4_HELPER: experts a token the helper GPU computed, the CPU lane for it after
@@ -1052,6 +1330,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         } else if (cx == 0) {   // (the storage's reads not measured here - but no expert ran on the CPU lane)
             out += " disk=0 ram_fetch=0";
         }
+        // Existing host timers, over the same interval as this STAT: one request in serial mode, the engine's
+        // busy interval with --parallel. These are measured regions, not GPU-only times or a wall-time breakdown.
+        std::snprintf(b, sizeof b, " draft_rounds=%lld draft_ms=%.3f verify_ms=%.3f",
+                      (long long) (s.drafts_rounds - s_dec.drafts_rounds), s.draft_ms - s_dec.draft_ms,
+                      s.verify_ms - s_dec.verify_ms);
+        out += b;
         if (d_off > 0) {
             std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
             out += b;
@@ -1066,21 +1350,40 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         return out;
     };
-    // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike): its
-    // pictures read, the state it continues reused (in place, a checkpoint, or a kept conversation), the rest read.
-    // Its lines carry `tag` (" <rid>" with --parallel), stop_now() is its STOP; false: it ended here (its ERR or
-    // DONE written)
+    // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike), in three
+    // steps: prompt_begin (its pictures read, the state it continues reused - in place, a checkpoint, or a kept
+    // conversation), prompt_piece (the next tokens of the rest read: one conversation reads it in one piece, --parallel
+    // a piece at a time with the other conversations' tokens between) and prompt_end (the state's checkpoints).  Its
+    // lines carry `tag` (" <rid>" with --parallel), stop_now() is its STOP; false: it ended there (its ERR or DONE
+    // written)
     struct Prompt {
         double t0 = 0;
+        strata::core::VramMark v0;   // (the free VRAM when the read began: the prompt-read line at its end)
         strata::ds4::Stats s0;   // (the request's own CPU lane share)
         size_t from = 0;         // the tokens the state already held
+        size_t done = 0;         // the prompt's tokens in the state so far
+        size_t next_pp = 0;      // (the next PP line's)
+        bool continued = false;  // (the conversation goes on - its anchor stays)
+        std::vector<Pic> pics;
+        std::vector<strata::ds4::MarkAt> cuts;   // the restore points the read stops at (ds4_marks.hpp)
+        size_t next_cut = 0;                     // (the next of them)
+        // the tail point the read stops at (-1: none) and what the read spent before it and after it (TailCost)
+        int64_t tail_at = -1;
+        double ms_main = 0.0, ms_tail = 0.0;
     };
-    const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
-                               Prompt& P) -> bool {
+    // MAYA_DS4_RESTORE_TAIL_AUTO (1): the tail point is left out where its cost is measured higher than reading its
+    // tokens again; 0: kept on every read that reaches it, as before
+    static const bool tail_auto = [] {
+        const char* v = std::getenv("MAYA_DS4_RESTORE_TAIL_AUTO");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    strata::ds4::TailCost tail_cost;
+    const auto prompt_begin = [&](Req& r, bool geni, const std::string& tag, Prompt& P) -> bool {
         const double t0 = now_ms();
         P.t0 = t0;
+        P.v0 = strata::core::vram_mark(g_vram_gpus);
         P.s0 = m.stats();
-        std::vector<Pic> pics;
+        std::vector<Pic>& pics = P.pics;
         {
             std::string e;
             if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
@@ -1105,7 +1408,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (const Pic& q : held)
             if ((size_t) q.start < c && !pic_same(pics, q)) c = (size_t) q.start;
         size_t from = 0;
-        bool continued = false;   // (continued: the conversation goes on - its anchor stays)
+        bool continued = false;
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
@@ -1122,11 +1425,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
             bool whole = false;
-            const size_t back = slot_take(r.ids, pics, rs > 0 ? (size_t) rs : 0, whole);
+            // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
+            //  only when it covers more than either)
+            const int pi = prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+            const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
+            const size_t back = slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
             beat();
             if (back > 0) {
                 from = back;
                 continued = whole;
+            } else if (pi >= 0 && prefix_take(pi)) {
+                from = plen;
+                held.clear();
             } else if (rs >= 0 && m.restore(limit))
                 from = (size_t) m.pos();
             else m.reset();
@@ -1181,59 +1491,186 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             for (Pic& q : pics) q.rgb = {};   // (only the start, hash and span stay)
         }
-        // the prompt in windows (PP <read> <total> <ms> <tok/s> <reuse> every 64 tokens), a checkpoint before its last
-        // token and one after it: the next turn re-renders this one, and shares its start up to one of them
+        if (!ok) {
+            std::fprintf(stderr, "ds4: %s\n", err.c_str());
+            std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
+            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
+            std::fflush(stdout);
+            m.set_images({});
+            m.reset();
+            held.clear();
+            return false;
+        }
+        // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
+        // feeds, --parallel's between pieces) and goes back to the state before this prompt - kept here first, in
+        // checkpoint 1, which the prompt's own end overwrites as before - so the next request still shares the
+        // conversation up to it
+        if (from > 0 && from < r.ids.size()) m.checkpoint(1);
+        P.from = from;
+        P.done = from;
+        P.next_pp = from + 64;
+        P.continued = continued;
+        // the restore points the request asks for (marks= / shared=; ds4_marks.hpp picks the ones this read reaches):
+        // the read stops at each and keeps the state there.  The stretch up to each is read as runs of its own (a
+        // piece ends at a point, and tells the model only of the prompt up to the next one: Model::feed's `after`),
+        // so a long stretch's skip (MAYA_DS4_PROMPT_SKIP) runs every layer on its own last ~2,700 rows - the state kept at the point is the
+        // one a whole read leaves (the later layers' window rings included), at the cost of up to that many rows
+        // through the layers the skip leaves out (V4.1: 20-39) that one run would have skipped - as many as lie
+        // between the point and the prompt's end, when that is less
+        std::vector<strata::ds4::MarkAt>& cuts = P.cuts;
+        cuts.clear();
+        P.tail_at = -1;
+        P.ms_main = P.ms_tail = 0.0;
+        // the tail point (tail=): only where the read reaches it, and - once two reads measured it - where its run
+        // costs no more than reading its tokens again (TailCost: most experts outside VRAM make it a whole pass)
+        std::vector<int64_t> asked = r.marks;
+        if (r.tail > (long long) from && r.tail < (long long) r.ids.size() - 1 && m.marks_cap() > 0) {
+            const bool was = tail_cost.costly();
+            if (!tail_auto || tail_cost.keep()) asked.push_back(r.tail);
+            static bool said_off = false;
+            if (tail_auto && was && !said_off) {
+                std::fprintf(stderr, "maya ds4 serve: the tail restore point is left out on this PC: its read stop cost "
+                                     "%.1fx a long read's time a token (more than reading its tokens again: the last "
+                                     "tail run %zu tokens in %.0f ms, the long read %.2f ms a token); one in 32 still "
+                                     "keeps it, to measure again (MAYA_DS4_RESTORE_TAIL_AUTO=0 keeps it always)\n",
+                             tail_cost.ratio, tail_cost.last_tail_tokens, tail_cost.last_tail_ms,
+                             tail_cost.last_main_ms_token);
+                said_off = true;
+            }
+        }
+        if ((!asked.empty() || r.shared >= 0) && m.marks_cap() > 0) {
+            std::vector<std::pair<int64_t, int64_t>> spans;
+            for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
+            cuts = strata::ds4::mark_plan(asked, r.shared, (int64_t) from, (int64_t) r.ids.size(), m.marks_cap(), 16, spans);
+            for (const strata::ds4::MarkAt& c : cuts)
+                if (c.pos == (int64_t) r.tail && c.pos > (int64_t) from) P.tail_at = c.pos;   // (the plan kept it there)
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "maya ds4 serve: restore points a request asks for: up to %d a conversation, "
+                                     "%.1f MB of RAM each (MAYA_DS4_RESTORE_POINTS)\n",
+                             m.marks_cap(), (double) m.check_bytes() / 1e6);
+            said = true;
+        }
+        P.next_cut = 0;
+        if (!cuts.empty() && cuts[0].pos == (int64_t) from) m.mark(cuts[P.next_cut++].shared);   // (the state as it is)
+        return true;
+    };
+    // the prompt's next `piece` tokens (or the rest) in windows (PP <read> <total> <ms> <tok/s> <reuse> every 64
+    // tokens), its last with a checkpoint before its last token and one after it: the next turn re-renders this one,
+    // and shares its start up to one of them
+    const auto prompt_piece = [&](Req& r, const std::string& tag, const std::function<bool()>& stop_now, Prompt& P,
+                                  size_t piece) -> bool {
         const size_t total = r.ids.size();
-        size_t done = from, next_pp = from + 64;
+        const size_t from = P.from;
+        const double t0 = P.t0;
+        const size_t start = P.done;
         int64_t beat_at = -1;   // (the run's progress at the last beat)
-        m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
+        // (a run of chunks: each one through every layer)
+        const std::function<void(int64_t)> progress = [&](int64_t d) {
             // (a beat only when it moved: the run calls this every 50 ms with what is done so far - a wedged chunk run
             //  repeats its last value for hours, #539, and must not look alive to the watchdog)
-            if (d + (int64_t) done != beat_at) {
-                beat_at = d + (int64_t) done;
+            if (d + (int64_t) P.done != beat_at) {
+                beat_at = d + (int64_t) P.done;
                 beat();
             }
             const double ms = now_ms() - t0;
-            std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done + (size_t) d, r.ids.size(), ms,
-                        ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
+            std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), P.done + (size_t) d, total, ms,
+                        ms > 0 ? 1000.0 * (double) (P.done + (size_t) d - from) / ms : 0.0, from);
             std::fflush(stdout);
-        });
+        };
+        m.set_progress(progress);
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
-        // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
-        // feeds) and goes back to the state before this prompt - kept here first, in checkpoint 1, which the prompt's
-        // own end overwrites as before - so the next request still shares the conversation up to it
-        if (from > 0 && from < total) m.checkpoint(1);
         m.set_cancel(stop_now);
-        bool stopped = false;
-        while (ok && done < total) {
+        std::string err;
+        bool ok = true, stopped = false;
+        while (ok && P.done < total) {
             if (stop_now()) {
                 stopped = true;
                 break;
             }
-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
-            // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
-            const bool fin = done + n == total;
-            if (fin && last_window) {
-                ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
-                if (ok) m.checkpoint(1);
-                ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
-            } else
-                ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
-                         : m.feed(r.ids.data() + done, (int) n, 0, err);
-            done += n;
-            beat();
-            if (ok && (done >= next_pp || done == total)) {
-                const double ms = now_ms() - t0;
-                std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done, r.ids.size(), ms,
-                            ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
-                std::fflush(stdout);
-                next_pp = done + 64;
+            if (P.done - start >= piece) break;
+            // (a restore point: the read stops there, and a piece tells the model of the prompt only up to it - the
+            //  state kept at the point is the one a whole read up to it leaves)
+            const size_t upto = P.next_cut < P.cuts.size() ? (size_t) P.cuts[P.next_cut].pos : total;
+            size_t n = std::min<size_t>({(size_t) m.feed_unit(), upto - P.done, piece - (P.done - start)});
+            // (the rest of the prompt in one read that keeps the restore points left on the way, where that costs
+            //  at most a chunk's rows more than stopping at each - a run of chunks has a fixed cost of its own, the
+            //  CPU lane's experts streamed for it: a point near the prompt's tail read alone cost as much as the rest)
+            std::vector<std::pair<int64_t, bool>> inner;
+            const size_t rest = total - P.done;
+            // (not past a shared start a read from token 0 reaches first: the read stops there, and its state is kept
+            //  apart for new conversations - prefix_keep keeps the state the model holds then)
+            const bool start_kept = prefix_max > 0 && P.from == 0 && P.next_cut == 0 && P.next_cut < P.cuts.size() &&
+                                    P.cuts[0].shared && (size_t) P.cuts[0].pos >= prefix_min;
+            if (P.next_cut < P.cuts.size() && !last_window && !start_kept && rest <= (size_t) m.feed_unit() &&
+                rest <= piece - (P.done - start)) {
+                std::vector<int64_t> rel;
+                for (size_t j = P.next_cut; j < P.cuts.size(); ++j) rel.push_back(P.cuts[j].pos - (int64_t) P.done);
+                if (m.marks_inside((int) rest, rel))
+                    for (size_t j = P.next_cut; j < P.cuts.size(); ++j) inner.push_back({P.cuts[j].pos, P.cuts[j].shared});
             }
+            if (!inner.empty()) n = rest;
+            // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
+            const bool fin = P.done + n == total;
+            size_t took = n;   // (fewer: a yield - the model ended the run early, the rest a later piece's)
+            const double f0 = P.tail_at >= 0 ? now_ms() : 0.0;   // (TailCost: the run's wall time)
+            if (!inner.empty()) {
+                ok = m.feed_marks(r.ids.data() + P.done, (int) n, 1, 1, inner, err);
+                if (ok) took = (size_t) m.fed();
+                // (the points the read went past: kept by it)
+                while (ok && P.next_cut < P.cuts.size() && (size_t) P.cuts[P.next_cut].pos < P.done + took) ++P.next_cut;
+            } else if (fin && last_window) {
+                ok = (n < 2 || m.feed(r.ids.data() + P.done, (int) n - 1, 0, err));
+                if (ok && n >= 2 && (size_t) m.fed() < n - 1) took = (size_t) m.fed();
+                else {
+                    if (ok) m.checkpoint(1);
+                    ok = ok && m.feed(r.ids.data() + P.done + n - 1, 1, 1, err);
+                }
+            } else {
+                ok = fin ? m.feed_mark(r.ids.data() + P.done, (int) n, 1, 1, err)
+                         : m.feed(r.ids.data() + P.done, (int) n, 0, err, (int) (upto - P.done - n));
+                if (ok) took = (size_t) m.fed();
+            }
+            if (ok && P.tail_at >= 0) {
+                const bool after = P.done >= (size_t) P.tail_at;
+                (after ? P.ms_tail : P.ms_main) += now_ms() - f0;
+                if (after && P.done + took == total && tail_auto) {   // (the read's end: its cost measured)
+                    const bool was = tail_cost.costly(), known = tail_cost.measured();
+                    if (tail_cost.add(P.ms_main, (size_t) P.tail_at - from, P.ms_tail, total - (size_t) P.tail_at) &&
+                        ((was && !tail_cost.costly()) || (!known && tail_cost.measured() && !tail_cost.costly())))
+                        std::fprintf(stderr, "maya ds4 serve: the tail restore point is kept%s: its read stop costs %.1fx "
+                                             "a long read's time a token (2x or less: no more than reading its tokens "
+                                             "again; the last tail run %zu tokens in %.0f ms, the long read %.2f ms a "
+                                             "token)\n", was ? " again" : "", tail_cost.ratio, tail_cost.last_tail_tokens,
+                                     tail_cost.last_tail_ms, tail_cost.last_main_ms_token);
+                }
+            }
+            P.done += took;
+            beat();
+            if (ok && P.next_cut < P.cuts.size() && P.done == (size_t) P.cuts[P.next_cut].pos) {
+                const bool sh = P.cuts[P.next_cut].shared;
+                m.mark(sh);
+                // (a shared start read from token 0 with no stop before it: the state a cold read keeps there - kept
+                //  apart for new conversations, #607)
+                bool pic = false;
+                for (const Pic& q : P.pics) pic = pic || (size_t) q.start < P.done;
+                if (sh && P.from == 0 && P.next_cut == 0 && !pic) prefix_keep();
+                ++P.next_cut;
+            }
+            if (ok && (P.done >= P.next_pp || P.done == total)) {
+                const double ms = now_ms() - t0;
+                std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), P.done, total, ms,
+                            ms > 0 ? 1000.0 * (double) (P.done - from) / ms : 0.0, from);
+                std::fflush(stdout);
+                P.next_pp = P.done + 64;
+            }
+            if (took < n) break;
         }
         m.set_cancel(nullptr);
-        m.set_images({});
+        m.set_progress(nullptr);
         if (stopped || (!ok && m.cancelled())) {
+            m.set_images({});
             const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
             if (!back) {
                 m.reset();
@@ -1241,31 +1678,46 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::fprintf(stderr, "maya ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
-            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), r.ids.size(), now_ms() - t0, back ? from : (size_t) 0);
+            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), total, now_ms() - t0, back ? from : (size_t) 0);
             std::fflush(stdout);
             return false;
         }
         if (!ok) {
+            m.set_images({});
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
-            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
+            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), total);
             std::fflush(stdout);
             m.reset();
             held.clear();
             return false;
         }
+        return true;
+    };
+    const auto prompt_end = [&](Prompt& P) {
+        {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
+            const std::string vt = strata::core::vram_mark_text(P.v0, strata::core::vram_mark(g_vram_gpus));
+            if (!vt.empty())
+                std::fprintf(stderr, "maya ds4 serve: prompt read: %zu tokens in %.1f s; %s\n",
+                             P.done > P.from ? P.done - P.from : (size_t) 0, (now_ms() - P.t0) / 1000.0, vt.c_str());
+        }
+        m.set_images({});
         {   // the pictures the state holds: the prompt's, and those the state kept short of `from` (a turn that adds no
             // picture still holds the ones the history above it has)
             std::vector<Pic> nh;
-            nh.reserve(held.size() + pics.size());
+            nh.reserve(held.size() + P.pics.size());
             for (const Pic& x : held)
-                if (x.len > 0 && (size_t) x.start + x.len <= from && !pic_same(pics, x)) nh.push_back(x);
-            for (const Pic& x : pics) nh.push_back(x);
+                if (x.len > 0 && (size_t) x.start + x.len <= P.from && !pic_same(P.pics, x)) nh.push_back(x);
+            for (const Pic& x : P.pics) nh.push_back(x);
             held = std::move(nh);
         }
         m.checkpoint(0);
-        if (!continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
-        P.from = from;
+        if (!P.continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
+    };
+    const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
+                               Prompt& P) -> bool {
+        if (!prompt_begin(r, geni, tag, P) || !prompt_piece(r, tag, stop_now, P, r.ids.size())) return false;
+        prompt_end(P);
         return true;
     };
     const bool multi = m.seq_count() > 1;
@@ -1288,6 +1740,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
+        if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
         // a request's own seed: its draws from the start of its stream, so the same seed gives the same answer (the
         // counter ran on across requests: a seed was not reproducible); without one the stream runs on as before
         if (r.seed != 0) counter = 0;
@@ -1314,8 +1767,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        strata::ds4::LogprobRow tok_lp;
+        std::vector<strata::ds4::LogprobRow> got_lp;
+        if (r.logprobs >= 0) tok_lp = lp_take(m, 1).back();
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
@@ -1334,7 +1791,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 finish = "cancel";
                 break;
             }
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                std::fprintf(stderr, "ds4: the sample failed\n");
+                finish = "cancel";
+                break;
+            }
             std::printf("T %d\n", tok);
+            if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
             beat();
             ++produced;
             if (lk) lk->sfx.append(tok);
@@ -1357,9 +1820,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                m.set_logprobs(r.logprobs, close_think ? r.think_end : -1);
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk)) {
+                           off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -1369,11 +1833,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 cool = try_spec && off == 0;
                 if (close_think && !got.empty()) got.back() = r.think_end;   // (room 1: one token, not fed yet)
                 std::reverse(got.begin(), got.end());
+                if (r.logprobs >= 0) got_lp = lp_take(m, got.size());
                 dump_rows();
             }
             tok = got.back();
             got.pop_back();
+            if (!got_lp.empty()) {
+                tok_lp = got_lp.back();
+                got_lp.pop_back();
+            }
         }
+        m.set_logprobs(-1);
         if (dump_f != nullptr) std::fflush(dump_f);
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
@@ -1412,6 +1882,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (lk && lk->windows > lk_w0)
             std::fprintf(stderr, "maya ds4 serve: prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the above)\n",
                          lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+        if (dc != nullptr && d_off > 0)
+            std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
@@ -1419,11 +1891,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // line a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...);
     // STOP <rid> ends that request, a bare STOP every one.  Each request runs in one of the n conversations the model
     // holds (Model::seq_bind): the idle one whose state its prompt reuses the most, else an empty one, else the least
-    // recently used (whose conversation is set aside first with MAYA_DS4_SLOT_KEEP, as one conversation's is).  A new
-    // request's prompt - its pictures too: the tower borrows its room and gives it back before the prompt, with every
-    // other request between two of its tokens - is read while the others wait; then each running request writes a
-    // token a step.  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
-    // lookup); two or more go through Model::step_multi - a token of each through the model together, no drafts.
+    // recently used (whose conversation is set aside first with MAYA_DS4_SLOT_KEEP, as one conversation's is).  The
+    // prompts being read take turns, a piece each (a chunk per pipeline stage: the split's stages all busy), and every
+    // running request writes a token between two pieces - so a long prompt no longer holds every answer, and a short
+    // question no longer waits for a long prompt read before it: a prompt whole in one piece goes ahead of the longer
+    // reads (MAYA_DS4_READ_ORDER=arrival: each prompt whole as it comes, the others waiting).  A prompt read alone goes
+    // in one run until a line comes (Model::set_yield: the run ends at a chunk every stage reaches), and a piece tells
+    // the model how much of its prompt follows (the long prompt's skip counts from the prompt's end).  A prompt with pictures is
+    // read whole (the tower borrows its room and gives it back before the prompt, with every other request between
+    // two of its tokens).  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
+    // lookup); two or more in rounds together - each one's DSpark drafts (its share of a window), every one's token
+    // and drafts through the model at once (Model::step_multi_spec, verify_multi), or with no drafts a token of each
+    // (Model::step_multi).  With several running, each writes all of its round's tokens at once, so every one needs
+    // the model in the same step again.
+    // The loop runs on events (ds4_evt.hpp, rig's evt): the reader's lines, and the turns - a round of tokens or a
+    // prompt's piece - each queueing the next as it ends; a line outranks a turn, and with nothing running it waits.
     if (multi) {
         struct Act {
             Req r;
@@ -1434,9 +1916,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             long long produced = 0, limit = 0, d_off = 0, d_acc = 0;
             const char* finish = "length";
             bool cool = false, in_think = false, done = false;
+            bool reading = false;   // its prompt is being read, a piece a turn
+            bool ended = false;     // it ended while its prompt was read (its DONE written)
             unsigned long long counter = 0;   // (its own: its picks the same alone or beside others)
             int tok = -1;                     // written next, not fed yet
             std::vector<int> got;             // a round's tokens still to write, the last first
+            strata::ds4::LogprobRow tok_lp;   // (logprobs=<k>: tok's row, and got's rows as got)
+            std::vector<strata::ds4::LogprobRow> got_lp;
         };
         const int nseq = m.seq_count();
         std::vector<long long> seq_rid((size_t) nseq, -1);   // the request in each conversation (-1: idle)
@@ -1445,6 +1931,28 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         uint64_t use_clock = 0;
         std::vector<std::unique_ptr<Act>> acts;
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
+        std::deque<Act*> read_line;        // the prompts being read, in turn: a piece each, then to the back
+        const bool read_pieces = [] {
+            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+            return v == nullptr || std::string(v) != "arrival";
+        }();
+        // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
+        // running answers write n tokens each (n rounds) between two pieces (1); MAYA_DS4_READ_SHARE=<percent>: instead,
+        // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
+        constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
+        const auto env_count = [](const char* name, int dflt) {
+            const char* v = std::getenv(name);
+            const int x = v != nullptr ? std::atoi(v) : 0;
+            return x > 0 ? x : dflt;
+        };
+        const size_t read_piece = m.prompt_chunk() > 0 ? (size_t) m.prompt_chunk() * (size_t) m.pipeline_stages() *
+                                                             (size_t) env_count("MAYA_DS4_READ_PIECE", kReadPieceChunks)
+                                                       : (size_t) m.feed_unit();
+        const int read_rounds = env_count("MAYA_DS4_READ_ROUNDS", kReadRounds);
+        const double read_share = std::min(env_count("MAYA_DS4_READ_SHARE", 0), kReadShareMax) / 100.0;
+        // the reader's lines posted and taken: one waiting, a prompt read alone yields to it
+        std::atomic<long long> lines_posted{0};
+        long long lines_taken = 0;
         long long lk_owner = -1;           // the request the prompt lookup's history follows (its rounds alone)
         // the Monitor's counters: over everything written since the engine was last idle
         double busy_t1 = 0;
@@ -1469,6 +1977,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
         const auto close_think = [](const Act& a) { return a.in_think && a.produced >= a.r.think_budget; };
+        // the next of a round's tokens to write (and its row: logprobs=<k>)
+        const auto next_tok = [](Act& a) {
+            a.tok = a.got.back();
+            a.got.pop_back();
+            if (!a.got_lp.empty()) {
+                a.tok_lp = a.got_lp.back();
+                a.got_lp.pop_back();
+            }
+        };
+        const auto release = [&](const Act& a) {   // (its conversation free for the next request)
+            seq_rid[(size_t) a.seq] = -1;
+            seq_used[(size_t) a.seq] = ++use_clock;
+            in.forget(a.r.rid);
+            if (lk_owner == a.r.rid) lk_owner = -1;
+        };
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
@@ -1479,16 +2002,57 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             std::fprintf(stderr,
                          "maya ds4 serve: request %lld: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
-                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running)\n",
+                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running; drafts %lld of %lld kept)\n",
                          a.r.rid, a.r.ids.size(), a.P.from, a.r.ids.size() - a.P.from, a.t1 - a.P.t0,
                          a.t1 > a.P.t0 ? 1000.0 * (double) (a.r.ids.size() - a.P.from) / (a.t1 - a.P.t0) : 0.0,
-                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size());
-            seq_rid[(size_t) a.seq] = -1;
-            seq_used[(size_t) a.seq] = ++use_clock;
-            in.forget(a.r.rid);
-            if (lk_owner == a.r.rid) lk_owner = -1;
+                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size(),
+                         a.d_acc, a.d_off);
+            if (dc != nullptr && a.d_off > 0)
+                std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n",
+                             dc->text().c_str());
+            release(a);
         };
-        // a GEN line into a free conversation: its prompt read (the others wait), its first token picked
+        // its prompt read: its first token picked, and it writes from the next turn on
+        const auto start_answer = [&](Act& a) {
+            prompt_end(a.P);
+            a.reading = false;
+            a.t1 = now_ms();
+            a.sd = m.stats();
+            a.limit = a.r.max_new > 0 ? a.r.max_new : m.max_context() - (long long) a.r.ids.size();
+            a.in_think = a.r.think_budget > 0 && a.r.think_end >= 0;
+            penalties(a.r);
+            m.set_logprobs(a.r.logprobs);
+            a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
+            if (a.r.logprobs >= 0) a.tok_lp = lp_take(m, 1).back();
+        };
+        // the next `piece` tokens of its prompt into its conversation (a STOP ends it here, its DONE written); `yield`:
+        // the piece ends early at a chunk the model reaches once a line is waiting
+        const auto read_turn = [&](Act& a, size_t piece, bool yield) {
+            bind(a.seq);
+            const long long rid = a.r.rid;
+            if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
+                                           piece);
+            m.set_yield(nullptr);
+            if (!read) {
+                a.ended = a.done = true;
+                return;
+            }
+            if (a.P.done == a.r.ids.size()) start_answer(a);
+        };
+        // a prompt whole in one piece joins the line ahead of the longer reads, behind the other one-piece prompts: it
+        // is through in its turn, so a short question does not wait a round of long reads' pieces
+        const auto one_piece = [&](const Act* a) { return a->r.ids.size() - a->P.done <= read_piece; };
+        const auto join_read = [&](Act* a) {
+            if (!one_piece(a)) {
+                read_line.push_back(a);
+                return;
+            }
+            auto at = read_line.begin();
+            while (at != read_line.end() && one_piece(*at)) ++at;
+            read_line.insert(at, a);
+        };
+        // a GEN line into a free conversation: its prompt begun, and read in turn (arrival, or with pictures: whole now)
         const auto admit = [&](const std::string& ln) {
             const bool geni = ln.rfind("GENI ", 0) == 0;
             auto a = std::make_unique<Act>();
@@ -1530,18 +2094,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             seq_used[(size_t) best] = ++use_clock;
             if (acts.empty()) m.begin_request();   // (DISK_SKIP_AUTO: between requests only - none runs now)
             const long long rid = r.rid;
-            const std::string tag = " " + std::to_string(rid);
-            if (!prompt_in(r, geni, tag, [&in, rid] { return in.stopped(rid); }, a->P)) {
+            if (!prompt_begin(r, geni, " " + std::to_string(rid), a->P)) {
                 in.forget(rid);
                 return;
             }
             a->seq = best;
-            a->t1 = now_ms();
-            a->sd = m.stats();
-            a->limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
-            a->in_think = r.think_budget > 0 && r.think_end >= 0;
-            penalties(r);
-            a->tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, a->counter++);
+            a->reading = true;
+            if (!read_pieces || !a->P.pics.empty()) {
+                read_turn(*a, r.ids.size(), false);
+                if (a->ended) {
+                    in.forget(rid);
+                    return;
+                }
+            }
             seq_rid[(size_t) best] = rid;
             if (acts.empty()) {
                 busy_t1 = now_ms();
@@ -1549,76 +2114,82 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 busy_s = m.stats();
                 busy_io = io_read_bytes();
             }
+            if (a->reading) join_read(a.get());
             acts.push_back(std::move(a));
         };
+        // the loop's events (ds4_evt.hpp, rig's evt), run one at a time on this thread: the reader's lines, then the
+        // turns - a token of every answer running (a round), or the next prompt's piece, in turn.  A line outranks a
+        // turn, so every request that came is admitted before the next one; nothing polls: with no request running
+        // the engine waits for a line
+        enum : int { kTurn = 1, kLine = 2 };
+        strata::ds4::evt::Engine eng;
         bool quit = false;
-        for (;;) {
-            // the input between steps: requests and QUIT (STOP <rid> is the reader's); waited for only when idle
-            std::string ln;
-            bool end = false;
-            if (acts.empty() && waiting.empty()) {
-                g_busy.store(false);   // (waiting for a request: no watchdog)
-                m.save_profile();
-                if (quit || !in.next(ln) || ln == "QUIT") break;
-                g_busy.store(true);
-                beat();
-                waiting.push_back(ln);
-            }
-            while (in.poll(ln, end)) {
-                if (ln == "QUIT") quit = true;
-                else waiting.push_back(ln);
-            }
-            for (size_t i = 0; i < waiting.size();) {   // (not GEN: answered at once)
-                if (waiting[i].rfind("GEN ", 0) == 0 || waiting[i].rfind("GENI ", 0) == 0) {
-                    ++i;
-                    continue;
-                }
-                std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
-                            waiting[i].substr(0, waiting[i].find(' ')).c_str());
-                std::fflush(stdout);
-                waiting.erase(waiting.begin() + (long) i);
-            }
-            while (!quit && !waiting.empty() &&
-                   std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
+        bool turn_queued = false;   // (one turn in the queue at a time: each queues the next as it ends)
+        int rounds = 0;             // (the rounds since the last piece, and their time; the last piece's time)
+        double rounds_ms = 0, piece_ms = 0;
+        // (with a share, a prompt whole in one piece next goes after a round: its read is short and its first token
+        //  the one waited for - the share is the answers' between a long read's pieces)
+        const auto piece_due = [&] {
+            if (read_share <= 0) return rounds >= read_rounds;
+            if (rounds > 0 && !read_line.empty() && one_piece(read_line.front())) return true;
+            return rounds > 0 && rounds_ms >= piece_ms * read_share / (1.0 - read_share);
+        };
+        const auto admit_waiting = [&] {
+            while (!quit && !waiting.empty() && std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
                 const std::string g = waiting.front();
                 waiting.pop_front();
                 admit(g);
                 beat();
             }
-            if (quit) in.stop_all.store(true);
-            // each running request writes its next token; those whose next one the model must make go below
+        };
+        // each running request writes its next token; those whose next one the model must make go below (with
+        // several running, a round's tokens all at once: every one then needs the model in the same step, so
+        // their rounds go through it together)
+        const auto round_turn = [&] {
             std::vector<Act*> need;
             const long long n0 = busy_n;
+            const bool several = acts.size() > 1;
             for (auto& ap : acts) {
                 Act& a = *ap;
-                if (in.stopped(a.r.rid)) {
-                    a.finish = "cancel";
-                    a.done = true;
-                    continue;
+                if (a.reading) continue;
+                for (;;) {
+                    if (in.stopped(a.r.rid)) {
+                        a.finish = "cancel";
+                        a.done = true;
+                        break;
+                    }
+                    if (a.tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                        std::fprintf(stderr, "ds4: the sample failed\n");
+                        a.finish = "cancel";
+                        a.done = true;
+                        break;
+                    }
+                    std::printf("T %lld %d\n", a.r.rid, a.tok);
+                    if (a.r.logprobs >= 0) lp_out(a.r.rid, a.tok, a.tok_lp);
+                    beat();
+                    ++a.produced;
+                    ++busy_n;
+                    if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
+                    if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
+                    bool eos_tok = false;
+                    for (int e : eos) eos_tok = eos_tok || a.tok == e;
+                    if (eos_tok) {
+                        a.finish = "stop";
+                        a.done = true;
+                        break;
+                    }
+                    if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
+                        a.done = true;
+                        break;
+                    }
+                    if (!a.got.empty()) {
+                        next_tok(a);
+                        if (several) continue;
+                        break;
+                    }
+                    need.push_back(&a);
+                    break;
                 }
-                std::printf("T %lld %d\n", a.r.rid, a.tok);
-                beat();
-                ++a.produced;
-                ++busy_n;
-                if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
-                if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
-                bool eos_tok = false;
-                for (int e : eos) eos_tok = eos_tok || a.tok == e;
-                if (eos_tok) {
-                    a.finish = "stop";
-                    a.done = true;
-                    continue;
-                }
-                if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
-                    a.done = true;
-                    continue;
-                }
-                if (!a.got.empty()) {
-                    a.tok = a.got.back();
-                    a.got.pop_back();
-                    continue;
-                }
-                need.push_back(&a);
             }
             if (busy_n / 8 != n0 / 8) {   // the Monitor's line, every 8 tokens of all of them
                 std::string st = stat_text(busy_t1, busy_s, busy_io, busy_n, 0, 0);
@@ -1626,24 +2197,27 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::printf("%s\n", st.c_str());
             }
             std::fflush(stdout);
-            if (need.size() == 1 && acts.size() == 1) {   // alone: its rounds, as with one conversation
+            if (need.size() == 1) {   // alone (or the last of several still running): its rounds, as with one conversation
                 Act& a = *need[0];
                 bind(a.seq);
+                if (round_log().f != nullptr) round_log().tag = "rid" + std::to_string(a.r.rid);   // (DS4_ROUND_LOG)
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
                 const bool closing = close_think(a);
                 if (closing) room = 1;
                 else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
-                Lookup* L = a.r.lookup == 0 ? nullptr : lk;
+                // (the prompt lookup alone only: its history follows one request)
+                Lookup* L = a.r.lookup == 0 || acts.size() > 1 ? nullptr : lk;
                 if (L != nullptr && lk_owner != a.r.rid) {   // (its history: what it consumed, then the token written)
                     L->start(m.tokens());
                     L->sfx.append(a.tok);
                     lk_owner = a.r.rid;
                 }
                 penalties(a.r);
+                m.set_logprobs(a.r.logprobs, closing ? a.r.think_end : -1);
                 int off = 0, acc = 0;
                 const bool try_spec = (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool;
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
-                           a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L)) {
+                           a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     a.finish = "cancel";
                     a.done = true;
@@ -1653,44 +2227,232 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     a.cool = try_spec && off == 0;
                     if (closing && !a.got.empty()) a.got.back() = a.r.think_end;
                     std::reverse(a.got.begin(), a.got.end());
-                    a.tok = a.got.back();
-                    a.got.pop_back();
+                    if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
+                    next_tok(a);
                 }
-            } else if (need.size() == 1) {   // one of several: a plain step of its conversation
-                Act& a = *need[0];
-                bind(a.seq);
-                if (!m.step(a.tok, true, err)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    a.finish = "cancel";
-                    a.done = true;
-                } else {
-                    penalties(a.r);
-                    const bool closing = close_think(a);
-                    a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
-                    if (closing) a.tok = a.r.think_end;
-                }
-            } else if (need.size() > 1) {   // several: a token of each through the model together
-                std::vector<int> sv, tv;
-                for (Act* a : need) {
-                    sv.push_back(a->seq);
-                    tv.push_back(a->tok);
-                }
-                if (!m.step_multi(sv.data(), tv.data(), (int) sv.size(), err)) {
+            } else if (need.size() > 1) {   // several: a round of each through the model together
+                // each one's drafts (DSpark, a conversation at a time: its own drafter rings) while their confidence
+                // holds, its share of a window at most; then every one's token and drafts through the model at once
+                // (step_multi_spec) and each its verdict (verify_multi).  No drafts this round: a token of each.
+                // DS4_DRAFT_COST (DraftCost): the windows planned together instead, the rows in all a window at most
+                const int nn = (int) need.size(), share = m.verify_max() / nn;
+                const double t_step = now_ms();   // (DS4_DRAFT_COST: the step's time, its drafting included)
+                const auto cancel_all = [&] {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     for (Act* a : need) {
                         a->finish = "cancel";
                         a->done = true;
                     }
-                } else
-                    for (size_t i = 0; i < need.size(); ++i) {
-                        Act& a = *need[i];
-                        penalties(a.r);
-                        const bool closing = close_think(a);
-                        a.tok = m.sample_multi((int) i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
-                                               a.counter++);
-                        if (closing) a.tok = a.r.think_end;
+                };
+                std::vector<std::vector<int>> drafts((size_t) nn);
+                std::vector<std::vector<float>> confs((size_t) nn);
+                std::vector<char> tried((size_t) nn, 0), closing((size_t) nn, 0);
+                std::vector<int> rooms((size_t) nn, 1), dsv, dys, dix;   // (the ones that draft: conversation, y, index)
+                std::vector<int> room_all((size_t) nn, 1);   // (DS4_DRAFT_COST: the room past the even share)
+                bool any = false, failed = false, stepped = false;
+                for (int i = 0; i < nn; ++i) {
+                    Act& a = *need[(size_t) i];
+                    int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
+                    closing[(size_t) i] = close_think(a);
+                    if (closing[(size_t) i]) room = 1;
+                    else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                    room_all[(size_t) i] = room;
+                    rooms[(size_t) i] = room = std::min(room, share);
+                    if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
+                    tried[(size_t) i] = 1;
+                    dsv.push_back(a.seq);
+                    dys.push_back(a.tok);
+                    dix.push_back(i);
+                }
+                // their drafts: in one drafter pass where they fit one (Model::draft_multi), else one after another
+                // (the drafter's argmax either way: verify_multi takes each draft as a point)
+                const int nd = (int) dsv.size();
+                const bool one_pass = nd > 1 && m.can_draft_multi(dsv.data(), nd);
+                if (nd > 1 && !one_pass) {   // (more drafters than one pass holds - four with DSpark's block: a drafter
+                                             //  pass each cost more than their drafts won, so a token of each)
+                    for (int j : dix) tried[(size_t) j] = 0;
+                } else if (one_pass) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    failed = !m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err);
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        drafts[(size_t) dix[(size_t) j]] = std::move(dd[(size_t) j]);
+                        confs[(size_t) dix[(size_t) j]] = std::move(cc[(size_t) j]);
                     }
+                } else
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        bind(dsv[(size_t) j]);
+                        failed = !m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], confs[(size_t) dix[(size_t) j]], err);
+                    }
+                // DS4_DRAFT_COST: each drafting request's drafts under its floor (their chain from the drafter's
+                // acceptance table), planned together at the measured time of a step of nn requests by its rows in
+                // all; a request with its own dspark_cum keeps its cut, beside the plan as one that does not draft
+                strata::spec::DraftPolicy* sp = dc != nullptr && !failed && nd > 0
+                                                    ? &dc->shared[(size_t) (std::min(nn, (int) dc->shared.size() + 1) - 2)]
+                                                    : nullptr;
+                std::vector<std::vector<double>> qs((size_t) nn);
+                std::vector<const double*> pq;
+                std::vector<int> plen, pcap, pix;
+                int fixed_rows = 0;
+                double fixed_tok = 0.0;
+                for (int i = 0; i < nn && !failed; ++i) {
+                    if (!tried[(size_t) i]) {
+                        ++fixed_rows;   // (its token: a row, a token)
+                        fixed_tok += 1.0;
+                        continue;
+                    }
+                    Act& a = *need[(size_t) i];
+                    const int room = rooms[(size_t) i];
+                    std::vector<int>& d = drafts[(size_t) i];
+                    const std::vector<float>& conf = confs[(size_t) i];
+                    const float cmin = a.r.conf >= 0 ? a.r.conf : conf_min;
+                    if (sp != nullptr && a.r.cum < 0) {
+                        int n = 0;
+                        while (n < (int) d.size() && n < room_all[(size_t) i] - 1 &&
+                               n < strata::spec::DraftPolicy::kMaxT - 1 && conf[(size_t) n] >= cmin)
+                            ++n;
+                        qs[(size_t) i].resize((size_t) n);
+                        dc->alone.chain(conf.data(), n, qs[(size_t) i].data());
+                        pq.push_back(qs[(size_t) i].data());
+                        plen.push_back(n);
+                        pcap.push_back(room_all[(size_t) i]);
+                        pix.push_back(i);
+                        continue;
+                    }
+                    const float cum_min = a.r.cum >= 0 ? a.r.cum : dspark_cum_default();
+                    int keep = 0;
+                    float cum = 1.0f;
+                    while (keep < (int) d.size() && keep < room - 1 && conf[(size_t) keep] >= cmin &&
+                           (cum *= conf[(size_t) keep]) >= cum_min)
+                        ++keep;
+                    d.resize((size_t) keep);
+                    any = any || keep > 0;
+                    if (sp != nullptr) {   // (its own cut: its rows, and the tokens they likely commit)
+                        qs[(size_t) i].resize((size_t) keep);
+                        dc->alone.chain(conf.data(), keep, qs[(size_t) i].data());
+                        fixed_rows += keep + 1;
+                        fixed_tok += strata::spec::DraftPolicy::tokens(qs[(size_t) i].data(), keep);
+                    }
+                }
+                if (sp != nullptr && !failed) {
+                    int64_t ctx = 0;   // (the band: the longest context of the step)
+                    for (Act* a : need) ctx = std::max<int64_t>(ctx, m.seq_pos(a->seq));
+                    sp->set_context(ctx);
+                    std::vector<int> prow(pix.size(), 1);
+                    sp->plan(pq.data(), plen.data(), pcap.data(), (int) pix.size(), m.verify_max(), fixed_rows, fixed_tok,
+                             prow.data());
+                    for (size_t j = 0; j < pix.size(); ++j) {
+                        drafts[(size_t) pix[j]].resize((size_t) (prow[j] - 1));
+                        any = any || prow[j] > 1;
+                    }
+                }
+                if (failed) cancel_all();
+                else if (!any) {
+                    std::vector<int> sv, tv;
+                    for (Act* a : need) {
+                        sv.push_back(a->seq);
+                        tv.push_back(a->tok);
+                    }
+                    if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
+                    else {
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            penalties(a.r);
+                            m.set_logprobs(a.r.logprobs, closing[(size_t) i] ? a.r.think_end : -1);
+                            a.tok = m.sample_multi(i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                   a.counter++);
+                            if (closing[(size_t) i]) a.tok = a.r.think_end;
+                            if (a.r.logprobs >= 0) a.tok_lp = lp_take(m, 1).back();
+                            a.cool = tried[(size_t) i] != 0;   // (its drafter tried and kept none: rests a round)
+                        }
+                        stepped = true;
+                    }
+                } else {
+                    std::vector<std::vector<int>> rows((size_t) nn);
+                    std::vector<const int*> tp((size_t) nn);
+                    std::vector<int> sv((size_t) nn), lens((size_t) nn);
+                    for (int i = 0; i < nn; ++i) {
+                        rows[(size_t) i].push_back(need[(size_t) i]->tok);
+                        rows[(size_t) i].insert(rows[(size_t) i].end(), drafts[(size_t) i].begin(), drafts[(size_t) i].end());
+                        tp[(size_t) i] = rows[(size_t) i].data();
+                        lens[(size_t) i] = (int) rows[(size_t) i].size();
+                        sv[(size_t) i] = need[(size_t) i]->seq;
+                    }
+                    if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), nn, err)) cancel_all();
+                    else
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            const std::vector<int>& d = drafts[(size_t) i];
+                            penalties(a.r);
+                            m.set_logprobs(a.r.logprobs, closing[(size_t) i] ? a.r.think_end : -1);
+                            int acc = 0, next = -1;
+                            if (!m.verify_multi(i, d, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                a.counter, acc, next, err)) {
+                                cancel_all();
+                                break;
+                            }
+                            stepped = i == nn - 1;   // (every verdict taken)
+                            if (dc != nullptr && !d.empty()) dc->alone.observe_drafts(confs[(size_t) i].data(), (int) d.size(), acc);
+                            a.counter += (unsigned long long) acc + 1;
+                            a.d_off += (long long) d.size();
+                            a.d_acc += acc;
+                            a.cool = tried[(size_t) i] && d.empty();
+                            a.got.assign(d.begin(), d.begin() + acc);
+                            a.got.push_back(next);
+                            if (closing[(size_t) i]) a.got.back() = a.r.think_end;
+                            std::reverse(a.got.begin(), a.got.end());
+                            if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
+                            next_tok(a);
+                        }
+                }
+                if (sp != nullptr && stepped) {   // (DS4_DRAFT_COST: the step's time by its rows in all)
+                    int rows_all = 0;
+                    for (const std::vector<int>& d : drafts) rows_all += 1 + (int) d.size();
+                    sp->observe_cost(rows_all, now_ms() - t_step);
+                }
             }
+        };
+        // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back.
+        // Alone - no other prompt read, no answer running - the rest of it in one run, the pipeline full throughout,
+        // until a line comes (a request: the run ends at the next chunk all stages reach, and pieces again)
+        const auto read_turn_next = [&](bool answering) {
+            Act* a = read_line.front();
+            read_line.pop_front();
+            const bool alone = read_line.empty() && !answering;
+            if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone);
+            if (a->reading && !a->done) read_line.push_back(a);
+        };
+        std::function<void()> settle;
+        // the next turn: a piece once the rounds since the last one are due (piece_due) while a prompt is being read,
+        // else a round while an answer runs
+        const auto queue_turn = [&] {
+            if (turn_queued || acts.empty()) return;
+            turn_queued = true;
+            eng.add([&] {
+                turn_queued = false;
+                const bool answering = std::any_of(acts.begin(), acts.end(),
+                                                   [](const std::unique_ptr<Act>& a) { return !a->reading; });
+                if (!read_line.empty() && (!answering || piece_due())) {
+                    const double t = now_ms();
+                    read_turn_next(answering);
+                    if (answering) piece_ms = now_ms() - t;
+                    rounds = 0;
+                    rounds_ms = 0;
+                } else if (answering) {
+                    const double t = now_ms();
+                    round_turn();
+                    rounds_ms += now_ms() - t;
+                    ++rounds;
+                }
+                settle();
+            }, kTurn);
+        };
+        // after every event: a STOP of a prompt waiting for its turn (ended now, the conversation before it kept), the
+        // requests ended (their conversations to the requests waiting), then the next turn - or, none running, idle
+        settle = [&] {
+            for (auto& ap : acts)
+                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0, false);
+            bool freed = false;
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
                     ++i;
@@ -1698,11 +2460,59 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 std::unique_ptr<Act> a = std::move(acts[i]);
                 acts.erase(acts.begin() + (long) i);
-                finish_act(*a);
+                read_line.erase(std::remove(read_line.begin(), read_line.end(), a.get()), read_line.end());
+                if (a->ended) release(*a);   // (its DONE written as its prompt was read)
+                else finish_act(*a);
+                freed = true;
             }
-            if (acts.empty() && quit) break;
-            (void) end;
-        }
+            if (freed) admit_waiting();
+            if (!acts.empty()) {
+                queue_turn();
+                return;
+            }
+            if (quit) {
+                eng.stop();
+                return;
+            }
+            if (waiting.empty()) {
+                g_busy.store(false);   // (waiting for a request: no watchdog)
+                m.save_profile();
+            }
+        };
+        // a line: a request (admitted when a conversation is free), QUIT (every request stopped, the engine's end once
+        // they are), anything else answered at once (STOP <rid> is the reader's)
+        const auto on_line = [&](const std::string& ln) {
+            ++lines_taken;
+            g_busy.store(true);
+            beat();
+            if (ln == "QUIT") {
+                quit = true;
+                in.stop_all.store(true);
+            } else if (ln.rfind("GEN ", 0) == 0 || ln.rfind("GENI ", 0) == 0) {
+                waiting.push_back(ln);
+                admit_waiting();
+            } else {
+                std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
+                            ln.substr(0, ln.find(' ')).c_str());
+                std::fflush(stdout);
+            }
+            settle();
+        };
+        std::thread reader([&] {   // (the reader's lines into the loop; the input's end is a QUIT)
+            std::string l;
+            bool quit_seen = false;
+            while (!quit_seen && in.next(l)) {
+                quit_seen = l == "QUIT";
+                lines_posted.fetch_add(1, std::memory_order_release);
+                eng.add([&, l] { on_line(l); }, kLine);
+            }
+            if (!quit_seen) {
+                lines_posted.fetch_add(1, std::memory_order_release);
+                eng.add([&] { on_line("QUIT"); }, kLine);
+            }
+        });
+        eng.run();
+        reader.join();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
@@ -1737,6 +2547,335 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 // decode n greedy tokens alone (a plain step at a time, one conversation after another), then all of them together
 // (Model::step_multi).  Each row's logits must be its own step's alone bit for bit, its tokens the same.  (The times
 // are the steps' alone and together on tiers the first pass warmed; the server's real questions are the measure.)
+// --profile-run FILE: an expert profile from a corpus - each line of FILE a run of ids (BOS + text, as --ppl's) fed
+// from a fresh state, no logits but its last row; what the runs route is counted, and saved as it goes (every 10 lines
+// or minute, and at the end) to --profile-out: this run's counts alone, while the pack's profile places the experts and
+// stays as it was.  A line longer than the context is cut there.  tools/ds4/profile.py make takes such files
+int profile_run(strata::ds4::Model& m, const std::string& path, const std::string& out) {
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "maya-ds4: --profile-run: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    std::string line, err;
+    long long lines = 0, tokens = 0, cut = 0;
+    const double t0 = now_ms();
+    double saved = t0;
+    while (std::getline(in, line)) {
+        std::vector<int> seq = parse_ids(line);
+        if (seq.empty()) continue;
+        if (seq.size() > (size_t) m.max_context()) {
+            seq.resize((size_t) m.max_context());
+            ++cut;
+        }
+        m.reset();
+        for (size_t done = 0; done < seq.size();) {
+            const size_t k = std::min<size_t>((size_t) m.feed_unit(), seq.size() - done);
+            if (!m.feed(seq.data() + done, (int) k, done + k == seq.size() ? 1 : 0, err)) {
+                std::fprintf(stderr, "maya-ds4: --profile-run, line %lld: %s\n", lines + 1, err.c_str());
+                m.save_profile();
+                return 1;
+            }
+            done += k;
+        }
+        ++lines;
+        tokens += (long long) seq.size();
+        const double now = now_ms();
+        std::fprintf(stderr, "profile-run %lld: %zu tokens, %lld in all, %.0f s, %.0f tok/s\n", lines, seq.size(), tokens,
+                     (now - t0) / 1000.0, 1000.0 * (double) tokens / std::max(1.0, now - t0));
+        if (lines % 10 == 0 || now - saved > 60000.0) {
+            m.save_profile();
+            saved = now;
+        }
+    }
+    m.save_profile();
+    std::fprintf(stderr, "profile-run: %lld lines, %lld tokens (%lld lines cut at the context) in %.0f s; the counts in %s "
+                         "(python tools/ds4/profile.py make --pack <pack> --out <profile> %s ...)\n",
+                 lines, tokens, cut, (now_ms() - t0) / 1000.0, out.c_str(), out.c_str());
+    return lines > 0 ? 0 : 1;
+}
+
+// a prompt from a fresh state, its last row's logits kept (mark: the state before its last token kept in checkpoint 1)
+bool feed_prompt(strata::ds4::Model& m, const std::vector<int>& ids, bool mark, std::string& err) {
+    m.reset();
+    for (size_t done = 0; done < ids.size();) {
+        const size_t k = std::min<size_t>((size_t) m.feed_unit(), ids.size() - done);
+        const bool fin = done + k == ids.size();
+        if (!(fin && mark ? m.feed_mark(ids.data() + done, (int) k, 1, 1, err)
+                          : m.feed(ids.data() + done, (int) k, fin ? 1 : 0, err)))
+            return false;
+        done += k;
+    }
+    return true;
+}
+
+// --spec-eval FILE --n N: the drafter's acceptance over prompts (a line of ids each, BOS and text as --ppl's), each from
+// a fresh state, N tokens decoded after it (greedy, or --temperature / --seed) with every draft verified - no
+// confidence floor or cut, no prompt lookup - so what a floor would have kept can be read off afterwards.  Per prompt
+// and in all: rounds, tokens a round, the drafts kept per position and by the drafter's confidence; DS4_ROUND_LOG gets
+// a line a round
+int spec_eval(strata::ds4::Model& m, const std::string& path, int n, float temp, unsigned long long seed) {
+    if (m.draft_block() <= 0) {
+        std::fprintf(stderr, "maya-ds4: --spec-eval needs the DSpark drafter (a pack with it, --dspark on)\n");
+        return 2;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "maya-ds4: --spec-eval: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    RoundLog& rl = round_log();
+    rl.record = true;
+    const int top_k = temp > 0 ? 64 : 1;
+    const strata::ds4::Stats s0 = m.stats();
+    long long prompts = 0, all_tok = 0, all_rounds = 0, all_off = 0, all_acc = 0;
+    long long reach[10] = {}, kept[10] = {};   // drafts by the drafter's confidence (tenths): verified with all before
+                                              // them kept, and kept
+    std::string line, err;
+    const double t_all = now_ms();
+    while (std::getline(in, line)) {
+        const std::vector<int> ids = parse_ids(line);
+        if (ids.empty()) continue;
+        if ((long long) ids.size() + n + 16 > m.max_context()) {
+            std::fprintf(stderr, "spec-eval: a prompt of %zu tokens and %d more do not fit the context: left out\n",
+                         ids.size(), n);
+            continue;
+        }
+        rl.tag = "p" + std::to_string(++prompts);
+        if (!feed_prompt(m, ids, false, err)) {
+            std::fprintf(stderr, "maya-ds4: --spec-eval, prompt %lld: %s\n", prompts, err.c_str());
+            return 1;
+        }
+        unsigned long long counter = 0;
+        int tok = m.sample(temp, 1.0f, top_k, 0.0f, seed, counter++);
+        long long produced = 1, rounds = 0, off_p = 0, acc_p = 0;
+        std::vector<int> got;
+        const double t0 = now_ms();
+        bool end = tok == 1;
+        while (!end && produced < n) {
+            int off = 0, acc = 0;
+            if (!round(m, tok, (int) (n - produced), true, 0.0f, temp, 1.0f, top_k, 0.0f, seed, counter, got, off, acc,
+                       err, 0.0f, nullptr)) {
+                std::fprintf(stderr, "maya-ds4: --spec-eval, prompt %lld: %s\n", prompts, err.c_str());
+                return 1;
+            }
+            ++rounds;
+            off_p += off;
+            acc_p += acc;
+            for (int i = 0; rl.made > 0 && !rl.lookup && i < rl.verified && i < (int) rl.conf.size(); ++i) {
+                const int b = std::min(9, std::max(0, (int) (rl.conf[(size_t) i] * 10.0f)));
+                reach[b] += i <= rl.kept;
+                kept[b] += i < rl.kept;
+            }
+            for (int t : got) {
+                ++produced;
+                if (t == 1) {
+                    end = true;
+                    break;
+                }
+            }
+            tok = got.back();
+        }
+        const double ms = now_ms() - t0;
+        std::fprintf(stderr, "spec-eval %lld: prompt %zu tokens, %lld written in %lld rounds (%.2f a round), %lld of %lld "
+                             "drafts kept (%.0f%%), %.1f tok/s\n",
+                     prompts, ids.size(), produced, rounds, rounds > 0 ? (double) (produced - 1) / (double) rounds : 0.0,
+                     acc_p, off_p, off_p > 0 ? 100.0 * (double) acc_p / (double) off_p : 0.0,
+                     ms > 0 ? 1000.0 * (double) (produced - 1) / ms : 0.0);
+        all_tok += produced - 1;
+        all_rounds += rounds;
+        all_off += off_p;
+        all_acc += acc_p;
+    }
+    rl.record = false;
+    const strata::ds4::Stats& s1 = m.stats();
+    const double nr = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
+    std::printf("spec-eval: %lld prompts, %lld tokens after their first in %lld rounds (%.2f a round), %lld of %lld drafts "
+                "kept (%.1f%%); drafting %.2f ms a round, verifying %.2f ms a round; %.0f s\n",
+                prompts, all_tok, all_rounds, all_rounds > 0 ? (double) all_tok / (double) all_rounds : 0.0, all_acc,
+                all_off, all_off > 0 ? 100.0 * (double) all_acc / (double) all_off : 0.0, (s1.draft_ms - s0.draft_ms) / nr,
+                (s1.verify_ms - s0.verify_ms) / nr, (now_ms() - t_all) / 1000.0);
+    std::printf("spec-eval %s\n", per_position(s0, s1).c_str());
+    std::string bc = "spec-eval by the drafter's confidence (kept / reached):";
+    for (int b = 0; b < 10; ++b) {
+        if (reach[b] == 0) continue;
+        char s[96];
+        std::snprintf(s, sizeof s, " %.1f-%.1f %lld/%lld %.0f%%", b / 10.0, (b + 1) / 10.0, kept[b], reach[b],
+                      100.0 * (double) kept[b] / (double) reach[b]);
+        bc += s;
+    }
+    std::printf("%s\n", bc.c_str());
+    return prompts > 0 ? 0 : 1;
+}
+
+// the chi-square distribution's upper tail at x with df degrees of freedom: Q(df / 2, x / 2), the regularized upper
+// incomplete gamma function - its series below a + 1, its continued fraction (Lentz) above
+double chi2_tail(double x, int df) {
+    const double a = 0.5 * df, z = 0.5 * x;
+    if (df <= 0 || z <= 0) return 1.0;
+    const double front = std::exp(-z + a * std::log(z) - std::lgamma(a));
+    if (z < a + 1.0) {
+        double term = 1.0 / a, sum = term;
+        for (int i = 1; i < 10000 && term > sum * 1e-15; ++i) {
+            term *= z / (a + i);
+            sum += term;
+        }
+        return std::min(1.0, std::max(0.0, 1.0 - front * sum));
+    }
+    const double tiny = 1e-300;
+    double b = z + 1.0 - a, c = 1.0 / tiny, d = 1.0 / b, h = d;
+    for (int i = 1; i < 10000; ++i) {
+        const double an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if (std::fabs(d) < tiny) d = tiny;
+        c = b + an / c;
+        if (std::fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        if (std::fabs(d * c - 1.0) < 1e-15) break;
+    }
+    return std::min(1.0, std::max(0.0, front * h));
+}
+
+// whether two samples of tokens come from one distribution: the two-sample chi-square over the tokens they drew (those
+// whose expected count in the smaller sample is under 5 pooled into one group), its groups and p-value
+struct Chi {
+    double x = 0.0, p = 1.0;
+    int groups = 0;
+};
+Chi two_sample(const std::vector<int>& a, const std::vector<int>& b) {
+    std::map<int, std::pair<double, double>> n;
+    for (int t : a) n[t].first += 1.0;
+    for (int t : b) n[t].second += 1.0;
+    const double na = (double) a.size(), nb = (double) b.size(), fewer = std::min(na, nb);
+    std::vector<std::pair<double, double>> g;
+    double ra = 0.0, rb = 0.0;
+    for (const auto& kv : n) {
+        const auto& c = kv.second;
+        if ((c.first + c.second) * fewer / (na + nb) >= 5.0) {
+            g.push_back(c);
+        } else {
+            ra += c.first;
+            rb += c.second;
+        }
+    }
+    if (ra + rb > 0.0) g.emplace_back(ra, rb);
+    Chi r;
+    if (na <= 0.0 || nb <= 0.0) return r;
+    const double ka = std::sqrt(nb / na), kb = std::sqrt(na / nb);
+    for (const auto& [x, y] : g) r.x += (ka * x - kb * y) * (ka * x - kb * y) / (x + y);
+    r.groups = (int) g.size();
+    r.p = chi2_tail(r.x, r.groups - 1);
+    return r;
+}
+
+// --sampler-test N --ids I,J,...: speculative sampling against the model's own draws.  After the prompt and its greedy
+// next token y, the token after y is drawn 20 N times from the model's own row (sample(): a plain step's draw), and N
+// times as a drafted round writes it - the drafter's drafts (drawn from its own distribution with DS4_DSPARK_SAMPLE=1,
+// set unless given; else its argmax) verified by verify()'s rule, the state taken back to the prompt each time
+// (checkpoint 1, its last token fed again).  The two samples are compared with a chi-square test for four sampling
+// chains, the last with penalties (its drafts are the argmax: points); a p-value under 0.001 is a mismatch (exit 1).
+// The plain draws' two halves are the test's own reference.  A prompt whose next token is nearly certain is said: the
+// test then sees little
+int sampler_test(strata::ds4::Model& m, const std::vector<int>& ids, int n, unsigned long long seed) {
+    if (m.draft_block() <= 0) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test needs the DSpark drafter (a pack with it, --dspark on)\n");
+        return 2;
+    }
+    if (ids.size() < 2 || n < 50) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test N (50 or more) needs --ids of two tokens or more\n");
+        return 2;
+    }
+    std::string err;
+    const int64_t P = (int64_t) ids.size();
+    if (!feed_prompt(m, ids, true, err)) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+        return 1;
+    }
+    const int y = m.sample(0.0f, 1.0f, 1, 0.0f, 0, 0);
+    // back to the prompt's end: the state before its last token, that token fed again (y's logits)
+    const auto back = [&]() -> bool {
+        if (!m.restore(P - 1) || m.pos() != P - 1) {
+            err = "the state before the prompt's last token did not come back";
+            return false;
+        }
+        return m.feed(ids.data() + P - 1, 1, 1, err);
+    };
+    struct Chain {
+        float t, top_p, min_p;
+        int top_k, pen_n;
+        float rep, freq, pres;
+    };
+    const Chain chains[] = {{1.0f, 1.0f, 0.0f, 64, 0, 1.0f, 0.0f, 0.0f},
+                            {0.8f, 0.95f, 0.0f, 20, 0, 1.0f, 0.0f, 0.0f},
+                            {0.7f, 0.9f, 0.05f, 40, 0, 1.0f, 0.0f, 0.0f},
+                            {0.8f, 0.95f, 0.0f, 20, 64, 1.3f, 0.1f, 0.1f}};
+    int bad = 0, cases = 0;
+    std::fprintf(stderr, "sampler-test: prompt %lld tokens, y = %d; %d plain draws and %d drafted rounds a chain\n",
+                 (long long) P, y, 20 * n, n);
+    for (const Chain& c : chains) {
+        m.set_penalties(c.pen_n, c.rep, c.freq, c.pres);
+        if (!back() || !m.step(y, true, err)) {
+            std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<int> plain((size_t) 20 * n), spec;
+        std::map<int, int> seen;
+        for (size_t i = 0; i < plain.size(); ++i) {
+            plain[i] = m.sample(c.t, c.top_p, c.top_k, c.min_p, seed, i);
+            ++seen[plain[i]];
+        }
+        int top = 0;
+        for (const auto& kv : seen) top = std::max(top, kv.second);
+        long long first_kept = 0, no_draft = 0;
+        bool drawn = false;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t ctr = (1ull << 32) + (uint64_t) i * 64;   // (apart from the plain draws' and each other's)
+            std::vector<int> drafts;
+            std::vector<float> conf;
+            int acc = 0, next = -1;
+            if (!back() || !m.draft(y, drafts, conf, err, c.t, c.top_p, c.top_k, c.min_p, seed, ctr)) {
+                std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+                return 1;
+            }
+            drawn = drawn || m.drafts_sampled();
+            if (drafts.empty()) {
+                ++no_draft;
+                continue;
+            }
+            if ((int) drafts.size() > m.verify_max() - 1) drafts.resize((size_t) (m.verify_max() - 1));
+            if (!m.verify(y, drafts, c.t, c.top_p, c.top_k, c.min_p, seed, ctr, acc, next, err)) {
+                std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+                return 1;
+            }
+            spec.push_back(acc > 0 ? drafts[0] : next);
+            first_kept += acc > 0;
+        }
+        const Chi x = two_sample(plain, spec);
+        const std::vector<int> h0(plain.begin(), plain.begin() + (long) (plain.size() / 2)),
+            h1(plain.begin() + (long) (plain.size() / 2), plain.end());
+        const Chi ref = two_sample(h0, h1);
+        const bool ok = x.p >= 1e-3;
+        ++cases;
+        bad += !ok;
+        std::printf("sampler-test T %.2f top_k %d top_p %.2f min_p %.2f%s: %zu plain draws of %zu tokens (the most drawn "
+                    "%.0f%%%s), %zu drafted rounds (%s drafts, the first kept %lld times%s): chi-square %.1f over %d "
+                    "groups, p %.4f (the plain halves: p %.4f) - %s\n",
+                    c.t, c.top_k, c.top_p, c.min_p, c.pen_n > 0 ? " penalties" : "", plain.size(), seen.size(),
+                    100.0 * top / (double) plain.size(), top > 0.95 * (double) plain.size() ? ": nearly certain" : "",
+                    spec.size(), drawn ? "drawn" : "argmax", first_kept,
+                    no_draft > 0 ? (", " + std::to_string(no_draft) + " without drafts").c_str() : "", x.x, x.groups,
+                    x.p, ref.p, ok ? "the same distribution" : "MISMATCH");
+        std::fflush(stdout);
+    }
+    m.set_penalties(0, 1.0f, 0.0f, 0.0f);
+    std::printf("sampler-test: %s\n", bad == 0 ? "speculative sampling gave the model's own draws in every chain"
+                                                : (std::to_string(bad) + " of " + std::to_string(cases) +
+                                                   " chains MISMATCH").c_str());
+    return bad == 0 ? 0 : 1;
+}
+
 int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     const int N = m.seq_count(), V = m.vocab();
     std::string err;
@@ -1827,13 +2966,436 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                 N, n, same_rows, rows, max_d, tokens_same ? "yes" : "NO",
                 ms_alone > 0 ? 1000.0 * steps * N / ms_alone : 0.0, ms_together > 0 ? 1000.0 * steps * N / ms_together : 0.0,
                 ms_together > 0 ? ms_alone / ms_together : 0.0);
-    return tokens_same && same_rows == rows ? 0 : 1;
+    // ... then with the drafter, greedy, so the tokens alone are due again - every draft verified, whatever its
+    // confidence, so rejected windows are undone often: each conversation alone (draft / verify, one conversation's
+    // rounds), then together (step_multi_spec / verify_multi, as the server's rounds, each conversation's drafts its
+    // share of a window) with the drafts made one conversation after another, then in one drafter pass (draft_multi)
+    bool spec_same = true;
+    double ms_spec_alone = 0;
+    for (int pass = 0; pass < 3 && m.draft_block() > 0; ++pass) {
+        std::vector<std::vector<int>> spec_t((size_t) N);
+        long long offered = 0, kept = 0, rounds = 0, one_pass = 0;
+        double ms_spec = 0;
+        for (int i = 0; i < N; ++i) {
+            if (!prompt(i)) {
+                std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                return 1;
+            }
+            spec_t[(size_t) i].push_back(m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
+        }
+        if (pass == 0)
+            for (int i = 0; i < N; ++i) {
+                std::vector<int>& got = spec_t[(size_t) i];
+                m.seq_bind(i);
+                const double t0 = now_ms();
+                while ((int) got.size() < n) {
+                    const int room = std::min(m.verify_max(), n - (int) got.size());
+                    std::vector<int> drafts;
+                    std::vector<float> conf;
+                    int acc = 0, next = -1;
+                    if (room > 1 && !m.draft(got.back(), drafts, conf, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    if ((int) drafts.size() > room - 1) drafts.resize((size_t) std::max(0, room - 1));
+                    if (drafts.empty()) {
+                        if (!m.step(got.back(), true, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                        next = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+                    } else if (!m.verify(got.back(), drafts, 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    got.insert(got.end(), drafts.begin(), drafts.begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts.size();
+                    kept += acc;
+                    ++rounds;
+                }
+                ms_spec += now_ms() - t0;
+            }
+        else {
+            const int share = m.verify_max() / N;
+            const double t0 = now_ms();
+            for (;;) {
+                std::vector<int> sv;
+                for (int i = 0; i < N; ++i)
+                    if ((int) spec_t[(size_t) i].size() < n) sv.push_back(i);
+                if (sv.empty()) break;
+                const int k = (int) sv.size();
+                std::vector<std::vector<int>> rws((size_t) k), drafts((size_t) k);
+                std::vector<const int*> tp((size_t) k);
+                std::vector<int> lens((size_t) k), dsv, dys, dix;
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    if (std::min(share, n - (int) got.size()) > 1) {
+                        dsv.push_back(sv[(size_t) j]);
+                        dys.push_back(got.back());
+                        dix.push_back(j);
+                    }
+                }
+                const int nd = (int) dsv.size();
+                if (pass == 2 && nd > 1 && m.can_draft_multi(dsv.data(), nd)) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    if (!m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int j = 0; j < nd; ++j) drafts[(size_t) dix[(size_t) j]] = dd[(size_t) j];
+                    ++one_pass;
+                } else
+                    for (int j = 0; j < nd; ++j) {
+                        std::vector<float> conf;
+                        m.seq_bind(dsv[(size_t) j]);
+                        if (!m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], conf, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    const int room = std::min(share, n - (int) got.size());
+                    if ((int) drafts[(size_t) j].size() > room - 1) drafts[(size_t) j].resize((size_t) std::max(0, room - 1));
+                    rws[(size_t) j].push_back(got.back());
+                    rws[(size_t) j].insert(rws[(size_t) j].end(), drafts[(size_t) j].begin(), drafts[(size_t) j].end());
+                    tp[(size_t) j] = rws[(size_t) j].data();
+                    lens[(size_t) j] = (int) rws[(size_t) j].size();
+                }
+                if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), k, err)) {
+                    std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                    return 1;
+                }
+                for (int j = 0; j < k; ++j) {
+                    int acc = 0, next = -1;
+                    if (!m.verify_multi(j, drafts[(size_t) j], 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    got.insert(got.end(), drafts[(size_t) j].begin(), drafts[(size_t) j].begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts[(size_t) j].size();
+                    kept += acc;
+                }
+                ++rounds;
+            }
+            ms_spec = now_ms() - t0;
+        }
+        if (pass == 0) ms_spec_alone = ms_spec;
+        bool same_all = true;
+        for (int i = 0; i < N; ++i) {
+            size_t d = 0;
+            while (d < alone[(size_t) i].size() && alone[(size_t) i][d] == spec_t[(size_t) i][d]) ++d;
+            const bool same = d == alone[(size_t) i].size();
+            same_all = same_all && same;
+            if (!same) std::printf("multi check: conversation %d with the drafter (pass %d): differs from token %zu on\n", i, pass, d);
+        }
+        spec_same = spec_same && same_all;
+        static const char* const what[3] = {"alone with the drafter", "together, drafts one after another",
+                                            "together, drafts in one pass"};
+        std::printf("multi check: %d conversations x %d tokens %s: tokens the same: %s; %lld rounds%s, drafts %lld of "
+                    "%lld kept; %.2f tok/s in all (x%.2f over together without, x%.2f over alone with the drafter)\n",
+                    N, n, what[pass], same_all ? "yes" : "NO", rounds,
+                    pass == 2 ? (" (" + std::to_string(one_pass) + " drafted in one pass)").c_str() : "", kept, offered,
+                    ms_spec > 0 ? 1000.0 * steps * N / ms_spec : 0.0, ms_spec > 0 ? ms_together / ms_spec : 0.0,
+                    ms_spec > 0 ? ms_spec_alone / ms_spec : 0.0);
+    }
+    return tokens_same && spec_same && same_rows == rows ? 0 : 1;
+}
+
+// --parts-check (tests): the --ids prompt read as the server reads it - in one call (feed_mark: the last row's logits,
+// the checkpoint before the last token) - then again in parts of one chunk (Model::feed_plan / feed_part), with
+// --parallel 2 or more another conversation read and stepped between every two parts, as a prompt read beside a
+// running request.  The last row's logits must be the same bit for bit, the n greedy tokens after them the same, and
+// the state before the last token too (the last token stepped again from that checkpoint: the same logits).
+// (--no-expert-cache keeps the experts where the load put them, so the flow sums a chunk's experts in the same order
+// in both reads.)
+int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
+    std::string err;
+    const int N = (int) ids.size();
+    if (N < 2) {
+        std::fprintf(stderr, "parts check: --ids needs two tokens at least\n");
+        return 2;
+    }
+    struct Read {
+        std::vector<float> last, again;
+        std::vector<int> toks;
+        int parts = 0;
+        double eg_ms = 0;   // (the devices' waits for Engram rows while the prompt was fed)
+    };
+    // the other conversation: its prompt (the --ids' first 300 tokens at most) read at the first pause, a greedy step
+    // at each one after
+    const bool beside = m.seq_count() > 1;
+    const std::vector<int> other(ids.begin(), ids.begin() + std::min(N - 1, 300));
+    int other_tok = -1, other_steps = 0;
+    // (its tokens between the parts: the first pause reads its prompt - the room a GGUF's GPUs lend handed back for
+    //  it - the later ones step it beside the kept room)
+    std::vector<int> other_toks;
+    const auto pause = [&]() -> bool {
+        if (!beside) return true;
+        m.seq_bind(1);
+        bool ok = true;
+        if (other_tok < 0) {
+            m.reset();
+            ok = m.feed(other.data(), (int) other.size(), 1, err);
+        } else {
+            ok = m.step(other_tok, true, err);
+            ++other_steps;
+        }
+        if (ok) other_tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        if (ok) other_toks.push_back(other_tok);
+        m.seq_bind(0);
+        return ok;
+    };
+    const auto read = [&](bool in_parts, Read& rd) -> bool {
+        m.seq_bind(0);
+        m.reset();
+        if (!in_parts) {
+            const double eg0 = m.stats().engram_ms;
+            if (!m.feed_mark(ids.data(), N, 1, 1, err)) return false;
+            rd.eg_ms = m.stats().engram_ms - eg0;
+            rd.parts = 1;
+        } else {
+            strata::ds4::FeedPlan plan;
+            if (!m.feed_plan(N, 1, 1, plan)) {
+                err = "the prompt is not a run of two chunks or more here (a longer --ids, or a smaller "
+                      "--prefill-chunk)";
+                return false;
+            }
+            const int nk = (int) plan.ends.size();
+            for (int k = 0; k < nk; ++k) {
+                const double eg0 = m.stats().engram_ms;
+                if (!m.feed_part(plan, ids.data(), k, k + 1, err)) return false;
+                rd.eg_ms += m.stats().engram_ms - eg0;
+                if (k + 1 < nk && !pause()) return false;
+            }
+            rd.parts = nk;
+        }
+        if (!m.logits(rd.last)) {
+            err = "no logits";
+            return false;
+        }
+        int tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        rd.toks.push_back(tok);
+        for (int k = 1; k < n; ++k) {
+            if (!m.step(tok, true, err)) return false;
+            tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+            rd.toks.push_back(tok);
+        }
+        // the checkpoint the prompt's end kept, before its last token: back there, and the last token again
+        if (!m.restore(N - 1) || m.pos() != N - 1) {
+            err = "the checkpoint before the prompt's last token is not there";
+            return false;
+        }
+        if (!m.step(ids.back(), true, err) || !m.logits(rd.again)) {
+            if (err.empty()) err = "no logits";
+            return false;
+        }
+        return true;
+    };
+    Read one, parts;
+    if (!read(false, one)) {
+        std::fprintf(stderr, "parts check: %s\n", err.c_str());
+        return 1;
+    }
+    const strata::ds4::Stats s0 = m.stats();
+    if (!read(true, parts)) {
+        std::fprintf(stderr, "parts check: %s\n", err.c_str());
+        return 1;
+    }
+    const strata::ds4::Stats s1 = m.stats();
+    // the other conversation alone: its prompt, then as many greedy steps - its tokens beside the parts against these
+    // (informational: between the parts the experts kept lent ran on the CPU lane, whose rounding can differ in the
+    // last bits, as between two runs)
+    size_t ot = 0;
+    if (beside && !other_toks.empty()) {
+        std::vector<int> alone;
+        m.seq_bind(1);
+        m.reset();
+        bool ok = m.feed(other.data(), (int) other.size(), 1, err);
+        int tok = ok ? m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0) : -1;
+        if (ok) alone.push_back(tok);
+        while (ok && alone.size() < other_toks.size()) {
+            ok = m.step(tok, true, err);
+            if (ok) alone.push_back(tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
+        }
+        m.seq_bind(0);
+        if (!ok) {
+            std::fprintf(stderr, "parts check: %s\n", err.c_str());
+            return 1;
+        }
+        while (ot < alone.size() && other_toks[ot] == alone[ot]) ++ot;
+    }
+    const auto diff = [](const std::vector<float>& a, const std::vector<float>& b, bool& same) {
+        same = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        double d = 0;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) d = std::max(d, (double) std::fabs(a[i] - b[i]));
+        return d;
+    };
+    bool same_last = false, same_again = false;
+    const double d_last = diff(one.last, parts.last, same_last), d_again = diff(one.again, parts.again, same_again);
+    size_t t = 0;
+    while (t < one.toks.size() && t < parts.toks.size() && one.toks[t] == parts.toks[t]) ++t;
+    const bool same_toks = t == one.toks.size() && t == parts.toks.size();
+    std::printf("parts check: %d prompt tokens in one call and in %d parts%s: the last row's logits %s (max |d| %.3g); "
+                "the state before the last token %s (max |d| %.3g); %d greedy tokens %s\n",
+                N, parts.parts, beside ? (", another conversation stepped " + std::to_string(other_steps) +
+                                          " times between them").c_str() : "",
+                same_last ? "bit for bit" : "DIFFER", d_last, same_again ? "bit for bit" : "DIFFERS", d_again, n,
+                same_toks ? "the same" : ("differ from token " + std::to_string(t) + " on").c_str());
+    if (beside && !other_toks.empty())
+        std::printf("parts check: the other conversation's %zu tokens between the parts %s its own alone\n",
+                    other_toks.size(),
+                    ot == other_toks.size() ? "the same as"
+                                            : ("differ from token " + std::to_string(ot) + " on from").c_str());
+    std::printf("parts check: the prompt path's room: %lld experts kept out of VRAM between the parts (summed over the "
+                "pauses), %lld of the other conversation's picks on them, %lld experts read back in %.0f ms; %lld "
+                "Engram lookups read ahead for the parts' first chunks, the devices' Engram waits %.0f ms (one call: "
+                "%.0f ms)\n",
+                (long long) (s1.lend_kept - s0.lend_kept), (long long) (s1.lend_picks - s0.lend_picks),
+                (long long) (s1.lent_back - s0.lent_back), s1.lent_back_ms - s0.lent_back_ms,
+                (long long) (s1.eg_ahead - s0.eg_ahead), parts.eg_ms, one.eg_ms);
+    return same_last && same_again && same_toks ? 0 : 1;
+}
+
+// --marks-check (tests): the --ids prompt with restore points at every whole chunk short of its end, read as the server
+// reads such a prompt - in one call that keeps them on the way (feed_marks) - and as it stopped at each before (feed()
+// up to it, mark() there, feed_mark() of the rest).  With the points on the chunks' bounds both reads take the same
+// chunks: the last row's logits must be the same bit for bit, the n greedy tokens after them the same, and from each
+// point the prompt's rest read again must give the same logits too (the state kept there is the same).
+// (--no-expert-cache keeps the experts where the load put them.)
+int check_marks(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
+    std::string err;
+    const int N = (int) ids.size(), C = m.prompt_chunk();
+    std::vector<std::pair<int64_t, bool>> at;
+    for (int p = C; C > 0 && p < N - 1 && at.size() < 4; p += C) at.push_back({p, false});
+    if (at.empty()) {
+        std::fprintf(stderr, "marks check: --ids needs more than one chunk of tokens (--prefill-chunk %d)\n", C);
+        return 2;
+    }
+    struct Read {
+        std::vector<float> last;
+        std::vector<std::vector<float>> again;   // (from each point, the rest read again)
+        std::vector<int> toks;
+    };
+    const auto read = [&](bool inside, Read& rd) -> bool {
+        m.reset();
+        if (inside) {
+            if (!m.feed_marks(ids.data(), N, 1, 1, at, err)) return false;
+        } else {
+            int done = 0;
+            for (const auto& a : at) {
+                if (!m.feed(ids.data() + done, (int) a.first - done, 0, err)) return false;
+                done = (int) a.first;
+                m.mark(a.second);
+            }
+            if (!m.feed_mark(ids.data() + done, N - done, 1, 1, err)) return false;
+        }
+        if (!m.logits(rd.last)) {
+            err = "no logits";
+            return false;
+        }
+        int tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        rd.toks.push_back(tok);
+        for (int k = 1; k < n; ++k) {
+            if (!m.step(tok, true, err)) return false;
+            tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+            rd.toks.push_back(tok);
+        }
+        for (auto it = at.rbegin(); it != at.rend(); ++it) {   // (latest first: going back drops the later ones)
+            const int p = (int) it->first;
+            if (!m.restore(p) || m.pos() != p) {
+                err = "the restore point at " + std::to_string(p) + " is not there";
+                return false;
+            }
+            rd.again.emplace_back();
+            if (!m.feed_mark(ids.data() + p, N - p, 1, 1, err) || !m.logits(rd.again.back())) {
+                if (err.empty()) err = "no logits";
+                return false;
+            }
+        }
+        return true;
+    };
+    Read one, split;
+    const double t0 = now_ms();
+    if (!read(true, one)) {
+        std::fprintf(stderr, "marks check: %s\n", err.c_str());
+        return 1;
+    }
+    const double t1 = now_ms();
+    if (!read(false, split)) {
+        std::fprintf(stderr, "marks check: %s\n", err.c_str());
+        return 1;
+    }
+    const double t2 = now_ms();
+    const auto diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double d = a.size() == b.size() ? 0.0 : 1e30;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) d = std::max(d, (double) std::fabs(a[i] - b[i]));
+        return d;
+    };
+    const bool same_last = one.last == split.last;
+    bool same_again = one.again.size() == split.again.size();
+    double d_again = 0;
+    for (size_t i = 0; same_again && i < one.again.size(); ++i) {
+        same_again = one.again[i] == split.again[i];
+        d_again = std::max(d_again, diff(one.again[i], split.again[i]));
+    }
+    size_t t = 0;
+    while (t < one.toks.size() && t < split.toks.size() && one.toks[t] == split.toks[t]) ++t;
+    const bool same_toks = t == one.toks.size() && t == split.toks.size();
+    // (the distributions' KL, one read's against the other's: the size of a difference, rounding or not)
+    const auto kl = [](const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.size() != b.size() || a.empty()) return -1.0;
+        const double ma = *std::max_element(a.begin(), a.end()), mb = *std::max_element(b.begin(), b.end());
+        double za = 0, zb = 0;
+        for (size_t i = 0; i < a.size(); ++i) za += std::exp(a[i] - ma), zb += std::exp(b[i] - mb);
+        double k = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double pa = std::exp(a[i] - ma) / za;
+            if (pa > 0) k += pa * ((a[i] - ma - std::log(za)) - (b[i] - mb - std::log(zb)));
+        }
+        return k;
+    };
+    double kl_again = 0;
+    for (size_t i = 0; i < one.again.size() && i < split.again.size(); ++i) kl_again = std::max(kl_again, kl(one.again[i], split.again[i]));
+    std::printf("marks check: %d tokens, %zu restore points (every %d); the last row's logits %s (max diff %.3g, KL "
+                "%.3g), from each point the rest again %s (max diff %.3g, KL %.3g), %d greedy tokens %s; one read %.0f "
+                "ms, stopping at each %.0f ms (each with the reads again)\n",
+                N, at.size(), C, same_last ? "bit for bit" : "DIFFER", diff(one.last, split.last), kl(one.last, split.last),
+                same_again ? "bit for bit" : "DIFFER", d_again, kl_again, n,
+                same_toks ? "the same" : ("differ from token " + std::to_string(t) + " on").c_str(), t1 - t0, t2 - t1);
+    if (const char* f = std::getenv("DS4_MARKS_DUMP")) {   // (the last rows' logits of both reads: <f>.one, <f>.split)
+        for (const auto& w : {std::make_pair(std::string(".one"), &one.last), std::make_pair(std::string(".split"), &split.last)})
+            if (FILE* fp = std::fopen((std::string(f) + w.first).c_str(), "wb")) {
+                std::fwrite(w.second->data(), 4, w.second->size(), fp);
+                std::fclose(fp);
+            }
+    }
+    return same_last && same_again && same_toks ? 0 : 1;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+#if defined(__linux__)
+    // the kernel's NUMA balancing (kernel.numa_balancing=1) scans memory whose policy migrates on fault: every thread
+    // then takes hinting faults - the launch thread hundreds a second, the CPU lane's workers on their shared scratch,
+    // each phase as slow as its straggler (a 2-socket Xeon: 3k faults/s decoding).  MPOL_LOCAL as the task policy,
+    // before any thread (they inherit it), allocates as the default does but takes the process out of the scan.
+    // DS4_NUMA_BALANCE=1: left to the kernel.  (A container needs SYS_NICE for set_mempolicy / mbind.)
+    // A policy the user set (numactl --interleave / --membind around the engine) is left as it is: only the default one
+    // is replaced.
+    int pol_mode = 0;
+    const bool pol_default = syscall(SYS_get_mempolicy, &pol_mode, nullptr, 0, nullptr, 0) != 0 || pol_mode == 0;
+    if (const char* nb = std::getenv("DS4_NUMA_BALANCE"); pol_default && (nb == nullptr || std::atoi(nb) == 0))
+        if (syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0) != 0)
+            std::fprintf(stderr, "ds4: set_mempolicy(MPOL_LOCAL) failed (%s): NUMA balancing still scans the engine\n",
+                         std::strerror(errno));
+#endif
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
     // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
     // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any
@@ -1859,9 +3421,12 @@ int main(int argc, char** argv) {
     std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16, suffix_draft = 3;
     bool spec = true;
+    bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
-    bool serve_mode = false, multi_check = false;
+    bool serve_mode = false, multi_check = false, parts_check = false, marks_check = false, describe = false, dspark_set = false;
+    std::string prof_run, prof_out, spec_eval_path;
+    int sampler_n = 0;
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -1900,6 +3465,8 @@ int main(int argc, char** argv) {
             const std::string v = val("--dspark");
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
+            dspark_on_asked = v == "on";
+            dspark_set = true;
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
@@ -1909,7 +3476,26 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") {
             const std::string v = val("--mmap-experts");
             o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
-        } else if (a == "--images") images = val("--images");
+        } else if (a == "--ssd-cache") {   // (the RAM expert store: GB, auto - the free RAM less 12 GB - or off)
+            const std::string v = val("--ssd-cache");
+            char* end = nullptr;
+            const double gb = std::strtod(v.c_str(), &end);
+            if (v == "auto") o.ssd_cache_gb = -1.0;
+            else if (v == "off") o.ssd_cache_gb = 0.0;
+            else if (!v.empty() && end != v.c_str() && *end == '\0' && gb >= 0.0 && gb <= 1e6) o.ssd_cache_gb = gb;
+            else {
+                std::fprintf(stderr, "--ssd-cache needs a size in GB, auto or off, not \"%s\"\n", v.c_str());
+                return 2;
+            }
+        } else if (a == "--ssd-policy") {
+            const std::string v = val("--ssd-policy");
+            if (v != "lru" && v != "lfu") {
+                std::fprintf(stderr, "--ssd-policy needs lru or lfu, not \"%s\"\n", v.c_str());
+                return 2;
+            }
+            o.ssd_policy = v == "lfu" ? 1 : 0;
+        } else if (a == "--experts") o.experts = std::max(1, std::atoi(val("--experts").c_str()));
+        else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
         else if (a == "--size") {
@@ -1920,7 +3506,21 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") temp = (float) std::atof(val("--temperature").c_str());
         else if (a == "--seed") cli_seed = std::strtoull(val("--seed").c_str(), nullptr, 10);
         else if (a == "--verbose" || a == "-v") o.verbose = true;
-        else if (a == "--ids") ids_s = val("--ids");
+        else if (a == "--version") {
+            std::printf("maya-ds4 %s (build %s)\n", MAYA_RELEASE, MAYA_BUILD_ID);
+            return 0;
+        }
+        else if (a == "--ids") {   // (@FILE: the ids from a file - a long prompt's are more than one argument may hold)
+            ids_s = val("--ids");
+            if (!ids_s.empty() && ids_s[0] == '@') {
+                std::ifstream f(ids_s.substr(1));
+                if (!f) {
+                    std::fprintf(stderr, "--ids: cannot read %s\n", ids_s.c_str() + 1);
+                    return 2;
+                }
+                ids_s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+        }
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
@@ -1931,6 +3531,14 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
+        else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
+        else if (a == "--marks-check") marks_check = true;   // (tests: restore points kept in one read, or stopping at each)
+        else if (a == "--pack-info") describe = true;
+        else if (a == "--profile-run") prof_run = val("--profile-run");
+        else if (a == "--profile-out") prof_out = val("--profile-out");
+        else if (a == "--profile-readonly") o.profile_readonly = true;
+        else if (a == "--spec-eval") spec_eval_path = val("--spec-eval");
+        else if (a == "--sampler-test") sampler_n = (int) num("--sampler-test", 50, 1e6, true);
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -1941,16 +3549,68 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.verbose) std::fprintf(stderr, "ds4: build %s (Maya %s)\n", MAYA_BUILD_ID, MAYA_RELEASE);
+    if (describe) {   // the pack's description alone, before anything that would touch a GPU
+        if (o.pack.empty()) {
+            usage();
+            return 2;
+        }
+        return strata::ds4::pack_info(o.pack, o.profile, kernel_types(), stdout);
+    }
+    if (marks_check && ids_s.empty()) {
+        std::fprintf(stderr, "--marks-check needs --ids (a prompt of two chunks or more)\n");
+        return 2;
+    }
+    if (parts_check && ids_s.empty()) {
+        std::fprintf(stderr, "--parts-check needs --ids (a prompt of two chunks or more)\n");
+        return 2;
+    }
     if (multi_check && (o.seqs < 2 || ids_s.empty())) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
+    if (sampler_n > 0 && ids_s.empty()) {
+        std::fprintf(stderr, "--sampler-test needs --ids (a prompt whose next tokens are open)\n");
+        return 2;
+    }
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
+                           spec_eval_path.empty())) {
         usage();
         return 2;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
+    o.profile_out = prof_out;
+    if (!prof_run.empty()) {   // (a profile run: the pack's profile read only, the run's counts to their own file)
+        o.profile_readonly = true;
+        if (o.profile_out.empty()) o.profile_out = prof_run + ".profile.bin";
+        if (!dspark_set) o.dspark = false;   // (it never drafts: the drafter's VRAM to experts)
+        suffix_draft = 0;
+        // every layer routes every token, as a decode's do: the prompt skip (layers 21-39 of a long run's earlier
+        // tokens left out) off unless set
+        const bool skip_set = std::getenv("DS4_YOCO") != nullptr || std::getenv("MAYA_DS4_PROMPT_SKIP") != nullptr;
+        if (!skip_set) {
+#if defined(_WIN32)
+            _putenv_s("DS4_YOCO", "0");
+#else
+            setenv("DS4_YOCO", "0", 1);
+#endif
+        }
+        std::fprintf(stderr, "profile-run: %s's routing counted into %s; the expert profile %s is only read%s\n",
+                     prof_run.c_str(), o.profile_out.c_str(), o.profile.empty() ? "(none)" : o.profile.c_str(),
+                     skip_set ? "" : "; every layer on every token (the prompt skip off)");
+    }
+    if (!spec_eval_path.empty() || sampler_n > 0) {   // (the drafter's tools: it loaded, no prompt lookup)
+        if (!dspark_set) o.dspark = true;
+        suffix_draft = 0;
+    }
+    if (sampler_n > 0 && std::getenv("DS4_DSPARK_SAMPLE") == nullptr) {   // (drafts drawn from the drafter's q)
+#if defined(_WIN32)
+        _putenv_s("DS4_DSPARK_SAMPLE", "1");
+#else
+        setenv("DS4_DSPARK_SAMPLE", "1", 1);
+#endif
+    }
     o.vision_only = !enc_rgb.empty();
     strata::ds4::Model m;
     std::string err;
@@ -1960,11 +3620,35 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+    if (dspark_on_asked && !o.vision_only && !m.has_drafter())
+        std::fprintf(stderr, "maya-ds4: warning: --dspark on, but this pack has no DSpark drafter blocks (mtp.* tensors): "
+                             "decoding with prompt lookup only (no drafter)\n");
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
+    std::unique_ptr<DraftCost> dc;   // (DS4_DRAFT_COST: DSpark's window by this PC's measured cost, over the run)
+    if (const char* v = ds4_env("DS4_DRAFT_COST"); v != nullptr && std::atoi(v) != 0 && m.draft_block() > 0) {
+        dc = std::make_unique<DraftCost>(m.verify_max());
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: DSpark's window by the measured cost of its rows (opt-in; the "
+                             "same tokens)\n");
+    } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+    if (serve_mode) {
+        g_vram_gpus = o.gpus;
+        return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
+    }
+    if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
+    if (!spec_eval_path.empty()) return spec_eval(m, spec_eval_path, n > 0 ? n : 256, temp, cli_seed);
+    if (sampler_n > 0) {
+        if (!ids_s.empty() && ids_s[0] == '@') {   // (--ids @FILE, as the CLI's run takes it)
+            std::ifstream f(ids_s.substr(1));
+            ids_s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        return sampler_test(m, parse_ids(ids_s), sampler_n, cli_seed);
+    }
     if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
+    if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
+    if (marks_check) return check_marks(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;
@@ -2117,9 +3801,14 @@ int main(int argc, char** argv) {
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
+        round_log().tag = "ids";   // (DS4_ROUND_LOG)
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         for (;;) {
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler)
+                std::fprintf(stderr, "maya-ds4: the sample failed\n");
+                return 1;
+            }
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
@@ -2129,7 +3818,7 @@ int main(int argc, char** argv) {
                 int off = 0, acc = 0;
                 const bool try_spec = spec && !cool;
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
-                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get())) {
+                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get(), dc.get())) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;
                 }
@@ -2147,6 +3836,7 @@ int main(int argc, char** argv) {
         if (lk && lk->windows > lk_w0)
             std::fprintf(stderr, "prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the dspark line's)\n",
                          lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+        if (dc != nullptr) std::fprintf(stderr, "draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
     }
     if (prof && rep == reps - 1) cudaProfilerStop();
     if (spec && rounds > 0) {
@@ -2171,6 +3861,16 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.store_slots > 0)   // --ssd-cache
+        std::fprintf(stderr, "RAM store: a token's CPU-lane experts %.2f from it, %.2f read (%.2f of them in place: no slot); "
+                             "the lane waited %.2f ms a token for its reads; %lld put in from VRAM, %lld guesses (%lld "
+                             "asked for, %lld dropped unread), %lld given up, %lld reads failed; %lld of %lld slots held\n",
+                     (double) (s.store_hits - s0.store_hits) / nt, (double) (s.store_misses - s0.store_misses) / nt,
+                     (double) (s.store_no_slot - s0.store_no_slot) / nt, (s.store_wait_ms - s0.store_wait_ms) / nt,
+                     (long long) (s.store_put - s0.store_put), (long long) (s.store_guesses - s0.store_guesses),
+                     (long long) (s.store_guess_used - s0.store_guess_used),
+                     (long long) (s.store_cancelled - s0.store_cancelled), (long long) (s.store_evicted - s0.store_evicted),
+                     (long long) (s.store_failed - s0.store_failed), (long long) s.store_held, (long long) s.store_slots);
     if (s.helper_held > 0)   // DS4_HELPER
         std::fprintf(stderr, "decode helper: %lld experts on the helper GPU (%d held), %lld on the CPU lane after it failed%s; "
                              "waits for it %.2f ms a token\n",

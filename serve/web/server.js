@@ -82,6 +82,7 @@ export async function loadMcp() {
 export const mcpOn = () => P.mcp !== false && S.mcp.tools > 0;
 
 // ------------------------------------------------------------------ the context size (a reload of the model)
+export const GLM_KV_BYTES = 12288;   // GLM's attention cache per token (KV streaming keeps all of it in RAM)
 export const CTX_STOPS = [4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576];
 export async function loadCtxInfo() {
   try {
@@ -91,13 +92,14 @@ export async function loadCtxInfo() {
   emit();
   return S.ctxInfo;
 }
-export function ctxStops() {
-  const c = S.ctxInfo;
-  if (!c) return [];
-  let stops = CTX_STOPS.filter((v) => v >= c.min && v <= c.max);
-  if (!stops.includes(c.context)) stops = [...stops, c.context].sort((a, b) => a - b);
-  return stops;
+// the Context size slider's stops (Settings > Model and the Models page's Engine settings): CTX_STOPS within a model's
+// range ({min, max}: GET /api/context, or /api/models' context_range), and the sizes given (the one now, a draft's)
+export function ctxStopsIn(r, ...sizes) {
+  if (!r) return [];
+  const own = sizes.map(Number).filter((n) => n > 0);
+  return [...new Set([...CTX_STOPS.filter((v) => v >= r.min && v <= r.max), ...own])].sort((a, b) => a - b);
 }
+export const ctxStops = () => (S.ctxInfo ? ctxStopsIn(S.ctxInfo, S.ctxInfo.context) : []);
 // what a context size costs here: the engine's own measurement of the current size, scaled
 export function ctxEstimate(n) {
   const c = S.ctxInfo;
@@ -113,6 +115,26 @@ export function ctxEstimate(n) {
   const est = perTok * n, now = perTok * c.context;
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
+}
+// the Context size slider's line under it (Settings > Model and the Models page alike): what n tokens of context cost.
+// `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
+// streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
+// GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
+export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ram = 0, vram = 0} = {}) {
+  const e = live ? ctxEstimate(n) : null, same = now == null || n === now;
+  const more = (d) => (same || !d ? "." : ` · ${fmt(Math.abs(d), 1)} GB ${d > 0 ? "more" : "less"} than now.`);
+  const W = ctxfmt(win || (S.ctxInfo && S.ctxInfo.kv_resident) || 0);
+  if (e && e.ram) return `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` + more(e.delta);
+  if (e) return `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (same ? "." : e.experts
+    ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
+  const gb = (bytes, k) => (bytes * k) / 2 ** 30;
+  if (ram && win) {
+    if (whole && n <= win) return `Up to ${W} the whole cache stays in VRAM.`;
+    return `≈ ${fmt(gb(ram, n), 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` +
+      (now != null && whole && now <= win ? "." : more(gb(ram, n - (now || 0))));
+  }
+  if (vram) return `≈ ${fmt(gb(vram, n), 1)} GB of GPU memory for the context, taken from the experts` + more(gb(vram, n - (now || 0)));
+  return "How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.";
 }
 // how long loading the model takes here: as long as its last load (GET /api/context's load_s), else the usual 1-3 minutes
 export function loadTime() {

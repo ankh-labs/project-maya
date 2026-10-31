@@ -488,7 +488,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         # Unlike the legacy adapter, preserve tool IDs, namespaces, content_blocks,
         # mid-system roles, latest_reminder and task fields for the reference encoder.
         declared = copy.deepcopy(req.get("tools") or [])
-        tools = tools_from_openai_format(declared) if declared else None
+        # same stabilization as the legacy branch - the encoder renders tools at the prompt's head,
+        # so a client's registration-order swap would otherwise break the engine's prompt-prefix reuse.
+        # tools_from_openai_format already returns flat dicts keyed by the namespace-qualified name.
+        tools = stable_tool_order(tools_from_openai_format(declared)) if declared else None
         if req.get("tool_choice") == "none":
             tools = None
             for message in messages:
@@ -598,8 +601,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""),
               "parameters": t.get("input_schema", {})} for t in req.get("tools") or []] or None
-    if not deepseek:
-        tools = stable_tool_order(tools)
+    tools = stable_tool_order(tools)   # DeepSeek renders tools at the prompt's head too
     if isinstance(req.get("tool_choice"), dict) and req["tool_choice"].get("type") == "none":
         tools = None
     kwargs = {}
@@ -646,6 +648,7 @@ class Event:
     text: str = ""
     call: ToolCall | None = None
     complete: bool = True          # false when the model never closed the call's syntax
+    logprobs: list | None = None   # a text event's tokens' OpenAI logprobs entries (a request that asked: Service.run)
 
 
 THINK_END = "</think>"
@@ -675,6 +678,15 @@ def call_name(body: str) -> str:
     return body.split("<", 1)[0].strip()
 
 
+class MalformedToolCall(ValueError):
+    """A call body that does not parse.  The message (what the client sees) keeps its first 80 characters; `body` is the
+    whole of it, for the server's log: a thinking budget that cuts a call off mid-way is read from the end (#613)."""
+
+    def __init__(self, body: str):
+        super().__init__("malformed tool call: " + body[:80])
+        self.body = body
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """A call body -> ToolCall, in GLM's form (`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`, what GLM-5.x
     writes: issue #5) or Qwen's (`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>`).  Values are
@@ -686,17 +698,17 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         name = call_name(body)
         rest = body[len(body.split("<", 1)[0]):]
         if not name or not (rest == "" or rest.lstrip().startswith(ARG_KEY)):
-            raise ValueError("malformed tool call: " + body[:80])
+            raise MalformedToolCall(body)
         args = {}
         while ARG_KEY in rest:
             rest = rest[rest.index(ARG_KEY) + len(ARG_KEY):]
             end = rest.find(ARG_KEY_END)
             if end < 0:
-                raise ValueError("malformed tool call: " + body[:80])
+                raise MalformedToolCall(body)
             key, rest = rest[:end].strip(), rest[end + len(ARG_KEY_END):]
             v0 = rest.find(ARG_VAL)
             if v0 < 0 or rest[:v0].strip():
-                raise ValueError("malformed tool call: " + body[:80])
+                raise MalformedToolCall(body)
             rest = rest[v0 + len(ARG_VAL):]
             end = rest.find(ARG_VAL_END)
             value = rest[:end] if end >= 0 else rest
@@ -704,7 +716,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             args[key] = _arg_value(value, (props.get(key) or {}).get("type"))
         return ToolCall(name=name, arguments=args)
     if ">" not in body:
-        raise ValueError("malformed tool call: " + body[:80])
+        raise MalformedToolCall(body)
     name = body[len(FUNC_START):body.index(">")]
     rest = body[body.index(">") + 1:]
     args = {}
@@ -854,6 +866,7 @@ class DsmlRewriter:
 
 MINIMAX_NS = "]<]minimax[>["
 MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
+THINK_AGAIN = "\x00think\x00"   # MinimaxRewriter -> OutputParser: a reasoning block opens (never in model text)
 
 
 def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
@@ -883,8 +896,9 @@ def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset(
 
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
-    form with JSON values).  `<mm:think>` opens reasoning (the parser is already in it) and goes; `</mm:think>` is
-    </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
+    form with JSON values).  `<mm:think>` opens reasoning: THINK_AGAIN for the parser, which drops it while it is
+    in the reasoning already and goes back into it after an answer part (MiniMax thinks again between tool calls and
+    text: that is reasoning, not answer text); `</mm:think>` is </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
     ]<]minimax[>[), a value that holds `NS<k>` elements being an object (or, all `item`, an array) - become
     `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` with V JSON: a string parameter (the
     tool's schema admits a string: may_be_string, a nullable string or a union with one included) JSON-quoted piece
@@ -932,7 +946,7 @@ class MinimaxRewriter:
                 end = self.buf.startswith(MM_THINK_END)
                 tag = MM_THINK_END if end else MM_THINK
                 self.buf = self.buf[len(tag):]
-                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else ""))
+                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else THINK_AGAIN))
                 continue
             rest = self.buf[len(MINIMAX_NS):]
             if not rest:
@@ -1064,6 +1078,7 @@ class OutputParser:
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
+        self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
         self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1075,6 +1090,7 @@ class OutputParser:
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
+        self.malformed: list[str] = []   # the bodies of calls that did not parse (#613), for the server's log
         self._reset_scan()
 
     def _track(self, text: str) -> str:
@@ -1294,6 +1310,8 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state != "content" and THINK_AGAIN in self.buf:
+                self.buf = self.buf.replace(THINK_AGAIN, "")    # (already reasoning; in a call: not an opening)
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:
@@ -1314,6 +1332,14 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
+                m = self.buf.find(THINK_AGAIN)
+                if m >= 0 and CALL_START not in self.buf[:m]:
+                    # MiniMax thinks again after an answer part: what follows is reasoning until its next </think>
+                    text = self.buf[:m].rstrip("\n")
+                    if text:
+                        out.append(Event("content", self._track(text)))
+                    self.buf, self.state = self.buf[m + len(THINK_AGAIN):], "reasoning"
+                    continue
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
@@ -1346,8 +1372,14 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_resume = 0
             else:
-                i = self.buf.find(CALL_END)
+                # the body accumulates in buf until the call closes, so searching from 0 every
+                # delta is O(body) per token.  In call state buf only grows, and a failed search over
+                # L chars rules out every start position up to L - len(CALL_END): resume there.
+                i = self.buf.find(CALL_END, self._call_resume)
+                if i < 0:
+                    self._call_resume = max(0, len(self.buf) - len(CALL_END) + 1)
                 complete = True
                 if self.stream_tools:
                     if i >= 0:
@@ -1367,7 +1399,24 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except MalformedToolCall as e:
+                    # a call that does not parse never fails the whole answer (#613: 24K tokens lost to one): one
+                    # already announced goes out as written so far, marked incomplete (as one the output ended
+                    # inside); one that never got that far is the answer's text, as the model wrote it.  `malformed`
+                    # keeps the body for the server's log
+                    self.malformed.append(e.body)
+                    if self.scall is not None:
+                        rest, self.buf = self.buf, body          # (_close_scan reads the body's unscanned rest)
+                        out += self._close_scan()
+                        self.buf = rest
+                        out.append(Event("tool_call", call=self.scall, complete=False))
+                    else:
+                        out.append(Event("content", self._track(CALL_START + body + CALL_END)))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 if self.dsml is not None and "::" in call.name:
                     call.namespace = call.name.split("::", 1)[0]
                 if self.scall is not None:

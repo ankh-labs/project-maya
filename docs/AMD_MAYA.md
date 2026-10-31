@@ -2,8 +2,9 @@
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
-layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer;
-Linux users can opt into the existing [CPU image encoder](#cpu-image-encoder-on-linux).
+layers (see [Two GPUs](#two-gpus)), and reads pictures too: setup builds the image encoder for the GPU
+(ggml's HIP backend), started only while a picture is encoded, as on NVIDIA; `--no-vision` leaves it out. The
+[CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux.
 Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
@@ -51,10 +52,9 @@ amount.
 
 ## CPU image encoder on Linux
 
-HIP setup skips the image encoder, but the server can use the existing CPU-only
+HIP setup builds a GPU image encoder (above); instead, the server can use a CPU-only
 `maya-vision` helper alongside the HIP text engine. This is an explicit manual
-setup; it does not enable an AMD GPU vision backend or change the installer's
-text-only default. Stop Maya before building or changing the config.
+setup. Stop Maya before building or changing the config.
 
 After HIP setup has fetched its pinned `third_party/llama.cpp` checkout, run
 these commands from the Maya project root. If you used `--llama-dir`, use that
@@ -117,7 +117,7 @@ Windows, large-image limits, and multiple-image workloads were not tested here.
 `--gpus 0,1` splits the layers across two supported cards, as on NVIDIA: each card caches the experts of its own
 half, and the second half also runs the model's MTP block, which drafts the next token so both cards stay busy. Setup
 puts the card with more VRAM first (it takes the bigger first half), leaves the split point to the engine, and writes
-one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a `:`-separated list; each card uses the table
+one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a path list, `:`-separated on Linux and `;` on Windows; each card uses the table
 for its own architecture). A discrete GPU paired with a unified-memory APU puts the discrete GPU first and loads the
 parts sequentially (`MAYA_GLM_PARALLEL_LOAD=0`), so the APU sizes its pool after the first part pins its RAM tier.
 The two cards may be different architectures. The split passes one small host-memory hop
@@ -200,6 +200,23 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
 
+## Instinct MI300X / MI325X
+
+AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64
+card and runs through the hip_compat half-wavefront layer.
+
+Install ROCm's development packages for the card first (ROCm 7.14: `amdrocm-core-dev7.14-gfx942` and
+`amdrocm-blas-dev7.14`), then run the setup above without the `MAYA_GLM_RAM_GB` override. On an MI325X (256 GB) every
+expert of Maya-L fits in HBM next to a 1M-token context; with that much room, `"--kv-streaming", "off"` in the config's
+`"args"` keeps the whole latent cache on the card too.
+
+```sh
+./maya.sh --backend hip --gpu 0 --context 1048576 --no-vision --yes --model Maya-L --download-model
+```
+
+`./maya.sh --bench` on one MI325X (v1.1.27, Maya-L, 1M context, `--kv-streaming off`): answers at 84.0 tokens/s,
+prompts at 1307 tokens/s (2K tokens) and 1663 tokens/s (8K tokens). Not tried yet: the MI300X itself, more than one GPU.
+
 ## Windows
 
 `START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
@@ -276,7 +293,14 @@ sub-batches. Two settings matter on AMD:
   `tools/hip/tune_hipblaslt` (`tools/hip/<arch>-glm-hipblaslt-<version>.txt`).
   Setup writes it when a table for the card exists. The engine accepts a table
   only for its own architecture and hipBLASLt version; otherwise, and for shapes
-  without a row, it keeps plain hipBLAS. The tuner's absolute-error gate now
+  without a row, it keeps plain hipBLAS. Builds of one hipBLASLt version can
+  number their solutions differently, so a version may have more than one table
+  (`<version>.txt`, `<version>-b.txt`): the engine keeps every matching table
+  and takes, per shape, the first whose solution its hipBLASLt accepts. The tuner's default shapes are
+  DeepSeek's, so a table generated from them covers none of another model's
+  projections: pass `--preset glm` for GLM-5.3-Flash (or `--shape T,N,K`) and
+  check the engine's log, which now prints one line per shape that misses the
+  table. On a 8060S, four GLM rows took a prompt from 128 to 168 tok/s. The tuner's absolute-error gate now
   scales with `sqrt(K / 4096)`, so long-K projections are no longer rejected.
 
 Measured prompt speed, GLM-5.3-Flash Maya-S-v2 IQ2_XXS, ROCm 7.2:

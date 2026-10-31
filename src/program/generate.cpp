@@ -16,6 +16,9 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/idle_gate.hpp"
+#include "strata/platform/env_report.hpp"
+#include "strata/kernels/glm_fast.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -52,6 +55,7 @@
 #include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
+#include "strata/core/vram_mark.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -105,6 +109,13 @@ namespace {
 bool refill_blocking() {
     static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
     return v;
+}
+
+// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, STRATA_GLM_VISION_LEND_MB
+// - the variable is named for the engine that had it first); 0 = no on-demand encoder.
+uint64_t vision_lend_need() {
+    const char* v = std::getenv("STRATA_GLM_VISION_LEND_MB");
+    return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
 }
 
 using Clock = std::chrono::steady_clock;
@@ -1050,6 +1061,13 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
     }
+#else
+    // Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too: it would end at once and
+    // lose the conversation it holds.  The server stops on them and ends the engine with QUIT, as above.
+    if (o.serve) {
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
+    }
 #endif
     strata::core::Glm5Model model;
     std::string err;
@@ -1221,6 +1239,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
@@ -1950,6 +1969,13 @@ static int glm_pack_generate(const Options& o) {
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
     std::chrono::steady_clock::time_point gap_mark;   // the read's start (after any restore), then each gap's end
+    // the GPUs the prompt-read line asks the free VRAM of: the ones the expert pool lives on (empty: every visible one)
+    const auto vram_devs = [&]() {
+        std::vector<int> d;
+        if (model.fast())
+            for (const auto& pv : model.pool_vram()) d.push_back(pv.dev);
+        return d;
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -2029,16 +2055,35 @@ static int glm_pack_generate(const Options& o) {
             if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         std::vector<float> lg;
+        const strata::core::VramMark vram0 = strata::core::vram_mark(vram_devs());   // (the line at the read's end)
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
-        // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
+        // the state is saved before the generation prompt (snap_at), so an identical or extending prompt can reuse it
         bool snapped = false;
+        // THE SNAPSHOT'S POSITION: before the prompt's generation prompt (its trailing <|assistant|>, then <think> or
+        // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
+        // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
+        // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
+        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (STRATA_GLM_SNAP_GEN=1): the prompt's
+        // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
+        // from a read with the snapshot before the last token (the default).
+        size_t snap_at = prompt.size() - 1;
+        {
+            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
+            constexpr int32_t kAsstTok = 154828;   // <|assistant|>
+            // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
+            for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
+                const size_t a = prompt.size() - k;
+                if (a < reuse || a == 0) break;
+                if (prompt[a] == kAsstTok) { snap_at = a; break; }
+            }
+        }
         // the batched prompt path (glm_prefill.cu) reads all but the last prompt token in chunks, layer by layer;
         // the last one goes through the token path, which leaves the logits the first sample reads
         const int pchunk = model.fast() ? model.prefill_chunk() : 0;
         size_t i_first = reuse;
-        if (pchunk > 0 && prompt.size() - reuse > 1) {
+        if (pchunk > 0 && snap_at > reuse) {
             // one call for everything but the last token: the two halves of a split pipeline the chunks; PP lines
             // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread.
             // A checkpoint position (ckpt_marks) ends a call: the state there is kept, and the next call goes on.
@@ -2066,7 +2111,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 std::fflush(stdout);
             };
-            std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            std::vector<size_t> marks = ckpt_marks(prompt, reuse, snap_at);
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
             // without checkpoints (STRATA_GLM_CKPTS=0, the several-conversation scheduler) the read still ends a call
@@ -2084,7 +2129,7 @@ static int glm_pack_generate(const Options& o) {
             size_t mi = 0, seg_start = at;
             // STRATA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
             // would otherwise stall them for the last stage of one and the first of the next
-            if (read_gap_first && prompt_between && at < prompt.size() - 1) {
+            if (read_gap_first && prompt_between && at < snap_at) {
                 const int r = prompt_between();
                 if (r == 1) {
                     pok = false;
@@ -2095,8 +2140,8 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
-            while (pok && at < prompt.size() - 1) {
-                const size_t seg_end = mi < marks.size() ? marks[mi] : prompt.size() - 1;
+            while (pok && at < snap_at) {
+                const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
                     // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
@@ -2144,9 +2189,17 @@ static int glm_pack_generate(const Options& o) {
                         seg_start = end;
                         seg_chunk = 0;
                     }
+                    // a cancel between two calls: a call that is one chunk (a checkpoint every chunk, or a piece) never
+                    // asks the progress callback, so with one conversation the read ran to its end after the client had
+                    // gone - it stops here, at the checkpoint just kept (a cancelled read keeps it, below)
+                    if (at < snap_at && !prompt_between && read_stopped()) {
+                        pok = false;
+                        err = "cancelled";
+                        break;
+                    }
                     // more to read: the decoding requests' turn (none after the last piece - its last token's logits
                     // must still be on the tail when the first sample reads them)
-                    if (at < prompt.size() - 1 && prompt_between) {
+                    if (at < snap_at && prompt_between) {
                         pp_line(at - reuse);
                         const int r = prompt_between();
                         if (r == 1) {
@@ -2169,12 +2222,45 @@ static int glm_pack_generate(const Options& o) {
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
             i_first = at;
             if (pok) {
-                i_first = prompt.size() - 1;
-                pp_line(prompt.size() - 1 - reuse);
+                i_first = snap_at;
+                pp_line(snap_at - reuse);
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
-                ckpt_drop_past(0);
+                // A CANCELLED READ keeps what it read: the longest checkpoint of this prompt the read has reached (one
+                // it kept itself, or an earlier one it started from) becomes the snapshot, so the client's retry - an
+                // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
+                // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
+                // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
+                // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
+                static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                size_t kept = 0;
+                if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    int best = -1;
+                    for (int c = 0; c < (int) ckpts.size(); ++c) {
+                        const auto& t = ckpts[(size_t) c].tokens;
+                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                            std::equal(t.begin(), t.end(), prompt.begin()))
+                            best = c;
+                    }
+                    std::string ce;
+                    if (best >= 0 && model.ckpt_restore(best, ce) && model.snapshot_save()) {
+                        kept = ckpts[(size_t) best].tokens.size();
+                        snap_tokens.assign(prompt.begin(), prompt.begin() + (long) kept);
+                        snap_img_hash = img_hash(kept);
+                        snap_in_slot = false;
+                        ckpts[(size_t) best].used = ++ckpt_clock;
+                        ckpt_drop_past(kept);
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps %zu of the prompt's %zu tokens\n",
+                                     kept, prompt.size());
+                    } else if (best >= 0) {
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps nothing (%s)\n",
+                                     ce.empty() ? "no snapshot" : ce.c_str());
+                    }
+                }
+                if (kept == 0) {
+                    snap_tokens.clear();
+                    model.reset();
+                    ckpt_drop_past(0);
+                }
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
@@ -2187,9 +2273,9 @@ static int glm_pack_generate(const Options& o) {
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
-            if (model.fast() && !snapped && i == prompt.size() - 1) {
+            if (model.fast() && !snapped && i == snap_at) {
                 if (model.snapshot_save()) {
-                    snap_tokens.assign(prompt.begin(), prompt.end() - 1);
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
                 } else {
@@ -2198,7 +2284,7 @@ static int glm_pack_generate(const Options& o) {
                 snapped = true;
             }
             size_t chunk = std::min<size_t>(8, prompt.size() - i);
-            if (model.fast() && !snapped && i + chunk > prompt.size() - 1) chunk = prompt.size() - 1 - i;
+            if (model.fast() && !snapped && i < snap_at && i + chunk > snap_at) chunk = snap_at - i;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
             const bool ok = model.forward(part, lg, err);
             if (!ok) {
@@ -2214,6 +2300,13 @@ static int glm_pack_generate(const Options& o) {
                             (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
             }
             if (read_stopped()) { finish = "cancel"; break; }
+        }
+        {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
+            const std::string vt = strata::core::vram_mark_text(vram0, strata::core::vram_mark(vram_devs()));
+            if (!vt.empty())
+                std::fprintf(stderr, "glm vram: prompt %zu tokens read in %.1f s; %s\n",
+                             prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), vt.c_str());
         }
         return 0;
     };
@@ -4526,6 +4619,24 @@ static int glm_pack_generate(const Options& o) {
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+    {
+        // the GLM tuning settings taken from the environment, said once at start (#6), with the value used where the
+        // engine clamps one (the same ranges as where each is read)
+        namespace gf = strata::kernels::glmf;
+        static const strata::platform::EnvRange kRanges[] = {
+            {"GLM_PREFETCH_N", 0, gf::kSpares - 1, "at most kSpares-1"},          // glm_fast_path.cu
+            {"GLM_AHEAD", 0, gf::kAhead, "at most kAhead"},                       // glm_fast_path.cu
+            {"GLM_DISK_SKIP_FROM", 0, 8, "0-8"},                                  // glm_fast_path.cu
+            {"GLM_PREFILL_SUB", 16, 8192, "16-8192"}};                            // glm_prefill.cu
+#if defined(_WIN32)
+        char** env = _environ;
+#else
+        char** env = environ;
+#endif
+        const std::string line = strata::platform::env_report(env, "GLM_", "glm settings from the environment",
+                                                              kRanges, sizeof(kRanges) / sizeof(kRanges[0]));
+        if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
+    }
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -5495,6 +5606,16 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const strata::core::ModelGeometry draft_geometry{};
+#if !defined(STRATA_USE_HIP)
+        // an on-demand vision encoder (it runs on the first GPU): a drafter there can lend its experts' VRAM too,
+        // when the expert cache alone cannot hold the encoder (nothing drafts while a picture is read)
+        {
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            if (o.serve && o.vision && vision_lend_need() > 0 && (last_st == nullptr || last_st->dev == dev0))
+                mtp.set_lendable(true);
+        }
+#endif
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "maya generate: %s\n", err.c_str()); return 1; }
@@ -5851,6 +5972,11 @@ int main(int argc, char** argv) {
         // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
+#if !defined(STRATA_USE_HIP)
+        // an on-demand vision encoder (serve --vision; the server sets STRATA_GLM_VISION_LEND_MB): the cache is mapped
+        // in pieces, so its tail can be given back while a picture is read (HIP: only VRAM that is free is lent)
+        if (o.serve && o.vision && vision_lend_need() > 0) xcache.set_lendable(true);
+#endif
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
@@ -7279,6 +7405,7 @@ int main(int argc, char** argv) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
@@ -7321,6 +7448,50 @@ int main(int argc, char** argv) {
                              (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
             }
         }
+        // The on-demand vision encoder (the server's VLEND / VRECLAIM between requests): it runs on this GPU in the
+        // VRAM that is free, plus - when that is short - the tail of the expert cache, given back to the driver
+        // while the picture is read (its experts are marked not resident) and mapped again and refilled after, so
+        // the next request finds the same experts in the same slots.  Nothing decodes while the encoder runs and a
+        // refill needs no slot (the experts are copied straight from RAM), so the whole cache can be lent; when even
+        // that is short, the draft layer's experts on this GPU follow (read again from their file after).
+        // `vis_cap` (the INFO's vision_lend): the encoder's need when free VRAM plus what can be lent holds it, else
+        // 0 (the server then runs the encoder on the CPU).
+        const uint64_t vis_need = o.vision ? vision_lend_need() : 0;
+        constexpr uint64_t kVisMargin = (uint64_t) 128 << 20;   // VRAM left free beside the encoder
+        const bool vis_tail_ok = xcache.lendable() && !host_res.empty() && d_res != nullptr && srcp != nullptr;
+        constexpr uint64_t vis_keep = 0;   // (no slot is needed while the encoder runs or for the refill)
+        const uint64_t vis_mtp_tail = !o.mtp.empty() ? mtp.lendable_bytes() : 0;
+        uint64_t vis_cap = 0;
+        if (vis_need > 0) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const uint64_t have = free_b > kVisMargin ? (uint64_t) free_b - kVisMargin : 0;
+            const uint64_t tail = vis_tail_ok ? xcache.lendable_bytes(vis_keep) : 0;
+            if (have >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU in VRAM "
+                                     "that is free\n", (double) vis_need / 1073741824.0);
+            } else if (have + tail >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
+                                     "free, the rest lent by the expert cache while a picture is read\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0);
+            } else if (have + tail + vis_mtp_tail >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
+                                     "free, %.2f GB lent by the expert cache and the rest by the draft layer's "
+                                     "experts while a picture is read\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
+                             (double) tail / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "maya serve: pictures: this GPU cannot spare the %.2f GB the vision encoder "
+                                     "needs (%.2f GB free, %.2f GB the expert cache and %.2f GB the draft layer can "
+                                     "lend%s) - it runs on the CPU\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
+                             (double) tail / 1073741824.0, (double) vis_mtp_tail / 1073741824.0,
+                             xcache.lendable() ? "" : ": this cache cannot give memory back");
+            }
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -7340,12 +7511,13 @@ int main(int argc, char** argv) {
             // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
             const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
             const int64_t ram_experts = from_gguf ? gguf_src.resident_blobs() : all_experts;
-            std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d\n",
+            std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d"
+                        " vision_lend=%llu\n",
                         (long long) all_experts, (long long) xcache.slots(), (double) xcache.bytes() / 1073741824.0,
                         (long long) ram_experts,
                         (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                             1073741824.0,
-                        o.mtp.empty() ? 0 : 1);
+                        o.mtp.empty() ? 0 : 1, (unsigned long long) vis_cap);
         }
         start_serve_watchdog(60);   // one step (a prompt layer, a verify window) takes seconds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -7363,6 +7535,62 @@ int main(int argc, char** argv) {
         // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
         constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
         bool mrope_identity = true;
+        // the experts the vision encoder's memory took out (residency index, slot), refilled once it is back
+        std::vector<std::pair<int32_t, int32_t>> vis_lent;
+        uint64_t vis_mtp_given = 0;   // the draft layer's expert bytes lent with them
+        auto vis_reclaim_cache = [&](std::string& e) -> bool {
+            if (!xcache.lent()) return true;
+            const auto t0 = Clock::now();
+            if (!xcache.reclaim_tail(e)) return false;
+            uint64_t bytes = 0;
+            bool filled = true;
+            for (const auto& [i, slot] : vis_lent) {   // as after a prompt: queued copies, one wait
+                const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                const uint8_t* b = srcp->blob(l, ex);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                const bool blocking = refill_blocking() || !srcp->stable(l, ex);
+                if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, e, nb)
+                                               : xcache.fill_slot_queued(slot, b, e, nb))) {
+                    filled = false;
+                    break;
+                }
+                bytes += (uint64_t) nb;
+            }
+            if (!xcache.sync_queued(e)) filled = false;
+            if (!filled) {
+                // (those experts stay marked not resident: the answers stay right, the decode is slower)
+                std::fprintf(stderr, "maya serve: refilling the expert cache after the vision encoder failed (%s): "
+                                     "%zu experts are read from RAM until the engine restarts\n", e.c_str(),
+                             vis_lent.size());
+                vis_lent.clear();
+                return true;
+            }
+            for (const auto& [i, slot] : vis_lent) host_res[(size_t) i] = slot;
+            res_upload();
+            std::fprintf(stderr, "maya serve: the vision encoder's VRAM is back: %zu experts (%.2f GB) refilled in "
+                                 "%.0f ms\n", vis_lent.size(), (double) bytes / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            vis_lent.clear();
+            return true;
+        };
+        // the cache first (its refill is the faster), then the draft layer's experts
+        auto vis_reclaim = [&](std::string& e) -> bool {
+            if (!vis_reclaim_cache(e)) return false;
+            if (!mtp.experts_lent()) return true;
+            const auto t0 = Clock::now();
+            if (!mtp.reclaim_experts(e)) {
+                if (mtp.experts_lent()) return false;   // (the memory is not free yet: a later call maps the rest)
+                // mapped again but not read back: only the drafts suffer (the verify decides every token)
+                std::fprintf(stderr, "maya serve: %s - drafts are rejected until the engine restarts\n", e.c_str());
+                vis_mtp_given = 0;
+                return true;
+            }
+            std::fprintf(stderr, "maya serve: the draft layer's experts are back: %.2f GB read again in %.0f ms\n",
+                         (double) vis_mtp_given / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            vis_mtp_given = 0;
+            return true;
+        };
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         // The prompt path's chunk, for the requests that follow: an allocation failure lowers it (the memory is
@@ -7377,6 +7605,93 @@ int main(int argc, char** argv) {
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on this GPU
+            // ("VLENT <bytes taken from the expert cache>"; 0: the free VRAM holds it) - and has ended ("VRECLAIMED";
+            // an ERR while its memory is not free yet: try again)
+            if (line == "VLEND") {
+                std::string ve;
+                uint64_t given = 0, from = 0;
+                if (vis_cap == 0) {
+                    std::printf("ERR this GPU cannot spare the memory the vision encoder needs\n");
+                } else {
+                    apply_pending(true);   // (no swap may still be copying into the slots about to go)
+                    cudaDeviceSynchronize();
+                    size_t free_b = 0, total_b = 0;
+                    cudaMemGetInfo(&free_b, &total_b);
+                    const uint64_t have = free_b > kVisMargin ? (uint64_t) free_b - kVisMargin : 0;
+                    // what is short of the free VRAM: the expert cache's tail first (all of it if need be), then
+                    // the draft layer's experts on this GPU
+                    uint64_t mtp_given = 0;
+                    const uint64_t short_b = have < vis_need ? vis_need - have : 0;
+                    if (short_b > 0 && vis_tail_ok) (void) xcache.lend_tail(short_b, vis_keep, from, given, ve);
+                    if (short_b > given && vis_mtp_tail > 0) {
+                        std::string me;
+                        (void) mtp.lend_experts(short_b - given, mtp_given, me);
+                        vis_mtp_given = mtp_given;
+                        if (!me.empty()) ve = ve.empty() ? me : ve + "; " + me;
+                    }
+                    const bool ok = given + mtp_given >= short_b;
+                    if (!ok) {
+                        char buf[200];
+                        std::snprintf(buf, sizeof buf, "the GPU could give the vision encoder only %.2f of the %.2f GB "
+                                      "it needs", (double) (have + given + mtp_given) / 1073741824.0,
+                                      (double) vis_need / 1073741824.0);
+                        ve = ve.empty() ? std::string(buf) : std::string(buf) + " (" + ve + ")";
+                    }
+                    if (xcache.lent()) {   // (also after a lend that stopped half-way: what is out is marked)
+                        // every slot reaching past `from` has lost its expert until the reclaim refills it
+                        int32_t first = 0;
+                        const uint8_t* base = xcache.device_slot(0);
+                        while (first < (int32_t) xcache.slots() &&
+                               (first + 1 < (int32_t) xcache.slots()
+                                    ? (uint64_t) (xcache.device_slot(first + 1) - base)
+                                    : (uint64_t) xcache.bytes()) <= from)
+                            ++first;
+                        for (size_t i = 0; i < host_res.size(); ++i)
+                            if (host_res[i] >= first && (!multi_gpu || stage_of((int64_t) i / g.n_expert) == 0)) {
+                                vis_lent.emplace_back((int32_t) i, host_res[i]);
+                                host_res[i] = strata::core::kNotResident;
+                            }
+                        res_upload();
+                    }
+                    if (ok) {
+                        cudaMemGetInfo(&free_b, &total_b);   // (measured: what the encoder finds free now)
+                        std::fprintf(stderr, "maya serve: the vision encoder gets %.2f GB of VRAM: %.2f GB free, "
+                                             "%.2f GB from the expert cache (%zu experts out until it ends), %.2f GB "
+                                             "from the draft layer's experts - %.2f GB free now\n",
+                                     (double) vis_need / 1073741824.0, (double) std::min(have, vis_need) / 1073741824.0,
+                                     (double) given / 1073741824.0, vis_lent.size(),
+                                     (double) mtp_given / 1073741824.0, (double) free_b / 1073741824.0);
+                        std::printf("VLENT %llu\n", (unsigned long long) (given + mtp_given));
+                    } else {
+                        std::printf("ERR %s\n", ve.c_str());
+                    }
+                }
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "VRECLAIM") {
+                std::string ve;
+                if (vis_reclaim(ve)) std::printf("VRECLAIMED\n");
+                else std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (xcache.lent() || mtp.experts_lent()) {
+                // a request while the encoder's memory is still out (the server reclaims it first, so only when
+                // that kept failing): it is taken back first - the prompt path's buffers live in that tail
+                std::string ve;
+                bool back = false;
+                for (int i = 0; i < 120 && !(back = vis_reclaim(ve)); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    strata::core::progress_beat();
+                }
+                if (!back) {
+                    std::printf("ERR the GPU memory lent to the vision encoder is not free yet (%s)\n", ve.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -8260,6 +8575,7 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
+    bool spec_go = false;   // the speculative loop runs (spec_pos can be 0: a native pack's prompt read by windows)
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -8316,6 +8632,35 @@ int main(int argc, char** argv) {
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
+        // --dump-logits (issue #658): the header announces a row for every position from 0, and the batched path
+        // computes no head - so each chunk's rows go through the token path's head from the final residuals the
+        // chunk leaves (what the draft layer reads too).  The prompt is read as without the dump: the same answer.
+        if (dump != nullptr) {
+            auto mtp_chunk = prefill.on_chunk;   // (empty without --mtp)
+            prefill.on_chunk = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                strata::core::BlockBuffers bb = ss.block;
+                for (int64_t t = 0; t < T; ++t) {
+                    if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
+                    bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.hc * g.n_embd);
+                    const bool ok = native_head.loaded()
+                                        ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
+                                              native_head.run(bb.mixed, d_logits, main_cs, e)
+                                        : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
+                    if (!ok) return false;
+                    if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
+                                        (cudaStream_t) main_cs) != cudaSuccess ||
+                        cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                        e = "reading a prompt row's logits back failed";
+                        return false;
+                    }
+                    if (std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                        e = "cannot write logits at position " + std::to_string(p0 + t);
+                        return false;
+                    }
+                }
+                return !mtp_chunk || mtp_chunk(R_rows, T, p0, e);
+            };
+        }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -8360,7 +8705,7 @@ int main(int argc, char** argv) {
 
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
+        if (native_pack) { spec_pos = pos; spec_go = true; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "maya generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
@@ -8569,7 +8914,7 @@ int main(int argc, char** argv) {
         ss.ple_prev[1] = (int32_t) tok;
         tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
         // Plan v0.3 P6: from the first generated token on, the speculative loop below takes over.
-        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
+        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; spec_go = true; break; }
     }
 
     // ================================ plan v0.3 P6: SPECULATIVE DECODING ================================
@@ -8579,7 +8924,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_go && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -8698,6 +9043,48 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
+        // --dump-logits (issue #658): the rows of the positions a window keeps, in order.  A native pack's prompt
+        // positions the batched path left (--prefill-until) are read here first, through teacher-forced windows
+        // (every token committed, the draft layer given their residuals as the batched chunks give it), so their rows
+        // are written too and the answer starts after the whole prompt
+        std::vector<float> dump_rows(dump != nullptr ? (size_t) o.spec * (size_t) n_vocab : 0);
+        auto dump_window = [&](int64_t pos0, int rows) -> bool {
+            if (dump == nullptr || rows <= 0) return true;
+            if (!ver.read_head_logits(rows, dump_rows.data(), err)) return false;
+            for (int r = 0; r < rows; ++r) {
+                if (!strata::program::logits_selection::selected(pos0 + r, dump_positions, o.logits_stride)) continue;
+                if (std::fwrite(dump_rows.data() + (size_t) r * (size_t) n_vocab, sizeof(float), (size_t) n_vocab, dump) !=
+                    (size_t) n_vocab) {
+                    err = "cannot write logits at position " + std::to_string(pos0 + r);
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (dump != nullptr && native_pack && p < n_prompt - 1) {
+            ver.set_head_sampling(false);
+            std::vector<int32_t> win((size_t) o.spec), outw((size_t) o.spec), nxt((size_t) o.spec);
+            while (p < n_prompt - 1) {
+                const int T = (int) std::min<int64_t>(o.spec, n_prompt - 1 - p);
+                for (int t = 0; t < T; ++t) {
+                    win[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t)];
+                    nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t + 1)];
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(T, win.data(), p, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed ||
+                    !ver.commit(T, err) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, p, err)) ||
+                    !dump_window(p, T)) {
+                    if (drive.d.failed && drive.d.fail) err = drive.d.fail;
+                    std::fprintf(stderr, "maya generate: reading the prompt for --dump-logits: %s\n", err.c_str());
+                    return 1;
+                }
+                p += T;
+            }
+            ver.set_head_sampling(true);
+            x = (int32_t) o.tokens[(size_t) p];
+        }
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
@@ -8793,10 +9180,16 @@ int main(int argc, char** argv) {
             ++accepted_hist[(size_t) a];
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
+            const size_t produced0 = produced.size();
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+            }
+            if (!dump_window(p, (int) (produced.size() - produced0))) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+                return 1;
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();

@@ -9,7 +9,9 @@ A background thread samples once a second and keeps the last 60 readings of each
   _Reader.MAX_CRASHES crashes; a call that hangs is ended the same way after _Reader.TIMEOUT seconds in it.
 - GPU (AMD, HIP backend): the amdgpu driver's sysfs files (Linux only, no extra library) - load, VRAM, temperature,
   power, PCIe link; see the _Amd class. Plain file reads, so read in the server's own process. Picked explicitly by
-  the server (its backend) or by auto-detection when NVML finds no card.
+  the server (its backend) or by auto-detection when NVML finds no card.  On Windows the same AMD card is read from
+  DXGI (name, memory size) and Windows' GPU performance counters in pdh.dll (load, memory used), as Task Manager does:
+  the _WinGpu class (no temperature, power or PCIe link there).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -28,6 +30,8 @@ import threading
 import time
 
 HISTORY = 60
+IDLE_S = 3.0      # the sampler's pause while no request runs and nothing has read the numbers lately (else 1 s)
+WATCH_S = 15.0    # "lately": how long after a GET /metrics (or a request) the sampler keeps its once-a-second pace
 
 
 # ------------------------------------------------------------------------------------------------ NVML (the server)
@@ -589,6 +593,152 @@ class _Amd:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ AMD (Windows)
+def _dxgi_adapters():
+    """[(name, vendor_id, dedicated_bytes, luid_high, luid_low)] of the hardware graphics adapters, in DXGI's order
+    (CreateDXGIFactory1 + IDXGIFactory1::EnumAdapters1 + IDXGIAdapter1::GetDesc1 through COM vtables; software
+    adapters skipped); [] when DXGI cannot be asked."""
+    class Desc1(ctypes.Structure):                       # DXGI_ADAPTER_DESC1
+        _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", ctypes.c_uint), ("DeviceId", ctypes.c_uint),
+                    ("SubSysId", ctypes.c_uint), ("Revision", ctypes.c_uint), ("DedicatedVideoMemory", ctypes.c_size_t),
+                    ("DedicatedSystemMemory", ctypes.c_size_t), ("SharedSystemMemory", ctypes.c_size_t),
+                    ("LuidLow", ctypes.c_uint32), ("LuidHigh", ctypes.c_int32), ("Flags", ctypes.c_uint)]
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+    def method(obj, slot, *argtypes):
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[slot])
+
+    out = []
+    try:
+        iid = Guid(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
+        factory = ctypes.c_void_p()
+        if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0 or not factory:
+            return []
+        try:
+            for i in range(64):
+                adapter = ctypes.c_void_p()
+                if method(factory, 12, ctypes.c_uint, ctypes.c_void_p)(factory, i, ctypes.byref(adapter)) != 0:
+                    break                                # DXGI_ERROR_NOT_FOUND: the last one
+                try:
+                    d = Desc1()
+                    if method(adapter, 10, ctypes.c_void_p)(adapter, ctypes.byref(d)) == 0 and not d.Flags & 2:
+                        out.append((d.Description, d.VendorId, int(d.DedicatedVideoMemory),
+                                    d.LuidHigh & 0xFFFFFFFF, d.LuidLow))
+                finally:
+                    method(adapter, 2)(adapter)          # Release
+        finally:
+            method(factory, 2)(factory)
+    except (OSError, AttributeError, ValueError):
+        return []
+    return out
+
+
+class _Pdh:
+    """Windows' GPU performance counters (pdh.dll, what Task Manager shows): one query with the GPU Engine
+    utilisation and the GPU Adapter Memory usage of every adapter; values() -> {counter: [(instance, value)]}."""
+    COUNTERS = {"engine": r"\GPU Engine(*)\Utilization Percentage",
+                "dedicated": r"\GPU Adapter Memory(*)\Dedicated Usage",
+                "shared": r"\GPU Adapter Memory(*)\Shared Usage"}
+
+    class Item(ctypes.Structure):                        # PDH_FMT_COUNTERVALUE_ITEM_W (the value as a double)
+        _fields_ = [("name", ctypes.c_wchar_p), ("status", ctypes.c_uint32), ("value", ctypes.c_double)]
+
+    def __init__(self):
+        self.query, self.counters = ctypes.c_void_p(), {}
+        try:
+            self.lib = ctypes.windll.pdh
+            if self.lib.PdhOpenQueryW(None, None, ctypes.byref(self.query)) != 0:
+                self.query = None
+                return
+            for key, path in self.COUNTERS.items():
+                c = ctypes.c_void_p()
+                if self.lib.PdhAddEnglishCounterW(self.query, path, None, ctypes.byref(c)) == 0:
+                    self.counters[key] = c
+            self.lib.PdhCollectQueryData(self.query)     # (a rate counter needs two collections)
+        except (OSError, AttributeError):
+            self.query = None
+
+    def ok(self):
+        return bool(self.query) and "dedicated" in self.counters
+
+    def values(self):
+        out = {}
+        if not self.ok() or self.lib.PdhCollectQueryData(self.query) != 0:
+            return out
+        for key, c in self.counters.items():
+            size, count = ctypes.c_uint32(0), ctypes.c_uint32(0)
+            fmt = 0x200 | 0x8000                         # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+            if self.lib.PdhGetFormattedCounterArrayW(c, fmt, ctypes.byref(size), ctypes.byref(count), None) \
+                    != ctypes.c_long(0x800007D2).value:  # PDH_MORE_DATA: the size it needs
+                continue
+            buf = (ctypes.c_byte * size.value)()
+            if self.lib.PdhGetFormattedCounterArrayW(c, fmt, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+                continue
+            items = ctypes.cast(buf, ctypes.POINTER(self.Item))
+            out[key] = [(items[i].name or "", items[i].value) for i in range(count.value)
+                        if items[i].status in (0, 1)]    # PDH_CSTATUS_VALID_DATA / _NEW_DATA
+        return out
+
+
+def win_gpu_reading(values, luid):
+    """The readings of the adapter `luid` ("luid_0x00000000_0x0000d1a3") from _Pdh.values(): the load is the busiest
+    engine's (each engine's processes summed, as Task Manager counts it - not Linux's whole-card busy percent), the
+    memory its dedicated (the VRAM, or an APU's carve-out) and shared usage in bytes; None where nothing was read."""
+    luid = luid.lower()
+    engines = {}
+    for name, v in values.get("engine", ()):
+        name = name.lower()
+        at = name.find(luid)
+        key = name[at:].split("_engtype")[0]            # luid_..._phys_0_eng_3: one engine, any process
+        if at < 0 or "_eng_" not in key:
+            continue
+        engines[key] = engines.get(key, 0.0) + v
+    out = {"util": round(min(100.0, max(engines.values())), 1) if engines else None}
+    for key, field in (("dedicated", "mem_used"), ("shared", "mem_shared")):
+        vals = [v for name, v in values.get(key, ()) if name.lower().startswith(luid)]
+        out[field] = int(sum(vals)) if vals else None
+    return out
+
+
+class _WinGpu:
+    """An AMD card on Windows (the HIP backend), with _Amd's interface: the name and total memory from DXGI, the load
+    and memory used from Windows' GPU performance counters (_Pdh). No temperature, power or PCIe link (Windows has no
+    such counters for it). `index` counts the AMD adapters in DXGI's order. Every failure leaves ok() False."""
+    VENDOR_AMD = 0x1002
+
+    def __init__(self, index=0, adapters=None, pdh=None):
+        amd = [a for a in (_dxgi_adapters() if adapters is None else adapters) if a[1] == self.VENDOR_AMD]
+        self.card = amd[index] if 0 <= index < len(amd) else None
+        self.pdh = pdh if pdh is not None or self.card is None else _Pdh()
+        self.luid = "luid_0x%08x_0x%08x" % (self.card[3], self.card[4]) if self.card else None
+
+    def ok(self):
+        return self.card is not None and self.pdh is not None and self.pdh.ok()
+
+    def name(self):
+        return (self.card[0] if self.card else "") or "AMD Radeon"
+
+    def pci(self):
+        return None
+
+    def read(self):
+        out = win_gpu_reading(self.pdh.values(), self.luid) if self.ok() else {}
+        out["mem_total"] = self.card[2] if self.card and self.card[2] else None
+        return out
+
+
+WINDOWS = os.name == "nt"
+
+
+def amd_card(index=0):
+    """An AMD card's reader for the HIP backend: the amdgpu sysfs files (Linux), else Windows' counters (_WinGpu)."""
+    g = _Amd(index)
+    return g if g.ok() or not WINDOWS else _WinGpu(index)
+
+
 class _NvmlCard:
     """One NVIDIA card through the NVML reader process (_Reader), with _Amd's interface (gpu_reader)."""
 
@@ -619,9 +769,9 @@ class _NvmlCard:
 
 
 def gpu_reader(index=0, amd=False):
-    """The card's readings: NVML through the reader process (NVIDIA), or the amdgpu sysfs files with the AMD/HIP
-    backend (Linux sysfs, read here: plain file reads)."""
-    return _Amd(index) if amd else _NvmlCard(index)
+    """The card's readings: NVML through the reader process (NVIDIA), or with the AMD/HIP backend the amdgpu sysfs
+    files (Linux, plain file reads) or Windows' GPU counters (amd_card), read here."""
+    return amd_card(index) if amd else _NvmlCard(index)
 
 
 def free_vram_mib(index=0, amd=False):
@@ -644,6 +794,12 @@ def _cpu_name():
             k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
             return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
         except OSError:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                                  timeout=5).stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
             pass
     elif os.path.exists("/proc/cpuinfo"):
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
@@ -703,7 +859,7 @@ class _CpuRamFallback:
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, reader: _Reader | None = None,
-                 start=True):
+                 start=True, busy=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -711,24 +867,31 @@ class Telemetry:
         AMD ones read from the sysfs files (the HIP backend); when False and NVML finds no card at all, AMD is
         tried anyway (auto-detection), so the Monitor works on a HIP setup that runs this file's older caller.
         `reader`: the NVML reader process (the server's own by default); `start`: sample in a thread of its own
-        (else sample() only)."""
+        (else sample() only); `busy()` -> whether a request is running: while none is and nobody has read the numbers
+        for WATCH_S, the sampler pauses IDLE_S between readings instead of 1 s (issue #685: every reading wakes the
+        server and the NVML process - for numbers nobody looks at); a reader of the numbers (snapshot) or touch()
+        returns it to once a second at once."""
         self.extra = extra
+        self.busy = busy
+        self.watched_at = time.monotonic()           # (starts watched: the first readings come at the usual pace)
+        self._wake = threading.Event()
+        self._slow = False
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
         self.nv = None
-        self.amd = None                              # [(index, _Amd)]: the cards read from the amdgpu sysfs files
+        self.amd = None                              # [(index, _Amd / _WinGpu)]: AMD cards (sysfs / Windows counters)
         cards = []
         if amd:
-            self.amd = [(i, _Amd(i)) for i in idx]
+            self.amd = [(i, amd_card(i)) for i in idx]
         else:
             self.nv = reader or _reader()
             info = self.nv.call({"op": "info", "idx": idx}) or {}
             cards = [g for g in info.get("gpus") or [] if g and g.get("ok")]
             if not cards:
                 # auto-detect: NVML found no card at all - try the amdgpu sysfs (a HIP setup that does not say so)
-                found = [(i, _Amd(i)) for i in idx]
+                found = [(i, amd_card(i)) for i in idx]
                 if any(g.ok() for _, g in found):
                     self.amd = found
         if self.amd is not None:
@@ -824,21 +987,49 @@ class Telemetry:
                 pass
         return s
 
+    def touch(self) -> None:
+        """Someone looks at the numbers, or a request starts: back to once a second, now."""
+        self.watched_at = time.monotonic()
+        if self._slow:
+            self._wake.set()
+
+    def pause(self) -> float:
+        """The seconds to the next reading."""
+        quiet = self.busy is not None and time.monotonic() - self.watched_at > WATCH_S
+        try:
+            return IDLE_S if quiet and not self.busy() else 1.0
+        except Exception:  # noqa: BLE001 - not known: the usual pace
+            return 1.0
+
     def _loop(self):
+        last = time.monotonic()
         while True:
             try:
                 s = self.sample()
             except Exception:  # noqa: BLE001 - a reading that fails is empty this second; the sampler goes on
                 s = {}
+            now = time.monotonic()
+            # (a reading after a long pause stands for each of its seconds: the series stay a second apart)
+            held = max(1, min(int(IDLE_S) + 1, int(round(now - last))))
+            last = now
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
-                    self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
-            time.sleep(1.0)
+                    for _ in range(held):
+                        self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+            wait = self.pause()
+            self._slow = wait > 1.0
+            if self._slow:
+                self._wake.wait(wait)
+                self._wake.clear()
+                self._slow = False
+            else:
+                time.sleep(wait)
 
     def snapshot(self):
+        self.touch()                                 # (somebody reads the numbers)
         with self.lock:
             return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
                     "static": dict(self.static)}

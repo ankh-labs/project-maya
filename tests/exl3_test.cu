@@ -4,6 +4,7 @@
 // the CPU lane's part and the shared expert, and the full reconstruction.
 //
 //   exl3_test                     run everything, exit 0 when every case is within tolerance
+//   exl3_test --prefill-only      grouped experts only; environment selects WMMA/FMA and tile width
 //   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
@@ -208,6 +210,60 @@ void test_mv(int k, int n, int k2, int cb, bool q8, int view_c0 = -1, int view_n
     if (d_xq) cudaFree(d_xq);
     cudaFree(d_bias);
     cudaFree(d_y);
+}
+
+// A mixed one-/three-row call must keep its generic fallback, with the same bits as
+// two one-row jobs. Keep both jobs in each reference call so mv_split's call_groups
+// stays unchanged; comparing against a lone job could select a different input split.
+void test_mv_mixed_columns(int k2, int cb) {
+    constexpr int k = 512, n = 512, xs = k + 32, ys = n + 16;
+    constexpr float guard = -7777.0f;
+    HostMat h = make_mat(k, n, k2, cb);
+    ex::Mat m;
+    m.trellis = dev_copy(h.tr);
+    m.suh = dev_copy(h.suh);
+    m.svh = dev_copy(h.svh);
+    m.k = k; m.n = n; m.k2 = k2; m.cb = cb;
+    float* x0 = dev_copy(rand_x(xs));
+    float* x3 = dev_copy(rand_x(3 * xs));
+    std::vector<float> guarded(3 * ys, guard);
+    float* y0 = dev_copy(guarded);
+    float* y3 = dev_copy(guarded);
+    float* r0 = dev_copy(guarded);
+    float* r1 = dev_copy(guarded);
+    ex::MvJob jobs[2];
+    for (auto& j : jobs) { j.m = &m; j.xf_cs = xs; j.y_cs = ys; }
+    jobs[0].xf = x0; jobs[0].y = y0; jobs[0].ncol = 1;
+    jobs[1].xf = x3; jobs[1].y = y3; jobs[1].ncol = 3;
+    for (int rep = 0; rep < 3; ++rep) if (!ex::mv(jobs, 2, 0)) ++g_fail;
+    CK(cudaDeviceSynchronize());
+    const auto mixed0 = host_copy(y0, guarded.size());
+    const auto mixed3 = host_copy(y3, guarded.size());
+    size_t bad = 0;
+    for (size_t i = 0; i < guarded.size(); ++i) {
+        if ((i >= ys || i % ys >= n) && mixed0[i] != guard) ++bad;
+        if (i % ys >= n && mixed3[i] != guard) ++bad;
+        if (!std::isfinite(mixed0[i]) || !std::isfinite(mixed3[i])) ++bad;
+    }
+    for (int row = 0; row < 3; ++row) {
+        jobs[0].y = r0;
+        jobs[1].ncol = 1; jobs[1].xf = x3 + row * xs; jobs[1].y = r1;
+        if (!ex::mv(jobs, 2, 0)) ++g_fail;
+        CK(cudaDeviceSynchronize());
+        const auto one0 = host_copy(r0, guarded.size());
+        const auto one1 = host_copy(r1, guarded.size());
+        for (int i = 0; i < n; ++i) {
+            bad += std::memcmp(&one0[i], &mixed0[i], sizeof(float)) != 0;
+            bad += std::memcmp(&one1[i], &mixed3[row * ys + i], sizeof(float)) != 0;
+        }
+        for (size_t i = n; i < guarded.size(); ++i)
+            bad += one0[i] != guard || one1[i] != guard;
+    }
+    std::printf("  mixed 1/3-row mv K%s cb%d: %zu mismatches/guard failures  %s\n",
+                kname(k2).c_str(), cb, bad, bad ? "FAIL" : "ok");
+    if (bad) ++g_fail;
+    CK(cudaFree((void*) m.trellis)); CK(cudaFree((void*) m.suh)); CK(cudaFree((void*) m.svh));
+    for (float* p : {x0, x3, y0, y3, r0, r1}) CK(cudaFree(p));
 }
 
 void test_batch(int k2a, int k2c) {
@@ -485,11 +541,43 @@ void test_gemm_rows(int k, int n, int k2, int cb, int rows) {   // (every GPU: b
 }
 
 // the prompt path's expert set: 3 experts (rows 37, 0, 70) through set_gate_up and set_down against the reference
-void test_set(int k2, int cb, int kd = 0) {
+#if defined(STRATA_USE_HIP)
+struct ScalarRowsSetting {
+    bool present;
+    std::string saved;
+    ScalarRowsSetting() {
+        const char* v = std::getenv("STRATA_EXL3_HIP_SCALAR_ROWS");
+        present = v != nullptr;
+        if (v) saved = v;
+        set("0");
+    }
+    static void set(const char* v) {
+#if defined(_WIN32)
+        _putenv_s("STRATA_EXL3_HIP_SCALAR_ROWS", v);
+#else
+        setenv("STRATA_EXL3_HIP_SCALAR_ROWS", v, 1);
+#endif
+    }
+    ~ScalarRowsSetting() {
+        if (present) set(saved.c_str());
+        else {
+#if defined(_WIN32)
+            _putenv_s("STRATA_EXL3_HIP_SCALAR_ROWS", "");
+#else
+            unsetenv("STRATA_EXL3_HIP_SCALAR_ROWS");
+#endif
+        }
+    }
+};
+#endif
+void test_set(int k2, int cb, int kd = 0, int first = 37, int last = 70, int row0 = 0, bool bench = false) {
+#if defined(STRATA_USE_HIP)
+    ScalarRowsSetting scalar_setting; // reference on the unchanged path, even when a caller opted in
+#endif
     if (kd <= 0) kd = k2;   // (every GPU: before sm_80 the portable kernels)
-    const int E = 512, F = 256, T = 64;
+    const int E = bench ? 5120 : 512, F = bench ? 1152 : 256, T = bench ? 2048 : 64;
     const float limit = 1.5f;
-    const int counts[3] = {37, 0, 70};
+    const int counts[3] = {first, 0, last};
     // the set's blobs back to back at a fixed stride, each [gate | up | down], a part [trellis | suh | svh]
     HostMat parts[3][3];
     ex::ExpertLayout lay;
@@ -517,55 +605,116 @@ void test_set(int k2, int cb, int kd = 0) {
         }
     std::vector<float> x = rand_x(T * E);
     // the sorted rows: expert e's rows are tokens (e * 7 + j) % T
-    std::vector<int> bounds = {0}, row_tok;
+    std::vector<int> bounds = {row0}, row_tok;
     for (int e = 0; e < 3; ++e) {
         for (int j = 0; j < counts[e]; ++j) row_tok.push_back((e * 7 + j) % T);
-        bounds.push_back((int) row_tok.size());
+        bounds.push_back(row0 + (int) row_tok.size());
     }
     const int rows = (int) row_tok.size();
     uint8_t* d_blob = dev_copy(blobs);
     float* d_x = dev_copy(x);
     int* d_bounds = dev_copy(bounds);
     int* d_rows = dev_copy(row_tok);
-    uint16_t* d_h = nullptr;
-    float* d_out = nullptr;
-    CK(cudaMalloc(&d_h, (size_t) rows * F * 2));
-    CK(cudaMalloc(&d_out, (size_t) rows * E * 4));
+    uint16_t* h_storage = nullptr;
+    float* y_storage = nullptr;
+    const size_t hbytes = (size_t) rows * F * 2, ybytes = (size_t) rows * E * 4;
+    CK(cudaMalloc(&h_storage, hbytes + 32));
+    CK(cudaMalloc(&y_storage, ybytes + 32));
+    CK(cudaMemset(h_storage, 0xa5, hbytes + 32));
+    CK(cudaMemset(y_storage, 0xa5, ybytes + 32));
+    uint16_t* d_h = h_storage + 8;
+    float* d_out = y_storage + 4;
     ex::SetArgs sa;
     sa.wbase = d_blob;
     sa.stride = stride;
     sa.lay = lay;
     sa.n_exp = 3;
     sa.bounds = d_bounds;
-    sa.row0 = 0;
-    sa.max_rows = 70;
+    sa.row0 = row0;
+    sa.max_rows = std::max(first, last);
     sa.n_embd = E;
     sa.n_ff = F;
     sa.limit = limit;
     ex::set_gate_up(sa, d_x, E, d_rows, d_h, F, 0);
     ex::set_down(sa, d_h, F, d_out, E, 0);
     CK(cudaDeviceSynchronize());
-    std::vector<float> ref((size_t) rows * E);
-    for (int e = 0, r = 0; e < 3; ++e) {
-        std::vector<float> wg((size_t) E * F), wu((size_t) E * F), wd((size_t) F * E);
-        cpu::exl3_inner_k2(parts[e][0].tr.data(), F / 16, E, F, k2, cb, wg.data());
-        cpu::exl3_inner_k2(parts[e][1].tr.data(), F / 16, E, F, k2, cb, wu.data());
-        cpu::exl3_inner_k2(parts[e][2].tr.data(), E / 16, F, E, kd, cb, wd.data());
-        for (int j = 0; j < counts[e]; ++j, ++r) {
-            std::vector<float> gg((size_t) F), uu((size_t) F), hh((size_t) F);
-            const float* xr = x.data() + (size_t) row_tok[(size_t) r] * E;
-            cpu::exl3_mv(wg.data(), parts[e][0].suh.data(), parts[e][0].svh.data(), E, F, xr, gg.data());
-            cpu::exl3_mv(wu.data(), parts[e][1].suh.data(), parts[e][1].svh.data(), E, F, xr, uu.data());
-            for (int i = 0; i < F; ++i) {
-                const float gv = std::min(gg[(size_t) i], limit), uv = std::min(std::max(uu[(size_t) i], -limit), limit);
-                hh[(size_t) i] = f32_from_f16(f16_from_f32(gv / (1.0f + std::exp(-gv)) * uv));   // h is FP16 there
+    if (!bench) {
+        std::vector<float> ref((size_t) rows * E);
+        for (int e = 0, r = 0; e < 3; ++e) {
+            std::vector<float> wg((size_t) E * F), wu((size_t) E * F), wd((size_t) F * E);
+            cpu::exl3_inner_k2(parts[e][0].tr.data(), F / 16, E, F, k2, cb, wg.data());
+            cpu::exl3_inner_k2(parts[e][1].tr.data(), F / 16, E, F, k2, cb, wu.data());
+            cpu::exl3_inner_k2(parts[e][2].tr.data(), E / 16, F, E, kd, cb, wd.data());
+            for (int j = 0; j < counts[e]; ++j, ++r) {
+                std::vector<float> gg((size_t) F), uu((size_t) F), hh((size_t) F);
+                const float* xr = x.data() + (size_t) row_tok[(size_t) r] * E;
+                cpu::exl3_mv(wg.data(), parts[e][0].suh.data(), parts[e][0].svh.data(), E, F, xr, gg.data());
+                cpu::exl3_mv(wu.data(), parts[e][1].suh.data(), parts[e][1].svh.data(), E, F, xr, uu.data());
+                for (int i = 0; i < F; ++i) {
+                    const float gv = std::min(gg[(size_t) i], limit), uv = std::min(std::max(uu[(size_t) i], -limit), limit);
+                    hh[(size_t) i] = f32_from_f16(f16_from_f32(gv / (1.0f + std::exp(-gv)) * uv));   // h is FP16 there
+                }
+                cpu::exl3_mv(wd.data(), parts[e][2].suh.data(), parts[e][2].svh.data(), F, E, hh.data(),
+                             ref.data() + (size_t) r * E);
             }
-            cpu::exl3_mv(wd.data(), parts[e][2].suh.data(), parts[e][2].svh.data(), F, E, hh.data(),
-                         ref.data() + (size_t) r * E);
         }
+        close(("set K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " (3 experts, " + std::to_string(rows) + " rows)").c_str(),
+              host_copy(d_out, ref.size()), ref, 3e-3);
     }
-    close(("set K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " (3 experts, 107 rows)").c_str(),
-          host_copy(d_out, ref.size()), ref, 3e-3);
+#if defined(STRATA_USE_HIP)
+    const auto h8 = host_copy(h_storage, hbytes / 2 + 16);
+    const auto y8 = host_copy(y_storage, ybytes / 4 + 8);
+    for (int i = 0; i < 16; ++i) {
+        const auto* hp = reinterpret_cast<const unsigned char*>(h8.data());
+        const auto* yp = reinterpret_cast<const unsigned char*>(y8.data());
+        if (hp[i] != 0xa5 || hp[hbytes + 16 + i] != 0xa5 || yp[i] != 0xa5 || yp[ybytes + 16 + i] != 0xa5) ++g_fail;
+    }
+    for (const char* value : {"8", "12", "16", "24", "auto", "32", "invalid"}) {
+        ScalarRowsSetting::set(value);
+        CK(cudaMemset(h_storage, 0xa5, hbytes + 32));
+        CK(cudaMemset(y_storage, 0xa5, ybytes + 32));
+        ex::set_gate_up(sa, d_x, E, d_rows, d_h, F, 0);
+        ex::set_down(sa, d_h, F, d_out, E, 0);
+        CK(cudaDeviceSynchronize());
+        const auto hc = host_copy(h_storage, h8.size());
+        const auto yc = host_copy(y_storage, y8.size());
+        const bool exact = hc == h8 && std::memcmp(yc.data(), y8.data(), y8.size() * sizeof(float)) == 0;
+        std::printf("  HIP scalar rows=%s K%s cb%d count=%d/%d row0=%d exact/guards=%d\n",
+                    value, kname3(k2, kd).c_str(), cb, first, last, row0, int(exact));
+        if (!exact) ++g_fail;
+    }
+    if (bench) {
+        const char* modes[] = {"8", "12", "16", "24", "auto"};
+        cudaEvent_t begin{}, end{};
+        CK(cudaEventCreate(&begin)); CK(cudaEventCreate(&end));
+        auto run = [&] {
+            ex::set_gate_up(sa, d_x, E, d_rows, d_h, F, 0);
+            ex::set_down(sa, d_h, F, d_out, E, 0);
+        };
+        for (const char* mode : modes) {
+            ScalarRowsSetting::set(mode);
+            run(); run();
+        }
+        CK(cudaDeviceSynchronize());
+        for (int block = 0; block < 4; ++block)
+            for (int pos = 0; pos < 5; ++pos) {
+                const char* mode = modes[(block % 2 == 0 ? pos + block : 4 - pos + block) % 5];
+                ScalarRowsSetting::set(mode);
+                run();
+                CK(cudaEventRecord(begin, 0));
+                for (int n = 0; n < 8; ++n) run();
+                CK(cudaEventRecord(end, 0)); CK(cudaEventSynchronize(end));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, begin, end));
+                std::printf("HIP_SCALAR_BENCH k2=%d first=%d last=%d mode=%s block=%d ms=%.9g\n",
+                            k2, first, last, mode, block, ms / 8);
+            }
+        CK(cudaEventDestroy(begin)); CK(cudaEventDestroy(end));
+    }
+#endif
+    CK(cudaFree(d_blob)); CK(cudaFree(d_x)); CK(cudaFree(d_bounds)); CK(cudaFree(d_rows));
+    CK(cudaFree(h_storage)); CK(cudaFree(y_storage));
+
 }
 
 // a mixed-precision layer: 3 experts each at its own K for gate / up / down, each in its own allocation
@@ -1070,7 +1219,9 @@ void test_cpu_gemm(int k, int n, int k2) {
     if (!ok) ++g_fail;
 }
 
-const char* cpu_tier_name(int tier) { return tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar"; }
+const char* cpu_tier_name(int tier) {
+    return tier == 3 ? "avx512vnni" : tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar";
+}
 
 // The vector tiers' arithmetic, written out on its own: column c's state at row r is the 16-bit window that ends at
 // bit (p + 1 + 256) K of the tile's MSB-first bit ring (p: the tile's step at (r, c) - row (p/8 % 4) 2 + (p & 1) +
@@ -1130,13 +1281,13 @@ void test_cpu_exact(int k, int n, int k2) {
     for (int i = 0; i < NT; ++i) gp[i] = got.data() + (size_t) i * 128;
     const int S = k / 16;
     const int ranges[3][2] = {{0, S}, {3, S - 1}, {S / 2, S / 2 + 1}};
-    size_t diff[3] = {0, 0, 0}, cmp[3] = {0, 0, 0};
+    size_t diff[4] = {0, 0, 0, 0}, cmp[4] = {0, 0, 0, 0};
     double se = 0.0, sr = 0.0;
     for (int c0 = 0; c0 < n; c0 += 128)
         for (const auto& rg : ranges) {
             for (int i = 0; i < NT; ++i)
                 for (int j = 0; j < 128; ++j) want[(size_t) i * 128 + j] = exact_band_col(m, xp[i], c0 + j, rg[0], rg[1]);
-            for (int tier = 0; tier <= 2; ++tier)
+            for (int tier = 0; tier <= 3; ++tier)
                 for (int nt : {1, 2, 3, 5, 8, 11}) {
                     if (!cpu::exl3_cpu_band_acc_on(tier, m, xp, nt, c0, rg[0], rg[1], gp)) break;
                     for (size_t i = 0; i < (size_t) nt * 128; ++i) {
@@ -1149,7 +1300,7 @@ void test_cpu_exact(int k, int n, int k2) {
                     }
                 }
         }
-    for (int tier = 1; tier <= 2; ++tier) {
+    for (int tier = 1; tier <= 3; ++tier) {
         if (cmp[tier] == 0) continue;
         const std::string what = std::string("cpu exact ") + cpu_tier_name(tier) + " k" + std::to_string(k) + " n" +
                                  std::to_string(n) + " K" + kname(k2);
@@ -1625,9 +1776,14 @@ void bench_moe() {
         cudaEventElapsedTime(&ms, a, b);
         return ms / iters;
     };
-    const int k1[6][3] = {{2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}};
+    int k1[6][3];   // (BENCH_MOE_K2: the uniform set's K2, default 2)
+    {
+        const char* v = std::getenv("BENCH_MOE_K2");
+        const int kk = v != nullptr ? std::atoi(v) : 2;
+        for (auto& r : k1) r[0] = r[1] = r[2] = kk;
+    }
     const int kx[6][3] = {{2, 2, 2}, {2, 2, 2}, {4, 4, 4}, {2, 2, 4}, {6, 6, 6}, {4, 2, 4}};
-    for (const auto* ks : {k1, kx}) {
+    for (const int (*ks)[3] : {(const int (*)[3]) k1, kx}) {
         ex::MixedLayouts mix;
         std::vector<unsigned long long> ptrs;
         std::vector<uint8_t*> blobs;
@@ -1648,8 +1804,15 @@ void bench_moe() {
         }
         ma.mix = mix;
         const float mixed = time(ma);
-        std::printf("  bench %s: one layout %.3f ms, mixed kernels %.3f ms a layer's token\n",
-                    uniform ? "6 experts at K 1" : "6 experts at K 1-3", one, mixed);
+        const std::vector<float> o = host_copy(d_out, (size_t) E);
+        uint64_t hsh = 1469598103934665603ull;
+        for (float v : o) {
+            uint32_t u;
+            std::memcpy(&u, &v, 4);
+            hsh = (hsh ^ u) * 1099511628211ull;
+        }
+        std::printf("  bench %s: one layout %.3f ms, mixed kernels %.3f ms a layer's token  bits %016llx\n",
+                    uniform ? "6 experts at K 1" : "6 experts at K 1-3", one, mixed, (unsigned long long) hsh);
         cudaFree(d_plan);
         for (uint8_t* p : blobs) cudaFree(p);
     }
@@ -1658,7 +1821,76 @@ void bench_moe() {
     cudaFree(d_out);
 }
 
+// --bench-mv: one decode token's dense GEMVs at DeepSeek-V4.1's geometry, 6-bit (K2 12, mul1) as the 3.5 bpw pack's
+// attention and shared expert: us a call, the trellis read rate, and a checksum of the outputs' bits (equal before and
+// after a kernel change that keeps the bits)
+void bench_mv() {
+    struct Shape { const char* name; int k, n, per_tok; };
+    const Shape shapes[] = {{"wq_a", 5120, 1280, 1},   {"wq_b", 1280, 32768, 1}, {"wkv", 5120, 512, 1},
+                            {"wo_a", 4096, 1024, 8},   {"wo_b", 8192, 5120, 1},  {"sh_w1", 5120, 2304, 2},
+                            {"sh_w2", 2304, 5120, 1}};
+    const char* only = std::getenv("BENCH_MV_ONLY");
+    const int k2 = 12, cb = 2, iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
+    double tot_us = 0;
+    for (const Shape& s : shapes) {
+        if (only != nullptr && std::string(only) != s.name) continue;
+        const HostMat h = make_mat(s.k, s.n, k2, cb);
+        uint32_t* d_tr = dev_copy(h.tr);
+        uint16_t* d_suh = dev_copy(h.suh);
+        uint16_t* d_svh = dev_copy(h.svh);
+        ex::Mat m;
+        m.trellis = d_tr;
+        m.suh = d_suh;
+        m.svh = d_svh;
+        m.k = s.k;
+        m.n = s.n;
+        m.k2 = k2;
+        m.cb = cb;
+        const std::vector<float> x = rand_x(s.k, 2.0f);
+        float* d_x = dev_copy(x);
+        float* d_y = nullptr;
+        CK(cudaMalloc(&d_y, (size_t) s.n * sizeof(float)));
+        ex::MvJob j;
+        j.m = &m;
+        j.xf = d_x;
+        j.y = d_y;
+        j.alpha = 1.0f;
+        for (int i = 0; i < 5; ++i) ex::mv(&j, 1, 0);
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+        cudaEventRecord(a, 0);
+        for (int i = 0; i < iters; ++i) ex::mv(&j, 1, 0);
+        cudaEventRecord(b, 0);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        const double us = 1000.0 * ms / iters;
+        const std::vector<float> y = host_copy(d_y, (size_t) s.n);
+        uint64_t hsh = 1469598103934665603ull;
+        for (float v : y) {
+            uint32_t u;
+            std::memcpy(&u, &v, 4);
+            hsh = (hsh ^ u) * 1099511628211ull;
+        }
+        const double bytes = (double) h.tr.size() * 4;
+        std::printf("  bench mv %-6s k%5d n%6d: %7.1f us  %6.0f GB/s  x%d a token  bits %016llx\n", s.name, s.k, s.n,
+                    us, bytes / us / 1e3, s.per_tok, (unsigned long long) hsh);
+        tot_us += us * s.per_tok;
+        cudaFree(d_tr);
+        cudaFree(d_suh);
+        cudaFree(d_svh);
+        cudaFree(d_x);
+        cudaFree(d_y);
+    }
+    std::printf("  bench mv: %.3f ms a layer's token (x40 for the model)\n", tot_us / 1000.0);
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench-mv") {
+        bench_mv();
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         bench_moe();
         return 0;
@@ -1668,6 +1900,39 @@ int main(int argc, char** argv) {
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&p, dev));
     std::printf("exl3_test on %s (%.1f GB)\n", p.name, (double) p.totalGlobalMem / 1e9);
+#if defined(STRATA_USE_HIP)
+    if (argc == 2 && std::string(argv[1]) == "--hip-scalar-bench") {
+        for (int k2 : {6, 8})
+            for (int n : {16, 64, 192, 512}) test_set(k2, 2, 0, n / 2, n, 17, true);
+        std::printf("HIP scalar bench: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
+                    ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--hip-scalar") {
+        for (int k2 = 2; k2 <= 16; k2 += 2)
+            for (int cb = 0; cb <= 2; ++cb) test_set(k2, cb);
+        for (int k2 : {3, 5, 7}) test_set(k2, 2);
+        test_set(6, 2, 8); // distinct gate/up and down formats
+        for (int k2 : {6, 8})
+            for (int n : {1, 7, 8, 11, 12, 15, 16, 23, 24, 31, 32, 47, 48, 127, 128})
+                test_set(k2, 2, 0, n, n + 1, 17);
+        std::printf("HIP scalar test: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
+                    ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
+#endif
+    std::printf("grouped matrix prefill: %s\n", (ex::mma_supported() || ex::prompt_wmma()) ? "enabled" : "disabled");
+    if (argc == 2 && std::string(argv[1]) == "--prefill-only") {
+        for (int k2 = 2; k2 <= 16; k2 += 2)
+            for (int cb = 0; cb <= 2; ++cb) test_set(k2, cb);
+        for (int k2 : {3, 5, 7}) test_set(k2, 2);
+        test_set(7, 2, 10); test_set(5, 2, 8);
+        for (int tail : {1, 15, 16, 17, 31, 32, 33}) test_set(6, 2, 8, 37, tail, 19);   // (row0 19)
+        for (int cb : {0, 1, 2}) test_mixed(cb);
+        std::printf("prefill-only: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok",
+                    g_fail, ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
     std::string fx_dir, expect_dir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1676,7 +1941,7 @@ int main(int argc, char** argv) {
         } else if (a == "--expect" && i + 1 < argc) {
             expect_dir = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: exl3_test [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
+            std::fprintf(stderr, "usage: exl3_test [--prefill-only] [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
             return 2;
         }
     }
@@ -1697,6 +1962,11 @@ int main(int argc, char** argv) {
     test_mv(4096, 1024, 4, 2, false, 384, 256);   // a column view
     test_batch(8, 6);
     test_batch(16, 12);                     // 8-bit attention / shared experts (EXL3-sc_4.10bpw)
+#if defined(STRATA_USE_HIP)
+    for (int k2 = 2; k2 <= 16; k2 += 2)
+        for (int cb = 0; cb < 3; ++cb) test_mv_mixed_columns(k2, cb);
+    for (int k2 : {3, 5, 7}) test_mv_mixed_columns(k2, 2);
+#endif
     // routed experts above 4 bits: EXL3-sc_4.10bpw's first MoE layer is 5-bit
     for (int k2 : {4, 6, 8, 10, 12, 16}) test_moe(k2, 2);
     test_moe(6, 1);

@@ -1,6 +1,6 @@
 /* Project Maya UI - the layout: the shell, the sidebar, the chat (header, messages, the message box, a new chat's
-   greeting), search, and the phone's layout (a chats drawer, floating buttons, sheets).  Settings: settings.css;
-   the Monitor: monitor.css. */
+   greeting), search, and the phone's layout (the chats pushing the page aside, floating buttons, the thinking bar,
+   sheets).  Settings: settings.css; the Monitor: monitor.css. */
 
 #app { height: 100%; }
 .shell { display: flex; height: 100%; min-height: 0; }
@@ -105,6 +105,39 @@
 .saved-pop__prices > div span:last-child { text-align: right; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
 .saved-pop__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .saved-pop__foot .btn { height: 30px; font-size: var(--st-fs-xs); }
+
+/* the phone's Saved: a bottom sheet, its title with a close button, the prices folded */
+.saved-sheet { gap: 0; padding: 8px 0 0; max-height: min(88vh, 88dvh); transition: transform 200ms var(--st-ease); }
+.saved-sheet__grab { flex: none; padding: 0 10px 4px 22px; touch-action: none; }
+.saved-sheet__grab .sheet__grip { display: block; margin: 2px auto 8px; }
+.saved-sheet__title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.saved-sheet__title h2 { margin: 0; font-size: var(--st-fs-base); font-weight: 600; color: var(--st-ink-muted); }
+.saved-sheet__title .icon-btn { width: 44px; height: 44px; }
+.saved-sheet__body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 18px;
+                     padding: 0 22px calc(20px + env(safe-area-inset-bottom)); }
+.saved-sheet .saved-pop__head b { font-size: 40px; }
+.saved-sheet .saved-pop__head > span:last-child { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__start { padding: 12px 14px; }
+.saved-sheet .saved-pop__start > span b { font-size: var(--st-fs-md); }
+.saved-sheet .saved-pop__start > span span { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__start > b { font-size: var(--st-fs-lg); }
+.saved-sheet .saved-pop__h { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__models { gap: 14px; }
+.saved-sheet .saved-pop__model { gap: 12px; }
+.saved-sheet .saved-pop__model > span b { font-size: var(--st-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.saved-sheet .saved-pop__model > span span { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__model > b { font-size: var(--st-fs-md); }
+.saved-pop__how { border-top: 1px solid var(--st-line); }
+.saved-pop__how summary { display: flex; align-items: center; justify-content: space-between; min-height: 48px; list-style: none;
+                          font-size: var(--st-fs-md); font-weight: 500; color: var(--st-ink-soft); cursor: pointer; }
+.saved-pop__how summary::-webkit-details-marker { display: none; }
+.saved-pop__how summary .chev { transform: rotate(-90deg); color: var(--st-ink-muted); }
+.saved-pop__how[open] summary .chev { transform: none; }
+.saved-pop__how .saved-pop__prices { padding: 0 0 4px; border-top: 0; font-size: var(--st-fs-sm); gap: 8px; }
+.saved-pop__how .saved-pop__price { flex-direction: column; gap: 1px; }
+.saved-pop__how .saved-pop__price span:last-child { text-align: left; color: var(--st-ink); }
+.saved-sheet__acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.saved-sheet__acts .btn { height: 44px; }
 .status { display: flex; align-items: center; gap: 6px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .status__dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--st-ink-muted); }
@@ -178,6 +211,15 @@
 .dot-pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--st-ink); animation: pulse 1s ease-in-out infinite; }
 .answer__actions { display: flex; align-items: center; gap: 2px; margin-left: -8px; min-height: 32px; }
 .answer__meta { margin-left: 8px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
+/* the answer's numbers, behind its info button: a line each, below it */
+.answer__pop { position: absolute; z-index: 20; left: 0; top: calc(100% + 6px); width: max-content; max-width: min(320px, 80vw);
+               display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: var(--st-r-md); background: var(--st-surface);
+               box-shadow: var(--st-shadow-soft); font-size: var(--st-fs-sm); color: var(--st-ink-soft); font-variant-numeric: tabular-nums;
+               line-height: 1.45; animation: pop 120ms var(--st-ease); }
+.answer__pop[hidden] { display: none; }
+.thread.has-pop { padding-bottom: 130px; }
+.answer__pop > div:first-child { color: var(--st-ink); font-weight: 600; }
+.answer__actions .icon-btn.is-on { background: var(--st-surface-2); color: var(--st-ink); }
 
 /* an MCP tool call inside an answer */
 .tool { margin: 4px 0; border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface); font-size: var(--st-fs-md); }
@@ -233,34 +275,37 @@
 .edit-bar span { flex: 1; }
 .plus-menu .menu__item[role="menuitemcheckbox"] { align-items: center; }
 
-/* the thinking speedometer's panel: a slider with four stops */
-.think-panel { position: absolute; z-index: 25; right: 48px; bottom: calc(100% + 8px); width: 340px; display: flex; flex-direction: column; gap: 14px;
-               padding: 16px 18px; border-radius: var(--st-r-lg); background: var(--st-surface); box-shadow: var(--st-shadow-pop); animation: popup 140ms var(--st-ease); }
-.think-panel--below { bottom: auto; top: calc(100% + 8px); animation-name: pop; }
-.think-panel__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.think-panel__head b { font-size: var(--st-fs-md); font-weight: 600; }
-.think-panel__head span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); text-align: right; }
-.think-panel__note { margin: 0; padding-top: 12px; border-top: 1px solid var(--st-line); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
-.think-slider { position: relative; height: 52px; margin: 0 22px; }
-.think-slider__track, .think-slider__fill { position: absolute; left: 0; top: 12px; height: 4px; border-radius: 2px; }
-.think-slider__track { right: 0; background: var(--st-surface-3); }
-.think-slider__fill { width: var(--fill); background: var(--st-accent); transition: width 160ms var(--st-ease); }
-.think-slider__stop { position: absolute; top: 0; width: 56px; height: 52px; margin-left: -28px; padding: 0; border: 0; background: transparent;
-                      display: flex; flex-direction: column; align-items: center; gap: 4px; }
-.think-slider__dot { display: block; width: 12px; height: 12px; margin: 8px 0; border-radius: 50%; background: var(--st-line-strong);
-                     transition: all 160ms var(--st-ease); }
-.think-slider__stop.is-on .think-slider__dot { background: var(--st-accent); }
-.think-slider__stop.is-sel .think-slider__dot { width: 22px; height: 22px; margin: 3px 0; box-shadow: 0 0 0 6px var(--st-accent-tint); }
-.think-slider__name { font-size: var(--st-fs-xs); line-height: 1.2; font-weight: 500; color: var(--st-ink-muted); }
-.think-slider__stop.is-sel .think-slider__name { color: var(--st-ink); font-weight: 600; }
-.think-slider__stop:focus-visible { outline: none; }
-.think-slider__stop:focus-visible .think-slider__dot { outline: 2px solid var(--st-focus); outline-offset: 3px; }
 
-/* ---------------------------------------------------------------- a new chat: the greeting, the box, ideas */
+/* ---------------------------------------------------------------- a new chat: the greeting, the model, the box, ideas */
 .greeting { min-height: 100%; width: 100%; max-width: calc(var(--maya-read) + 48px); margin: 0 auto; padding: 24px 24px 12vh;
             display: flex; flex-direction: column; justify-content: center; gap: 28px; }
 .greeting h1 { margin: 0; font-size: var(--st-fs-display); font-weight: 600; letter-spacing: -.015em; line-height: 1.2; text-align: center; }
 .greeting .composer-wrap { gap: 16px; }
+/* the model that answers: ready or busy, its context, the last answer's speed, images, what it saved; Switch model */
+.model-card { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 14px 14px 16px; border: 1px solid var(--st-line);
+              border-radius: var(--st-r-lg); background: var(--st-surface); box-shadow: var(--st-shadow-box); }
+.model-card .model-logo { border-radius: var(--st-r-md); }
+.model-card__text { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.model-card__name { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.model-card__name > b { font-size: var(--st-fs-lg); font-weight: 600; }
+.model-card .pill { height: 24px; padding: 0 9px; gap: 6px; font-size: var(--st-fs-xs); }
+.model-card__facts { display: flex; flex-wrap: wrap; gap: 2px 18px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.model-card__facts b { margin-left: 6px; font-size: var(--st-fs-md); font-weight: 600; color: var(--st-ink); }
+/* a phone: the card one row (a button: the Models page) */
+.model-card--phone { width: 100%; flex-wrap: nowrap; gap: 12px; padding: 10px 12px 10px 10px; color: var(--st-ink); text-align: left; }
+.model-card--phone:active { background: var(--st-surface-2); }
+.model-card--phone .model-card__text { flex: 1 1 auto; gap: 2px; }
+.model-card--phone .model-card__name { flex-wrap: nowrap; gap: 8px; }
+.model-card--phone .model-card__name > b { min-width: 0; color: var(--st-ink); font-size: var(--st-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model-card__state { color: var(--st-ink-soft); }
+.model-card__state > i { display: inline-block; width: 7px; height: 7px; margin: 0 6px 1px 0; border-radius: 50%; background: var(--st-ink-muted); }
+.model-card__state[data-tone="ok"] > i { background: var(--st-ok); }
+.model-card__state[data-tone="accent"] > i { background: var(--st-accent); }
+.model-card__state[data-tone="info"] > i { background: var(--st-info); }
+.model-card__state[data-tone="warn"] > i { background: var(--st-warn); }
+.model-card__state[data-tone="danger"] > i { background: var(--st-danger); }
+.model-card__line { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model-card--phone > .st-icon { flex: none; color: var(--st-ink-muted); }
 .ideas { display: flex; flex-direction: column; gap: 2px; padding: 0 6px; }
 .idea { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 44px; padding: 0 12px; border: 0; border-radius: var(--st-r-md);
         background: transparent; color: var(--st-ink-soft); font-size: var(--st-fs-base); text-align: left; }
@@ -290,31 +335,55 @@
 .search__item--new { font-size: var(--st-fs-md); font-weight: 500; }
 .search__none { margin: 0; padding: 18px 12px; color: var(--st-ink-muted); font-size: var(--st-fs-md); text-align: center; }
 
-/* ---------------------------------------------------------------- a sheet (the phone's thinking levels) */
+/* ---------------------------------------------------------------- a sheet (the phone's Saved) */
 .sheet-scrim { position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-end; background: var(--st-scrim); animation: fade 140ms ease; }
 .sheet { width: 100%; display: flex; flex-direction: column; gap: 6px; padding: 8px 22px calc(24px + env(safe-area-inset-bottom));
          border-radius: var(--st-r-xl) var(--st-r-xl) 0 0; background: var(--st-surface); box-shadow: var(--st-shadow-sheet); animation: slideup 200ms var(--st-ease); }
 @keyframes slideup { from { transform: translateY(100%); } }
 .sheet__grip { align-self: center; width: 36px; height: 4px; margin: 2px 0 12px; border-radius: 2px; background: var(--st-line-strong); }
-.sheet .think-panel__head { flex-direction: column; align-items: flex-start; gap: 2px; padding-bottom: 8px; }
-.sheet .think-panel__head b { font-size: 17px; }
-.sheet .think-panel__head span { text-align: left; }
-.sheet .think-slider { height: 64px; margin: 6px 26px 4px; }
-.sheet .think-slider__track, .sheet .think-slider__fill { top: 14px; }
-.sheet .think-slider__stop { width: 64px; height: 64px; margin-left: -32px; gap: 6px; }
-.sheet .think-slider__dot { margin: 10px 0; }
-.sheet .think-slider__stop.is-sel .think-slider__dot { margin: 5px 0; }
-.sheet .think-slider__name { font-size: var(--st-fs-md); }
-.think-panel__now { margin: 10px 0 0; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-surface-2); font-size: var(--st-fs-md); color: var(--st-ink-soft); }
-.think-panel__now b { color: var(--st-ink); font-weight: 600; }
+/* the thinking level: a thick bar hovering over the chat by the message box, a segment a level, a pill on the one set;
+   a tap, a click or a drag along it sets another.  On a phone it spans the message box; wider, it sits by the chip */
+.think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); padding: 5px;
+             border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill); background: var(--st-glass-bar);
+             box-shadow: var(--st-shadow-float); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%);
+             animation: thinkbar 160ms var(--st-ease); }
+@keyframes thinkbar { from { opacity: 0; transform: translateY(6px); } }
+.think-bar__track { position: relative; display: flex; height: 44px; border-radius: var(--st-r-pill); background: var(--st-surface-3);
+                    overflow: hidden; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; outline: none; }
+.think-bar__track:focus-visible { box-shadow: 0 0 0 2px var(--st-focus); }
+.think-bar__fill { position: absolute; left: var(--at); top: 0; bottom: 0; width: var(--w); border-radius: var(--st-r-pill); background: var(--st-accent);
+                   transition: left 180ms var(--st-ease); }
+.think-bar__seg { position: relative; flex: 1; min-width: 0; display: grid; place-items: center; font-size: var(--st-fs-sm); font-weight: 500;
+                  color: var(--st-ink-muted); white-space: nowrap; transition: color 180ms var(--st-ease); }
+.think-bar__seg.is-sel { color: var(--st-accent-ink); font-weight: 700; }
+.think-bar--many:not(.think-bar--pop) .think-bar__seg { font-size: var(--st-fs-xs); }   /* (MiniMax's seven, on a phone) */
+.think-bar--pop { left: auto; right: 44px; width: min(calc(var(--n) * 84px + 12px), calc(100% - 48px)); }
+.think-bar--below { bottom: auto; top: calc(100% + 10px); animation-name: thinkbar-down; }
+@keyframes thinkbar-down { from { opacity: 0; transform: translateY(-6px); } }
+@media (hover: hover) { .think-bar__seg:not(.is-sel):hover { color: var(--st-ink); } }
 
-/* ---------------------------------------------------------------- the phone: a chats drawer, floating buttons */
-.drawer-scrim { position: fixed; inset: 0; z-index: 45; background: var(--st-scrim); animation: fade 140ms ease; }
-.side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: min(86vw, 330px); border-right: 0;
-                --st-side-glass: color-mix(in srgb, var(--st-side) 84%, transparent);   /* (over the chat: more tint to read) */
-                box-shadow: inset -1px 0 0 var(--st-glass-edge), var(--st-shadow-pop);
-                animation: slidein 200ms var(--st-ease); padding-top: max(10px, env(safe-area-inset-top)); }
-@keyframes slidein { from { transform: translateX(-100%); } }
+/* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
+/* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
+   stays in view, dimmed - a tap there or a swipe to the left closes them.  --push-drag: the finger, while it swipes) */
+.push { --push-w: min(80vw, 320px); --push-drag: 0px; --push-ease: cubic-bezier(.32, .72, 0, 1);
+        position: relative; flex: 1; min-width: 0; height: 100%; overflow: hidden; }
+.push__main { position: absolute; inset: 0; display: flex; background: var(--st-bg); transition: transform 320ms var(--push-ease); }
+/* (the sidebar's glass as it looks on the page, without the blur: only the page is behind it here, and a blur at its edge
+   would pull in the pushed page's) */
+.push > .side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: var(--push-w); padding-top: max(10px, env(safe-area-inset-top));
+                        background: linear-gradient(to bottom, var(--st-glass-sheen), transparent 35%),
+                                    linear-gradient(var(--st-side-glass), var(--st-side-glass)), var(--st-bg);
+                        -webkit-backdrop-filter: none; backdrop-filter: none;
+                        transform: translateX(-100%); visibility: hidden; transition: transform 320ms var(--push-ease), visibility 0s 320ms; }
+.push__dim { position: absolute; z-index: 20; top: 0; bottom: 0; left: 0; width: 100%; padding: 0; border: 0; background: var(--st-push-dim);
+             opacity: 0; pointer-events: none; cursor: default; transition: transform 320ms var(--push-ease), opacity 320ms var(--push-ease); }
+.push.is-open > .side--drawer { transform: translateX(max(-100%, var(--push-drag))); visibility: visible; transition: transform 320ms var(--push-ease); }
+.push.is-open > .push__main, .push.is-open > .push__dim { transform: translateX(calc(var(--push-w) + max(-1 * var(--push-w), var(--push-drag)))); }
+.push.is-open > .push__main { box-shadow: -.5px 0 0 var(--st-line); }
+.push.is-open > .push__dim { opacity: 1; pointer-events: auto; }
+.push.is-open > .side--drawer, .push.is-open > .push__dim { touch-action: pan-y; }
+.push.is-drag > * { transition: none; }
+@media (prefers-reduced-motion: reduce) { .push > * { transition-duration: 0s, 0s; transition-delay: 0s, 0s; } }
 /* (a frosted bar the page scrolls under: the model's name and the buttons stay readable over any text) */
 .chat-head--float { position: absolute; z-index: 10; top: 0; left: 0; right: 0; height: auto; padding: 10px;
                     padding-top: max(10px, env(safe-area-inset-top)); background: var(--st-glass-bar);
@@ -335,8 +404,8 @@
   .think-chip { height: 36px; }
   .send { width: 40px; height: 40px; }
   .composer-note { padding: 8px 0 6px; }
-  .greeting--phone { padding: 24px 16px; gap: 20px; }
-  .greeting--phone h1 { font-size: 24px; }
+  .greeting--phone { padding: 16px; gap: 18px; }
+  .greeting--phone h1 { margin-bottom: 4px; font-size: 22px; }
   .jump { bottom: 130px; }
   .dialog-scrim { padding: 12px; }
   .dialog-scrim--top { padding-top: 12px; }

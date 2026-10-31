@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -197,6 +198,8 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
+    if sys.platform == "darwin":
+        return int(out(["sysctl", "-n", "hw.memsize"]).strip() or 0) / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
@@ -231,9 +234,37 @@ def arm_cpu_arch():
     return ""
 
 
+def cuda_integrated_pci():
+    """{PCI id (as sysfs names it): True if CUDA calls the device integrated (its memory is the system's)} for the
+    NVIDIA GPUs the driver shows (cuDeviceGetAttribute CU_DEVICE_ATTRIBUTE_INTEGRATED, the attribute the engine asks
+    too).  Empty when the driver cannot be asked (Windows, no libcuda, a failing init): the caller falls back."""
+    res = {}
+    if WIN or sys.platform == "darwin":
+        return res
+    try:
+        cu = ctypes.CDLL("libcuda.so.1")
+        if cu.cuInit(0) != 0:
+            return res
+        n = ctypes.c_int(0)
+        if cu.cuDeviceGetCount(ctypes.byref(n)) != 0:
+            return res
+        for i in range(n.value):
+            dev, buf, integrated = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_int(0)
+            if cu.cuDeviceGet(ctypes.byref(dev), i) != 0 or cu.cuDeviceGetPCIBusId(buf, 32, dev) != 0:
+                continue
+            if cu.cuDeviceGetAttribute(ctypes.byref(integrated), 18, dev) != 0:     # 18 = INTEGRATED
+                continue
+            res[_pci_key(buf.value.decode("ascii", "replace"))] = bool(integrated.value)
+    except (OSError, AttributeError, ValueError):
+        return {}
+    return res
+
+
 def unified_memory_pci_ids():
-    """PCI ids (as sysfs names them) of GPUs whose memory is system RAM (Grace/GB10, Jetson): the device has no
-    memory BAR of its own (only a tiny register window), unlike a discrete card's prefetchable BAR."""
+    """PCI ids (as sysfs names them) of the GPUs that might have the system's RAM for memory (Grace/GB10, Jetson): the
+    device has no memory BAR of its own (only a tiny register window), unlike a discrete card's prefetchable BAR.
+    A candidate list only - a discrete card on a PC without Resizable BAR has a 256 MiB BAR1 too (issue #671); gpus()
+    decides with what the driver says."""
     ids = set()
     if WIN:
         return ids
@@ -284,6 +315,8 @@ def cpu_info():
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
+    elif sys.platform == "darwin":
+        name = out(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or name
     else:
         try:
             txt = open("/proc/cpuinfo").read()
@@ -364,14 +397,21 @@ def gpus():
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,pci.bus_id",
              "--format=csv,noheader,nounits"])
     umem = unified_memory_pci_ids()
+    integrated = cuda_integrated_pci() if umem else {}     # (only a card that might be unified needs the question)
     found = []
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv, bus = [x.strip() for x in line.split(",")]
-            unified = _pci_key(bus) in umem
+            key = _pci_key(bus)
             try:
-                vram = float(mem) / 1024.0
+                vram, reported = float(mem) / 1024.0, True
             except ValueError:
+                vram, reported = 0.0, False                # (a unified device: nvidia-smi says "[N/A]" or "Not Supported")
+            # Unified memory: what CUDA says (integrated) when it can be asked, else a card with no big memory BAR
+            # whose memory nvidia-smi cannot report.  A discrete card reports its VRAM - however small its BAR1 is
+            # without Resizable BAR (an RTX A4000 with 256 MiB, issue #671).
+            unified = integrated[key] if key in integrated else (key in umem and not reported)
+            if not reported:
                 vram = ram_gb() if unified else 0.0
             found.append({"index": int(idx), "name": name, "vram_gb": vram, "arch": cc.replace(".", ""),
                           "driver": drv, "pci": bus, "unified_memory": unified})
@@ -478,6 +518,8 @@ def download(url, dst: Path, what=None, headers=None):
         return
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
+        if total and have >= total:                    # killed between the last byte and the rename: no 416 loop
+            break
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
             for k, v in (headers or {}).items():
@@ -502,7 +544,7 @@ def download(url, dst: Path, what=None, headers=None):
             progress()
             if not total or have >= total:
                 break
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:     # IncompleteRead: the connection cut mid-body
             progress()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
@@ -540,12 +582,20 @@ def get_llama_cpp():
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
+    if (llama / ".git").exists():                       # someone's own checkout: never deleted
+        fail(f"{llama} is a git checkout without ggml/CMakeLists.txt or gguf-py",
+             f"check out llama.cpp {LLAMA_CPP_COMMIT[:7]} there, or move the folder away")
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:                          # cut short with no Content-Length: never mark it done
+        z.unlink(missing_ok=True)
+        z.with_name(z.name + ".done").unlink(missing_ok=True)
+        fail(f"{z.name} is damaged (the download was cut short)", "run the setup again: it downloads it anew")
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
@@ -569,7 +619,10 @@ def get_llama_cpp():
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    try:
+        have = json.loads(stamp.read_text()) if stamp.exists() else []
+    except ValueError:                                  # half written (power loss): install again
+        have = []
     need = [p for p in packages if p not in have]
     if not need:
         ok(f"{what} already installed")

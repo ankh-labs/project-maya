@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
     check(pread_par(fd,copy.data()+n/2,n/2,n/2),"second NUMA half");
     void* map=mmap(nullptr,n,PROT_READ,MAP_SHARED,fd,0);check(map!=MAP_FAILED,"map for mincore only");
     std::vector<uint8_t> before(n/p),after(n/p);check(mincore(map,n,before.data())==0,"before mincore");
-    const uint64_t hinted=release_copied_cache(fd,1,n-2);
+    const uint64_t hinted=release_copied_cache(fd, map,1,n-2);
     check(hinted==n-2*p,"only inward-aligned whole pages hinted");
     check(mincore(map,n,after.data())==0,"after mincore");
     // DONTNEED is advisory: a busy filesystem or larger boundary folios can retain pages.
@@ -32,10 +32,10 @@ int main(int argc, char** argv) {
     check(!(before.front()&1)||(after.front()&1),"leading partial page retained");
     check(!(before.back()&1)||(after.back()&1),"trailing partial page retained");
     check(copy==data,"independent RAM copies unchanged after hint");
-    check(release_copied_cache(fd,1,p-2)==0,"partial-page range ignored");
-    check(release_copied_cache(fd,0,0)==0,"zero range ignored");
-    check(release_copied_cache(kBadFd,0,p)==0,"invalid fd rejected");
-    check(release_copied_cache(fd,UINT64_MAX-1,16)==0,"overflow rejected");
+    check(release_copied_cache(fd, map,1,p-2)==0,"partial-page range ignored");
+    check(release_copied_cache(fd, map,0,0)==0,"zero range ignored");
+    check(release_copied_cache(kBadFd, map,0,p)==0,"invalid fd rejected");
+    check(release_copied_cache(fd, map,UINT64_MAX-1,16)==0,"overflow rejected");
     std::vector<uint8_t> staging,direct(n-2,0xFF);
     check(!copy_direct(kBadFd,1,n-2,direct.data(),staging),"missing direct fd requests fallback");
     check(pread_par(fd,direct.data(),n-2,1),"buffered fallback succeeds");
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         check(!copy_direct(dfd,0,0,direct.data(),staging),"direct zero request rejected");
         // The real NVMe fixture separately measures eviction and bypass. tmpfs/CI may ignore O_DIRECT.
     }
-    close_fd(dfd);close(fd);check(release_copied_cache(fd,0,p)==0,"closed fd failure handled");munmap(map,n);
+    close_fd(dfd);close(fd);check(release_copied_cache(fd, map,0,p)==0,"closed fd failure handled");munmap(map,n);
     std::cout<<"PASS: bytes, two halves, range bounds, fallback, direct="<<(direct_ok?"tested":"unavailable")
              <<"; cached interior "<<resident_before<<" -> "<<resident_after<<" (advisory)\n";
 #endif

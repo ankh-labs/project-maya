@@ -5,13 +5,18 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -236,6 +241,15 @@ inline bool pread_full(fd_t f, void* dst, uint64_t n, uint64_t off) {
     return true;
 }
 /// The whole file mapped read-only (nullptr: it could not be).
+#if defined(_WIN32)
+/// fd -> the view map_ro returned for it (advise's Windows branch unlocks through the view; a mapping is per fd here,
+/// and a stale entry can only name a dead or reused view - VirtualUnlock on it fails harmlessly).
+inline std::unordered_map<fd_t, const uint8_t*>& view_of_fd() {
+    static std::unordered_map<fd_t, const uint8_t*> r;
+    return r;
+}
+inline std::mutex& view_mu() { static std::mutex m; return m; }
+#endif
 inline void* map_ro(fd_t f, uint64_t bytes) {
     if (bytes == 0) return nullptr;
 #if defined(_WIN32)
@@ -243,6 +257,10 @@ inline void* map_ro(fd_t f, uint64_t bytes) {
     if (m == nullptr) return nullptr;
     void* v = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(m);   // (the view keeps the mapping)
+    if (v != nullptr) {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        view_of_fd()[(size_t) f] = (const uint8_t*) v;
+    }
     return v;
 #else
     void* p = ::mmap(nullptr, (size_t) bytes, PROT_READ, MAP_SHARED, (int) f, 0);
@@ -253,37 +271,107 @@ inline void unmap(void* p, uint64_t bytes) {
     if (p == nullptr) return;
 #if defined(_WIN32)
     (void) bytes;
+    {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        auto& r = view_of_fd();
+        for (auto it = r.begin(); it != r.end();)
+            it = it->second == p ? r.erase(it) : std::next(it);
+    }
     UnmapViewOfFile(p);
 #else
     ::munmap(p, (size_t) bytes);
 #endif
 }
+/// Demote [p, p + n)'s whole interior pages of this process's working set to the standby list (Windows: VirtualUnlock
+/// on unlocked pages removes them from the working set even though it reports ERROR_NOT_LOCKED - the working set
+/// documentation; a clean file-backed page stays resident and soft-faults back with its contents, so this only makes
+/// it count as available again). Returns the bytes accepted. Interior pages only: an edge page may hold a neighbour's
+/// bytes. Linux has no equivalent for a shared map - its page cache already counts as available.
+inline uint64_t unlock_range(const void* p, uint64_t n) {
+#if defined(_WIN32)
+    if (p == nullptr || n < 4096) return 0;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uint64_t pg = si.dwPageSize ? si.dwPageSize : 4096;
+    const uint64_t a = ((uint64_t) (uintptr_t) p + pg - 1) & ~(pg - 1);
+    const uint64_t b = ((uint64_t) (uintptr_t) p + n) & ~(pg - 1);
+    if (b <= a) return 0;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL unlocked = VirtualUnlock((LPVOID) (uintptr_t) a, (SIZE_T) (b - a));
+    // (NOT_LOCKED is the documented success path for pages this process never locked)
+    return unlocked || GetLastError() == ERROR_NOT_LOCKED ? b - a : 0;
+#else
+    (void) p, (void) n;
+    return 0;
+#endif
+}
+
 /// A hint that [off, off + n) of the file is needed soon (need) or not again soon (!need); nothing where the OS has
-/// no such hint for a file (Windows' page cache reads ahead on its own).
+/// no such hint for a file. Windows' !need, where this process maps the file, demotes the range's interior pages out
+/// of its working set (Linux: the page cache is reclaimable and counts as available, so the hint stays a no-op there).
 inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
 #if defined(_WIN32)
-    (void) f, (void) off, (void) n, (void) need;
+    if (need || f == kBadFd) return;
+    const uint8_t* base = nullptr;
+    {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        const auto it = view_of_fd().find((size_t) f);
+        if (it == view_of_fd().end()) return;
+        base = it->second;
+    }
+    if (off > UINT64_MAX - n) return;
+    (void) unlock_range(base + off, n);
 #else
     posix_fadvise((int) f, (off_t) off, (off_t) n, need ? POSIX_FADV_WILLNEED : POSIX_FADV_DONTNEED);
 #endif
 }
 
+/// This process's resident working-set bytes (the trimmer's measure; 0: it could not be read).
+inline uint64_t working_set_bytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pm{};
+    pm.cb = sizeof pm;
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pm, pm.cb) ? (uint64_t) pm.WorkingSetSize : 0;
+#else
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (f == nullptr) return 0;
+    unsigned long long size = 0, resident = 0;
+    const int got = std::fscanf(f, "%llu %llu", &size, &resident);
+    std::fclose(f);
+    return got == 2 ? resident * 4096ull : 0;
+#endif
+}
+
 /// Release only whole source-file pages after their bytes have been copied to private RAM.
 /// Edge pages may contain another tensor or a concurrent reader's bytes: leave them cached.
-/// Advisory, not a guarantee of eviction (mapped/locked pages can remain). Returns bytes accepted as a hint.
-inline uint64_t release_copied_cache(fd_t f, uint64_t off, uint64_t n) {
+/// Windows trims those pages from this process's working set with VirtualUnlock: clean file-backed contents stay
+/// recoverable by a later fault, unlike MEM_RESET. Linux advises DONTNEED. Returns bytes accepted as a hint;
+/// neither interface promises global cache eviction (another process may still map the pages).
+inline uint64_t release_copied_cache(fd_t f, const void* mapped_base, uint64_t off, uint64_t n) {
 #if defined(_WIN32)
-    (void) f, (void) off, (void) n;
-    return 0;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uint64_t p = si.dwPageSize;
+    if (mapped_base == nullptr) return 0;
 #else
     const long page = sysconf(_SC_PAGESIZE);
-    if (f == kBadFd || page <= 0 || n == 0 || off > UINT64_MAX - n) return 0;
-    const uint64_t p = (uint64_t) page;
+    const uint64_t p = page > 0 ? (uint64_t) page : 0;
+    (void) mapped_base;
+#endif
+    if (f == kBadFd || p == 0 || n == 0 || off > UINT64_MAX - n || off + n > (uint64_t) INT64_MAX - p) return 0;
     const uint64_t rem = off % p;
     const uint64_t skip = rem == 0 ? 0 : p - rem;
     if (skip >= n) return 0;
     const uint64_t begin = off + skip, end = (off + n) / p * p;
     if (end <= begin || end > (uint64_t) INT64_MAX) return 0;
+#if defined(_WIN32)
+    void* address = const_cast<uint8_t*>(static_cast<const uint8_t*>(mapped_base)) + begin;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL unlocked = VirtualUnlock(address, (SIZE_T) (end - begin));
+    const DWORD error = GetLastError();
+    // Microsoft's Working Set documentation: unlocked pages are removed even though the call reports NOT_LOCKED.
+    return unlocked || error == ERROR_NOT_LOCKED ? end - begin : 0;
+#else
     return posix_fadvise((int) f, (off_t) begin, (off_t) (end - begin), POSIX_FADV_DONTNEED) == 0
                ? end - begin : 0;
 #endif
@@ -417,7 +505,14 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
-        syscall(SYS_mbind, m, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0);
+        if (syscall(SYS_mbind, m, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0) != 0) {
+            // (said once: without it the per-node copies land wherever first touch puts them and nothing shows it -
+            //  Docker's default seccomp profile refuses mbind to a container without CAP_SYS_NICE)
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "ds4: mbind to NUMA node %d failed (%s): the RAM copies do not prefer their node "
+                                     "(a container needs SYS_NICE)\n", node, std::strerror(errno));
+        }
     }
     return m;
 #endif
@@ -429,6 +524,54 @@ inline void anon_free(void* p, size_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 #else
     ::munmap(p, bytes);
+#endif
+}
+
+/// The kernel's pool of explicit 2 MB huge pages (reserved by the admin: `sysctl vm.nr_hugepages=N`): the bytes a new
+/// mapping can still take from it (free less already reserved); 0 where there is none or it cannot be read, and on
+/// Windows.  MemAvailable does not count this pool.
+constexpr size_t kHuge2M = (size_t) 2 << 20;
+inline uint64_t huge2m_free() {
+#if defined(_WIN32)
+    return 0;
+#else
+    auto num = [](const char* path) -> uint64_t {
+        std::FILE* f = std::fopen(path, "r");
+        if (f == nullptr) return 0;
+        unsigned long long v = 0;
+        const bool ok = std::fscanf(f, "%llu", &v) == 1;
+        std::fclose(f);
+        return ok ? (uint64_t) v : 0;
+    };
+    const uint64_t fr = num("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"),
+                   rs = num("/sys/kernel/mm/hugepages/hugepages-2048kB/resv_hugepages");
+    return fr > rs ? (fr - rs) * kHuge2M : 0;
+#endif
+}
+
+/// Anonymous memory on explicit 2 MB pages from that pool (MAP_HUGETLB): `bytes` rounded up to whole pages, `*got` the
+/// size mapped (what anon_free takes back), NUMA node `node` of `nodes` preferred as anon_alloc does.  The pages are
+/// reserved at the call, so a mapping it returns does not fault for want of them later; nullptr: the pool cannot hold
+/// it (or Windows).  Unlike a transparent-huge-page arena, a pin (cudaHostRegister) of it keeps its 2 MB pages.
+inline void* huge_alloc(size_t bytes, int node, int nodes, size_t* got) {
+#if defined(_WIN32)
+    (void) bytes, (void) node, (void) nodes, (void) got;
+    return nullptr;
+#else
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+    const size_t hb = (bytes + kHuge2M - 1) / kHuge2M * kHuge2M;
+    void* m = ::mmap(nullptr, hb, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
+                     -1, 0);
+    if (m == MAP_FAILED) return nullptr;
+    if (node >= 0 && nodes > 1) {
+        unsigned long mask[4] = {0, 0, 0, 0};
+        mask[node / 64] = 1ul << (node % 64);
+        syscall(SYS_mbind, m, hb, 1 /* MPOL_PREFERRED */, mask, 256, 0);
+    }
+    if (got != nullptr) *got = hb;
+    return m;
 #endif
 }
 

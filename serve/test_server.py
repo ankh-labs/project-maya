@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -14,6 +15,7 @@ import time
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -80,13 +82,22 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_small_limits_leave_reasoning_and_answer_room(self):
         for api in ("openai", "anthropic", "responses"):
-            for limit in (128, 512, 1024, 2048, 8192):
+            for limit in (128, 512, 1024):
                 with self.subTest(api=api, limit=limit):
                     sampling = self.call(api, limit)
                     budget = sampling["_think_budget"]
                     self.assertGreaterEqual(budget, limit // 2 - 1)
                     # The forced closing marker is an output token too.
                     self.assertLessEqual(budget + 1, limit - limit // 4)
+
+    def test_larger_limits_keep_the_configured_budget(self):
+        # a chat client's max_tokens (Open WebUI's 4096, say) is a cap on the whole output, not a reason to close
+        # the thinking early: only a tiny limit (THINK_TINY_LIMIT or fewer tokens) lowers the budget
+        from serve.server import THINK_TINY_LIMIT
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (THINK_TINY_LIMIT + 1, 2048, 4096, 8192):
+                with self.subTest(api=api, limit=limit):
+                    self.assertEqual(self.call(api, limit)["_think_budget"], 32768)
 
     def test_configured_budget_and_thinking_off(self):
         old = self.svc.think_budget
@@ -497,6 +508,36 @@ class StableToolOrder(unittest.TestCase):
         self.assertIs(stable_tool_order(nameless), nameless)
         self.assertIsNone(stable_tool_order(None))
 
+    def test_deepseek_paths_are_stabilized_too(self):
+        # the DeepSeek converters skipped stable_tool_order, so one swap on the DS4 path (an agent client's
+        # or an MCP hub's tool order) re-rendered the tools at the prompt's head in a new order and the engine
+        # re-read the whole conversation.  Unique names: _TOOL_ORDERS is process-global.
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+
+        def oa(*names):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"type": "function", "function": {"name": n, "parameters": {}}} for n in names]}, deepseek=True)[1]
+
+        def an(*names):
+            return anthropic_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"name": n, "input_schema": {}} for n in names]}, deepseek=True)[1]
+
+        self.assertEqual(self.names(oa("ds_a", "ds_b", "ds_c")), ["ds_a", "ds_b", "ds_c"])   # first sight
+        self.assertEqual(self.names(oa("ds_c", "ds_a", "ds_b")), ["ds_a", "ds_b", "ds_c"])
+        self.assertEqual(self.names(an("ds_b", "ds_c", "ds_a")), ["ds_a", "ds_b", "ds_c"])  # the same set
+
+    def test_deepseek_namespaced_tools_key_on_the_encoding_name(self):
+        from serve.frontend import openai_to_messages
+
+        def oa(*tools):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": list(tools)},
+                                      deepseek=True)[1]
+
+        one = {"type": "function", "namespace": "nsx", "function": {"name": "probe", "parameters": {}}}
+        two = {"type": "function", "function": {"name": "plain", "parameters": {}}}
+        self.assertEqual(self.names(oa(one, two)), ["nsx::probe", "plain"])
+        self.assertEqual(self.names(oa(two, one)), ["nsx::probe", "plain"])
+
 
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
@@ -733,6 +774,7 @@ class PrometheusMetrics(unittest.TestCase):
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
         eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0,
+                    "draft_rounds": 12, "draft_ms": 123.5, "verify_ms": 456.75,
                     "eg_cache_rows": 10, "eg_cache_cap": 100, "eg_cache_row_bytes": 264,
                     "eg_lookup_rows": 20, "eg_lookup_hits": 15, "eg_lookup_reads": 5}
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -752,6 +794,9 @@ class PrometheusMetrics(unittest.TestCase):
             self.assertGreater(int(lines["llamacpp:tokens_predicted_total"]), 0)
             self.assertEqual(lines["llamacpp:requests_deferred"], "0")
             self.assertEqual((lines["maya:engine_tok_s"], lines["maya:engine_vram_hit"]), ("21.5", "0.95"))
+            for key, value in (("draft_rounds", "12"), ("draft_ms", "123.5"), ("verify_ms", "456.75")):
+                self.assertEqual(lines["maya:engine_" + key], value)
+                self.assertIn("# TYPE maya:engine_" + key + " gauge", text)
             self.assertNotIn("maya:engine_promo", lines)          # not a number: left out
             self.assertEqual((lines["maya:engine_eg_cache_rows"], lines["maya:engine_eg_cache_cap"],
                               lines["maya:engine_eg_cache_row_bytes"]), ("10", "100", "264"))
@@ -1465,6 +1510,20 @@ class CorsOptIn(unittest.TestCase):
         code, h, _ = self.call("GET", "/", {"Origin": self.PAGE})
         self.assertIsNone(h.get("Access-Control-Allow-Origin"))
 
+    def test_another_page_cannot_post_without_a_preflight(self):
+        # CSRF: fetch(..., {mode: "no-cors", body: "..."}) sends text/plain and no preflight; its Origin gives it away
+        for origin in ("http://evil.example", "null"):
+            r = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(self.CHAT).encode(),
+                                       headers={"Content-Type": "text/plain", "Origin": origin}, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(r, timeout=30)
+            with cm.exception as e:
+                self.assertEqual(e.code, 403, origin)
+        code, _, _ = self.call("POST", "/v1/chat/completions", None, self.CHAT)   # curl, the SDKs: no Origin
+        self.assertEqual(code, 200)
+        code, _, _ = self.call("DELETE", "/v1/responses/resp_x", {"Origin": "http://evil.example"})
+        self.assertEqual(code, 403)
+
     def test_the_config_value(self):
         self.assertEqual(parse_cors_origins(None), [])
         self.assertEqual(parse_cors_origins([]), [])
@@ -1525,6 +1584,42 @@ class WebApp(unittest.TestCase):
         side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
         self.assertIn("S.health.model_label || modelName(S.health.model)", side)
 
+    def test_text_file_limit_follows_the_context(self):
+        """#635: /health tells the chat page how big a text file the context holds (about 4 bytes a token, 512 KB to
+        16 MB); the page reads it instead of a fixed 512 KB."""
+        from serve.server import text_file_limit
+        self.assertEqual(text_file_limit(32768), 512 * 1024)               # (never less than before)
+        self.assertEqual(text_file_limit(262144), 1024 * 1024)
+        self.assertEqual(text_file_limit(1048576), 4 * 1024 * 1024)
+        self.assertEqual(text_file_limit(10**9), 16 * 1024 * 1024)         # (a sane cap)
+        self.assertEqual(text_file_limit(0), 512 * 1024)
+        health = json.loads(self.get("/health")[2])
+        self.assertEqual(health["max_text_file"], text_file_limit(health["max_context"]))
+        page = (ROOT / "serve/web/chats.js").read_text(encoding="utf-8")
+        self.assertIn("S.health.max_text_file", page)
+        self.assertNotIn("MAX_TEXT_FILE", page)
+
+    def test_home_screen_start_url(self):
+        """The manifest's start_url and scope resolve to the page, not to /web/ (iOS's Add to Home Screen opened a 404);
+        an icon saved with the old /web/ is sent to the page."""
+        code, _, body = self.get("/web/manifest.webmanifest")
+        self.assertEqual(code, 200)
+        man = json.loads(body)
+        base = self.base + "/web/manifest.webmanifest"
+        for key in ("start_url", "scope"):
+            self.assertEqual(urllib.parse.urljoin(base, man[key]), self.base + "/")
+        for path, loc in (("/web/", "../"), ("/web", "./"), ("/web/?q=hi", "../?q=hi")):
+            with self.subTest(path=path):
+                conn = http.client.HTTPConnection(self.base.split("//")[1], timeout=10)
+                conn.request("GET", path)
+                r = conn.getresponse()
+                self.assertEqual((r.status, r.getheader("Location")), (302, loc))
+                conn.close()
+                self.assertEqual(urllib.parse.urljoin(self.base + path, loc).split("?")[0], self.base + "/")
+        code, _, body = self.get("/web/")   # (followed: the page)
+        self.assertEqual(code, 200)
+        self.assertIn(b"\"web/app.js\"", body)
+
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):
@@ -1562,6 +1657,8 @@ class WebApp(unittest.TestCase):
                     self.assertEqual(model["id"], svc.model)
                     self.assertEqual(model["status"]["value"], "loaded")
                     self.assertEqual(model["meta"]["n_ctx"], 262144)
+                    self.assertEqual(model["context_length"], 262144)
+                    self.assertNotIn("max_output_tokens", model)
                     self.assertEqual(model["architecture"]["input_modalities"],
                                      ["text", "image"] if vision else ["text"])
                 code, _, body = self.get("/props?model=" + svc.model + "&autoload=false")
@@ -1824,7 +1921,7 @@ class RequestBodies(unittest.TestCase):
     def raw(self, headers: str, body: bytes = b"") -> tuple[int, dict]:
         """One POST written by hand (headers urllib would not send) -> (status, JSON answer)."""
         import socket
-        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" + headers +
+        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n" + headers +
                 "\r\n").encode()
         with socket.create_connection(("127.0.0.1", self.port), timeout=30) as s:
             s.sendall(head + body)
@@ -2016,6 +2113,102 @@ class IdleUnload(unittest.TestCase):
         self.assertEqual((self.engine.restarts, self.engine.running, self.svc.unloaded), (1, True, False))
 
 
+class ModelManagement(unittest.TestCase):
+    """#678: llama.cpp's /models/load, /models/unload and /models/sse (Open WebUI's Models page), off unless
+    "model_management" is on; #677: /status obeys the API key, and a request while the engine starts gets a 503."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = LifecycleEngine(self.tok, "</think>\n\nok", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def call(self, method, path, body=None, key=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", None if body is None else json.dumps(body).encode(),
+                                     {"Content-Type": "application/json", **({"Authorization": "Bearer " + key} if key else {})},
+                                     method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def first_event(self, key=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", "/models/sse", headers={"Authorization": "Bearer " + key} if key else {})
+            r = conn.getresponse()
+            if r.status != 200:
+                return r.status, None
+            while True:
+                line = r.fp.readline()
+                if line.startswith(b"data:"):
+                    return r.status, json.loads(line[5:])
+        finally:
+            conn.close()
+
+    def test_off_unless_the_config_turns_it_on(self):
+        for method, path in (("POST", "/models/load"), ("POST", "/models/unload"), ("GET", "/models/sse")):
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 404, path)
+        self.assertEqual((self.engine.closes, self.engine.restarts), (0, 0))
+        from serve.server import model_management_setting
+        self.assertFalse(model_management_setting({}, env={}))
+        self.assertTrue(model_management_setting({"model_management": True}, env={}))
+        self.assertFalse(model_management_setting({"model_management": True}, env={"MAYA_MODEL_MANAGEMENT": "0"}))
+        self.assertTrue(model_management_setting({}, env={"MAYA_MODEL_MANAGEMENT": "on"}))
+
+    def test_unload_load_and_the_state_stream(self):
+        self.svc.model_management = True
+        code, out = self.call("POST", "/models/load", {})                      # (already loaded: nothing starts)
+        self.assertEqual((code, out["status"]["value"], self.engine.restarts), (200, "loaded", 0))
+        self.assertEqual(self.call("POST", "/models/load", {"model": "other"})[0], 404)
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
+        code, out = self.call("POST", "/models/unload", {})
+        self.assertEqual((code, out["status"]["value"], self.engine.running, self.svc.unloaded), (200, "unloaded", False, True))
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "unloaded")
+        code, out = self.call("POST", "/models/load", {"model": self.svc.model})
+        self.assertEqual((code, out["status"]["value"], self.engine.restarts, self.engine.running), (200, "loaded", 1, True))
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
+
+    def test_unload_waits_for_a_running_request(self):
+        self.svc.model_management = True
+        self.assertTrue(self.svc.fifo.acquire(blocking=False))      # (a request holds the engine)
+        try:
+            self.assertEqual(self.call("POST", "/models/unload", {})[0], 409)
+        finally:
+            self.svc.fifo.release()
+        self.assertTrue(self.engine.running)
+
+    def test_the_api_key_guards_them_and_status(self):
+        self.svc.model_management = True
+        self.svc.api_key = "secret"
+        for method, path in (("POST", "/models/load"), ("POST", "/models/unload"), ("GET", "/models/sse"), ("GET", "/status")):
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 401, path)
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None, key="wrong")[0], 401, path)
+        self.assertEqual(self.first_event()[0], 401)
+        self.assertEqual(self.engine.closes, 0)
+        code, out = self.call("GET", "/status", key="secret")
+        self.assertEqual(code, 200)
+        self.assertIn("busy", out)
+        self.assertEqual(self.first_event("secret")[0], 200)
+        self.svc.api_key = ""
+        self.assertEqual(self.call("GET", "/status")[0], 200)          # (no key set: open, as before)
+
+    def test_a_request_while_the_engine_starts_gets_a_retryable_503(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+        self.engine.max_context = 0                                     # (a start in progress: no READY yet)
+        code, out = self.call("POST", "/v1/chat/completions", body)
+        self.assertEqual(code, 503)
+        self.assertIn("starting", out["error"]["message"])
+        self.engine.max_context = CTX
+        self.assertEqual(self.call("POST", "/v1/chat/completions", body)[0], 200)
+
+
 class HeldEngine(MockEngine):
     """The first request holds the engine until `release` is set (heartbeats meanwhile); the others answer at once."""
     def __init__(self, *a, **k):
@@ -2053,7 +2246,7 @@ class GoneClients(unittest.TestCase):
         body = json.dumps({"model": "m", "max_tokens": 8, "stream": stream,
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         s = socket.create_connection(("127.0.0.1", self.port))
-        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                   b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         return s
 
@@ -2100,7 +2293,7 @@ class QueuedKeepAlives(GoneClients):
         import socket
         b = json.dumps(body).encode()
         s = socket.create_connection(("127.0.0.1", self.port))
-        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                   b"Content-Length: " + str(len(b)).encode() + b"\r\n\r\n" + b)
         return s
 
@@ -2223,6 +2416,202 @@ for line in sys.stdin:
             self.run_gen(2)
         self.assertLess(time.monotonic() - t0, 5.0)         # (a short wait for a DONE that does not come)
         self.assertEqual(self.run_gen(3), [66, 67])
+
+
+class ThinkTok(ByteTokenizer):
+    SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+
+class BudgetEngine(MockEngine):
+    """Thinks `reasoning` (one id a byte) until the request's think_budget, where it closes the thinking itself as the
+    real engines do; a prompt that ends with the end of the thinking (the server closed it) gets the answer only."""
+
+    def __init__(self, tok, reasoning, answer):
+        super().__init__(tok, answer)
+        self.tok, self.calls = tok, []
+        self.end = tok.encode("</think>", parse_special=True)[0]
+        self.reasoning, self.answer = tok.encode(reasoning), tok.encode(answer) + tok.encode("<|im_end|>",
+                                                                                               parse_special=True)
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        sampling = dict(sampling or {})
+        self.calls.append(sampling)
+        if ids and ids[-1] == self.end:
+            yield from self.answer[:max_new]
+            return
+        budget = sampling.get("_think_budget") or 1 << 30
+        out = self.reasoning[:budget] + ([self.end] if budget < len(self.reasoning) else []) + self.answer
+        for t in out[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ThinkingBudgetAtASentenceEnd(unittest.TestCase):
+    """#613: the thinking budget closed an agent turn's reasoning mid-sentence (in the middle of a formula), and the
+    answer after it was garbled.  Past the budget the reasoning now ends at its first sentence or line end."""
+
+    # sentences of 72 tokens (one a byte; numbered, so no loop for the loop guard): a budget of 100 lands in the second
+    SENT = "".join(f"Roof {i:02d} at its ridge is storyHalf_i+0.3 wide, so the eave sits above it. " for i in range(40))
+
+    def run_one(self, reasoning, budget, max_tokens, tools=None):
+        tok = ThinkTok()
+        engine = BudgetEngine(tok, reasoning, "Done.")
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.think_budget = budget
+        body = {"messages": [{"role": "user", "content": "Plan the roofs."}], "max_tokens": max_tokens,
+                "reasoning_effort": "high"}
+        if tools:
+            body["tools"] = tools
+        from serve.frontend import openai_to_messages
+        from serve.server import openai_chunks, openai_collect
+        msgs, schemas, kw = openai_to_messages(body)
+        ids, thinking, max_new = svc.prepare(msgs, schemas, kw, max_tokens)
+        out = openai_collect(openai_chunks(svc, body, ids, thinking, schemas, max_new, threading.Event()))
+        return out["choices"][0]["message"], engine.calls
+
+    def test_boundary(self):
+        from serve.server import think_boundary
+        for text in ("so the eave sits above it.", "wide.\n", "a line\n", 'he said "go."', "really?", "(see above.)"):
+            self.assertTrue(think_boundary(text), text)
+        for text in ("storyHalf_i+0.", "storyHalf_i+0.3", "and so", "wait...", "x = 3"):
+            self.assertFalse(think_boundary(text), text)
+
+    def test_closed_at_the_end_of_its_sentence(self):
+        msg, calls = self.run_one(self.SENT, 100, 8192, tools=[{"type": "function", "function": {
+            "name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])
+        thought = msg.get("reasoning_content") or ""
+        self.assertEqual(msg.get("content"), "Done.")
+        self.assertTrue(thought.endswith("Roof 01 at its ridge is storyHalf_i+0.3 wide, so the eave sits above it."),
+                        f"closed mid-sentence: {thought[-60:]!r}")
+        self.assertEqual(calls[0]["_think_budget"], 100 + 512)    # (the engine's own close: THINK_GRACE later)
+        self.assertEqual(calls[0]["_think_soft"], 100)
+        self.assertNotIn("_think_budget", calls[-1])              # (the call after the close: no budget left)
+
+    def test_no_sentence_end_closes_at_the_engines_budget(self):
+        words = "".join(random.Random(7).choices(string.ascii_lowercase + "  ", k=2000))   # (no sentence end, no loop)
+        msg, calls = self.run_one(words, 100, 8192)
+        self.assertEqual(len(msg.get("reasoning_content") or ""), 612)   # (the engine's close, as before)
+        self.assertEqual(msg.get("content"), "Done.")
+
+    def test_little_room_after_the_budget_keeps_half_of_it(self):
+        _, calls = self.run_one(self.SENT, 1100, 1301)            # (200 tokens after the budget: 100 of grace)
+        self.assertEqual(calls[0]["_think_budget"], 1100 + 100)
+        _, calls = self.run_one(self.SENT, 1500, 1501)            # (no room: the budget alone, as before)
+        self.assertEqual(calls[0]["_think_budget"], 1500)
+        self.assertNotIn("_think_soft", calls[0])
+
+
+class MalformedToolCallAnswers(unittest.TestCase):
+    """#613: a tool call the parser could not read failed the whole request - 24K tokens of work lost, only an error
+    for the client.  Now it goes on as written: as the answer's text, or (once announced) as an incomplete call."""
+
+    BAD = "write<arg_key>path</arg_key>oops<arg_value>PLAN.md</arg_value>"
+    TOOLS = [{"name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+
+    def test_the_parser_never_raises(self):
+        from serve.frontend import CALL_END, CALL_START, OutputParser
+        for stream in (False, True):
+            p = OutputParser(thinking=False, tools=self.TOOLS, stream_tools=stream)
+            evs = p.feed("Let me write it." + CALL_START + self.BAD + CALL_END + " Then more.") + p.finish()
+            self.assertEqual(p.malformed, [self.BAD])
+            calls = [e for e in evs if e.kind == "tool_call"]
+            text = "".join(e.text for e in evs if e.kind == "content")
+            if stream:                                     # (announced as it streamed: an incomplete call)
+                self.assertEqual([(c.call.name, c.complete) for c in calls], [("write", False)])
+                args = "".join(e.text for e in evs if e.kind == "tool_args")
+                json.loads(args)                           # (its arguments still close as JSON)
+            else:                                          # (never announced: the text as the model wrote it)
+                self.assertEqual(calls, [])
+                self.assertIn(CALL_START + self.BAD + CALL_END, text)
+            self.assertIn("Then more.", text)
+
+    def test_the_request_answers(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>Let me write it.<tool_call>" + self.BAD + "</tool_call>"), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps({
+                "model": "m", "max_tokens": 512, "messages": [{"role": "user", "content": "Write the plan."}],
+                "tools": [{"type": "function", "function": self.TOOLS[0]}]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+                out = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        msg = out["choices"][0]["message"]
+        self.assertNotIn("error", out)
+        self.assertIn("Let me write it.", msg.get("content") or "")
+        self.assertEqual([c["function"]["name"] for c in msg.get("tool_calls") or []], ["write"])
+
+
+@unittest.skipUnless(os.name == "posix", "the fake engine uses a script with a shebang")
+class StatsAfterConsumerStops(unittest.TestCase):
+    """An EOS/budget/cancel closes the token consumer before final STAT and DONE are read."""
+
+    def test_final_stats_are_kept_and_next_request_is_clean(self):
+        import tempfile
+        script = r'''import sys
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if not line.startswith("GEN"):
+        continue
+    print("STAT tok_s=10 cpu_read_proxy=4 rng_begin=0 rng_end=1", flush=True)
+    print("T 66", flush=True)
+    print("STAT tok_s=30 cpu_read_proxy=99 rng_begin=0 rng_end=9", flush=True)
+    print("DONE 1 3 1.0 1.0 stop 0 0 0 0 0", flush=True)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "engine"
+            exe.write_text(f"#!{sys.executable}\n" + script)
+            exe.chmod(0o755)
+            engine = StrataEngine(str(exe), [])
+            try:
+                tokens = engine.generate([1, 2, 3], 16, {}, threading.Event())
+                self.assertEqual(next(tokens), 66)
+                self.assertEqual(engine.stat["tok_s"], 10)
+                tokens.close()  # the frontend found EOS, reached its budget, or was cancelled
+                self.assertEqual(engine.stat["tok_s"], 30)
+                self.assertEqual(engine.stat["cpu_read_proxy"], 99)
+                self.assertEqual(engine.stat["rng_end"], 9)
+                self.assertEqual(engine.last["finish"], "stop")
+                following = engine.generate([1, 2, 4], 16, {}, threading.Event())
+                self.assertEqual([t for t in following if t is not None], [66])
+                self.assertEqual(engine.stat["cpu_read_proxy"], 99)
+            finally:
+                engine.proc.kill()
+                engine.proc.wait()
+
+
+class NoDelayStreaming(unittest.TestCase):
+    """Streamed replies are flush-per-token small frames; without TCP_NODELAY, Nagle + delayed ACK
+    can hold a frame ~40 ms on the LAN to LiteLLM.  _sse (every streaming path goes through it) sets it."""
+
+    def test_sse_sets_tcp_nodelay(self):
+        import socket
+
+        from serve.server import make_handler
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname())
+        conn, _ = listener.accept()
+        try:
+            handler_cls = make_handler(None)
+            handler = handler_cls.__new__(handler_cls)
+            handler.connection = conn
+            handler.send_response = lambda *a, **k: None
+            handler.send_header = lambda *a, **k: None
+            handler.end_headers = lambda *a, **k: None
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
+            handler._sse()
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+        finally:
+            conn.close(), client.close(), listener.close()
 
 
 if __name__ == "__main__":

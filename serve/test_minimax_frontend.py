@@ -92,6 +92,31 @@ class Parser(unittest.TestCase):
             self.assertEqual(calls[0].arguments, want)
             self.assertEqual(json.loads(streamed), want)        # the streamed arguments: the same JSON
 
+    def test_thinking_again_is_reasoning(self):
+        # MiniMax is interleaved: it can think, answer or call a tool, then think again - the second block is
+        # reasoning (reasoning_content for a chat client), never answer text, and no tag leaks out
+        out = ("<mm:think>First thought.</mm:think>Part one.\n\n<mm:think>Second thought.</mm:think>Part two." +
+               "<mm:think>Before the call.</mm:think>" + self.CALL)
+        for seed in range(20):
+            p = OutputParser(thinking=True, tools=TOOLS, stream_tools=True, minimax=True)
+            rng, evs, i = random.Random(seed), [], 0
+            while i < len(out):
+                n = rng.randint(1, 7)
+                evs += p.feed(out[i:i + n])
+                i += n
+            evs += p.finish()
+            kinds = []
+            for e in evs:
+                if e.kind in ("reasoning", "content") and e.text and (not kinds or kinds[-1] != e.kind):
+                    kinds.append(e.kind)
+            self.assertEqual(kinds, ["reasoning", "content", "reasoning", "content", "reasoning"], seed)
+            r = "".join(e.text for e in evs if e.kind == "reasoning")
+            c = "".join(e.text for e in evs if e.kind == "content")
+            self.assertEqual(r, "First thought.Second thought.Before the call.")
+            self.assertEqual(c, "Part one.Part two.")
+            self.assertNotIn("\x00", r + c)
+            self.assertEqual([e.call.name for e in evs if e.kind == "tool_call"], ["get_weather"])
+
     def test_no_thinking(self):
         r, c, calls, _ = events("</mm:think>Just the answer.", seed=1)   # (adaptive: it chose not to think)
         self.assertEqual((r, c.strip(), calls), ("", "Just the answer.", []))

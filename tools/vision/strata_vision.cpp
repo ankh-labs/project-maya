@@ -94,9 +94,11 @@ int main(int argc, char** argv) {
     size_t free0 = 0, total0 = 0;
     if (measure) {
         warm = true;
-        for (size_t i = 0; i < ggml_backend_dev_count() && mdev == nullptr; ++i)
-            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU)
-                mdev = ggml_backend_dev_get(i);
+        // (the GPU the encoder runs on, as mtmd picks it: a discrete one, else an integrated one - an APU such as
+        // Strix Halo is GGML_BACKEND_DEVICE_TYPE_IGPU)
+        for (const auto type : {GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU})
+            for (size_t i = 0; i < ggml_backend_dev_count() && mdev == nullptr; ++i)
+                if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == type) mdev = ggml_backend_dev_get(i);
         if (mdev != nullptr) ggml_backend_dev_memory(mdev, &free0, &total0);
     }
 
