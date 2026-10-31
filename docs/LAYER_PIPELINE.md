@@ -1,7 +1,9 @@
-# Layer pipeline (RxTy) — spec
+# Layer pipeline (RxTy) - spec and implementation status
 
-Status: **spec only, nothing built.** Written against the current tree (`feat/rows-de-fused-pf` @ `84054cc`,
-production config `--parallel 2`, `--prefill 65536`, `kv=q4_0` streaming).
+Status: **BUILT, AND THE ROTATION IS THE DEFAULT DECODE SCHEDULE.** `STRATA_GLM_LAYER_PIPE` unset means 2
+(`glm_memory.hpp:50`), so two concurrent requests run the de-fused rotation unless it is explicitly turned off. This
+document began as a spec; it is now the record of what was built, what was measured, and what was rejected, and the
+increment table below is the authoritative status. Written against `--parallel 2`, `--prefill 65536`, `kv=q4_0` streaming.
 
 ## Notation
 
@@ -92,9 +94,13 @@ Env flag `STRATA_GLM_LAYER_PIPE`, default off, so the existing path stays byte-i
 |---|---|---|
 | 1 | `rows_layers(..., il_from, il_to)` - one layer issued on its own; `multi_rows` drives it per layer behind `STRATA_GLM_LAYER_PIPE` | **done** `cd3ed9f`, bit-identical gate passed (cold boot, greedy, one request) |
 | 2 | `RowsState::RowCursor cur[8]` - the map: per row its layer, stage, lead over the slowest row, done. Seeded in `rows_bind`, advanced as each layer finishes | **done** `d49c2f4`, no arithmetic effect (same 90 tokens as the pre-cursor build) |
-| 3a | **per-channel handshake**: `MoeDev.wait_ch`, `wait_seq[ch]`, `resp[ch]`, `MoeRequest.ch`; the host service answers into the requesting channel's buffer; the rows path gives row *i* channel *i* | **in** (this commit) |
-| 3b | per-row compute streams + per-token events | next |
-| 4 | the rotation scheduler with the VRAM lead bound | after 3b |
+| 3a | **per-channel handshake**: `MoeDev.wait_ch`, `wait_seq[ch]`, `resp[ch]`, `MoeRequest.ch`; the host service answers into the requesting channel's buffer; the rows path gives row *i* channel *i* | **done** |
+| 3b | per-row compute streams + per-token events | **done** - the overlapped arm is arithmetically correct (`acd52d1`): both rows reproduce the `n = 1` tokens |
+| 4 | the rotation scheduler with the VRAM lead bound | **done** - `pipe_lead = 2` (`glm_fast_state.hpp:521`, raised to at least `n-1`); the measured spread is **0..1**, so the second layer of lead is never reached in practice |
+
+**Throughput, measured in boot (paired, warm-up pair discarded): serial 30.5 vs overlap 34.0 tok/s, +11%.** The earlier
+"+8% cross-boot" figure is **superseded and wrong by ~2.3x** - cross-boot numbers on this box are not comparable, which is
+why every arm since is paired inside one boot.
 
 ### 3a - why the handshake had to change first
 

@@ -1,0 +1,78 @@
+{
+  "exe": "<repo>/build/maya.exe",
+  "args": [
+    "--glm-pack",
+    "<pack-dir>",
+    "--max-context",
+    "524288",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "65536",
+    "--kv-streaming",
+    "on",
+    "--expert-profile",
+    "<repo>/data/expert-profile-glm.bin",
+    "--vram-reserve-mib",
+    "512",
+    "--parallel",
+    "2",
+    "--kv",
+    "q4_0"
+  ],
+  "cwd": "<repo>",
+  "tokenizer": "<pack-dir>/tokenizer",
+  "model_name": "glm-5.3-flash",
+  "gpu": [
+    0
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "penalty_last_n": 64
+  },
+  "reasoning_effort": "high",
+  "lib_dirs": [
+    "<CUDA>/bin",
+    "<CUDA>/bin/x64"
+  ],
+  "port": 8080,
+  "log": "<repo>/maya-<name>.log",
+  "installer": {
+    "models_dir": "<models-dir>",
+    "quant": "v3q q4_0 KV (streaming - correct)",
+    "gguf": "<pack-dir>/<model>.gguf",
+    "gguf_dir": "<gguf-dir>",
+    "draft": "mtp",
+    "written": "2026-10-26 20:22",
+    "as_set_up": {
+      "context": 262144,
+      "gpus": [
+        0
+      ],
+      "env": {},
+      "images": false,
+      "reserve_mib": null,
+      "parallel": 1,
+      "draft": "mtp",
+      "expert_cache": null,
+      "prefill": null,
+      "kv_streaming": true,
+      "kv_resident": null
+    }
+  },
+  "env": {
+    "MAYA_GLM_SLOT_KEEP": "1",
+    "MAYA_GLM_SLOT_DIR": "<scratch>/slots",
+    "MAYA_GLM_SLOTS": "20",
+    "MAYA_GLM_SLOT_MIN": "1024",
+    "MAYA_GLM_SLOT_GB": "24",
+    "MAYA_GLM_ROWS_ATTN": "1",
+    "MAYA_GLM_EXPERT_USED": "7"
+  }
+}

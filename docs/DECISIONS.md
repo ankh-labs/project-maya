@@ -46,3 +46,32 @@ time that code runs at all.
 
 **Expectation:** correctness before any throughput number.  This exercises untested code, so the first question is
 whether it loads and produces coherent output, not how fast.
+
+## 2026-10-31 - PRESTAGING: the z-after-y ordering is the design; PRED_PF is a different, weaker mechanism
+
+Two mechanisms are easy to conflate, and the repo only has the weaker one. This is a decision record, not an
+implementation task.
+
+**What exists, gated off** (`STRATA_GLM_ROWS_PRED_PF`, `glm_rows.cu:908-919`): layer L+1's router weight is applied to the
+**current** activation `x` - i.e. *before* L has computed. That is a genuine **prediction**: it can be wrong, and if it is,
+the staged experts are the wrong ones and the miss path runs anyway. Its value therefore depends on a hit rate nobody has
+measured.
+
+**What the schedule in this document specifies** (`LAYER_PIPELINE.md`, the RxTy staging): stage z routes L+1's experts
+**after stage y has executed L**, so the router runs on L's **real output**. The expert set is then **exact** - no
+predictor, no hit rate, and "100% prestaged" holds by construction.
+
+**Decision: the z-after-y ordering is the design. `PRED_PF` is an approximation that the ordering makes unnecessary.**
+It is not a step toward the schedule and should not be read as one; enabling it would answer a different question
+(how good is the predictor) rather than the one the schedule asks (can the next layer be staged exactly).
+
+Consequence for any future work: the ordering is a scheduling change - stage z's router reads L's output - and its
+prerequisite is that L and L+1 can both be in flight for one token, which is the `pipe_lead` / spare-capacity question
+recorded in `LAYER_PIPELINE.md` and measured below. Do not implement it by turning on PRED_PF.
+
+Measured context for the capacity it would need (2026-10-31, the running `--parallel 4` config): VRAM free **1258 MiB of
+48935**; expert pool **~33.5 GB** of the 47.76 GB device; `4104` of `12096` pool slots resident; RAM tier 87.94 GB pinned
+in 10035 slots. Slot stride works out at **~2.8 MB**, and **42** MoE layers (45 layers less `dense_lead = 3`). So raising
+`kSpares` 3 -> 7 would reserve `4 x 42 = 168` more slots, ~**0.47 GB** - which fits inside the 1.23 GB free, but only
+just, and it competes with the 13.2 GB the prompt path borrows. (The earlier "+1.6 GB" figure was wrong twice: it used 45
+layers and an 8.8 MB stride that is the *pinned prefetch buffer*, not a VRAM slot.)
