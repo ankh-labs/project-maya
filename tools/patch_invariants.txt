@@ -1,0 +1,31 @@
+# PATCH INVARIANTS — the expressions this fork depends on, and the counts that prove they survived a replay.
+#
+# WHY THIS EXISTS (2026-10-30): five hunks were silently dropped by the v1.1.40/v1.1.41 replays. Every one compiled.
+# Every one was found by hand, over a day, after the fault had already cost a session. rerere cannot help: it reproduces a
+# wrong resolution faithfully. This file is the mechanical check, so the next upstream merge is "merge, run this, three
+# boots" instead of archaeology.
+#
+# FORMAT:  pattern | file | expected_occurrences | status
+#   status REQUIRED                - count must match exactly; a miss is a dropped hunk
+#   status ACKNOWLEDGED-DIVERGENT  - count must ALSO match exactly; it records a deliberate divergence from cd52717 so
+#                                    that it reads as acknowledged rather than as a failure. A miss is still a failure.
+#
+# RULES: fail closed. A missing file, a malformed line, a non-integer count or a pattern found zero times are failures,
+# never skips. Counts were derived from cd52717 (the tree verified to run 796 clean rotor entries) unless noted.
+
+# --- losses found on 2026-10-30, restored; the ones that must never vanish again ---
+std::min<size_t>(8, F->stage.size()) | src/core/glm_fast_path.cu | 1 | REQUIRED
+if (!rows_layers(rw + r, 1, err, il, il + 1)) | src/core/glm_rows.cu | 1 | REQUIRED
+m.wait_ch = R(i) & 7; | src/core/glm_rows.cu | 1 | REQUIRED
+if (R(i) > 0 && md.cpu_seq != nullptr) | src/core/glm_rows.cu | 1 | REQUIRED
+h.xq = rows_q(S->xq, E, R(i)); | src/core/glm_rows.cu | 1 | REQUIRED
+h.part = per_row_bufs ? nullptr : F->part; | src/core/glm_rows.cu | 1 | REQUIRED
+h.counter = per_row_bufs ? nullptr : F->counter; | src/core/glm_rows.cu | 1 | REQUIRED
+S->hc_part_n = (4 * E / 512) * 26 + 64; | src/core/glm_rows.cu | 1 | REQUIRED
+
+# --- added after cd52717 by this fork; the rotor's BF16 fallback must stay conditioned on it ---
+rotor_will_run | src/core/glm_rows.cu | 2 | REQUIRED
+
+# --- acknowledged divergences: deliberately NOT what cd52717 had. Expected counts are for the CURRENT tree. ---
+A single sequential read reached only | src/core/glm_fast_path.cu | 0 | ACKNOWLEDGED-DIVERGENT
+s_qa[tid ^ stride] | src/kernels/cuda/glm_fast.cu | 0 | ACKNOWLEDGED-DIVERGENT
