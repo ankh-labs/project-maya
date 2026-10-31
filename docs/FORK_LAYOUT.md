@@ -110,7 +110,16 @@ instrument.
 3. Run the invariant checker. It must pass.
 4. Three boots at `n=2`, rotor entry count and tok/s read from the log. No single-run
    cross-build comparison: this failure is a Heisenbug (see `LAYER_PIPELINE.md`).
-5. Only then tag and deploy.
+5. Only then tag and deploy. **A Maya deploy is NOT the llama.cpp lab's deploy** (verified
+   2026-10-31, and the mistake was made once): there is **no `maya` NSSM service**
+   (`sc query maya` → 1060); the only service on the box is `llama-server8080`, which runs the
+   **llama.cpp** fork's binary. `config_drift.py` lives in `G:\AI\llama-server\tools\` and is
+   **that** lab's checker — Maya has none. So a Maya deploy is: build, the config `.json`
+   (keeping `MAYA_GLM_EXPERT_USED=7`), a `deployed/<version>-<date>` tag on the exact commit
+   that was built (not on a later docs commit), and the docs plus the regenerated export.
+   **Do not restart `llama-server8080` for a Maya change, and do not run the llama.cpp drift
+   checker.** Carry deploy rules across projects only after checking they apply — that is the
+   same failure as inferring repo structure without running the inventory command.
 
 ## 2026-10-30 (late) — v1.1.42 merged onto the verified-good tree: a working n=2 rotor
 

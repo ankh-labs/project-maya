@@ -718,3 +718,21 @@ concurrent load are the shape that would surface the stall class, and none appea
 Gate status: the rotation is ON by default - `layer_pipe_mode()` defaults to 2 and the live config carries
 `MAYA_GLM_ROWS_ATTN=1` - and a boot with zero shell keys engages it and stays clean.  The per-row-DSA-everywhere change
 stays parked (22 MB of the rows' 31 MB, changes the attention shape, needs its own measurement).
+
+## 2026-10-30 (late) — EXCLUSION: ring publication is not the fault
+
+Instrument (`a139767`): the host records the channel it published per seq in `exp_ch[seq % kRingSize]`; the consume
+compares `rq->ch` against it and every step-failure message then states either the mismatch count with the first one's
+seq/slot/got/want, or **"ring entries consistent with the host's record"**. Counter plus one dump, no hot-path print.
+
+**Result: zero mismatches** — one boot with the rotor engaged (6 entries) and a verdict line, the other two boots of that
+arm contributing nothing (one did not come up, one never engaged the rotor).
+
+So, read with the n = 1 caveat that applies to every single boot in this file: the entry the service consumes **is the one
+published for that seq**. That retires the leading suspect of two days — that the `ch = 4` consume and the wedge came from
+a slot/entry disagreement (a late or lost publish, or a slot overwritten with another row's entry). The `ch = 4` consume
+and the fully-accounted wedge are therefore **downstream of the read**, and the next instrument must look at what happens
+to a request *after* the service has read it correctly.
+
+Not closed under the three-boot rule, and re-running needs a tree where the fault reproduces: the v1.1.42 merge
+(`f383c28`) is clean 3/3, so `ch = 4` no longer appears there without an extra condition.
