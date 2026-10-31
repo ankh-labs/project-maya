@@ -2,8 +2,8 @@
 #
 # WHY THIS EXISTS (2026-10-30): five hunks were silently dropped by the v1.1.40/v1.1.41 replays. Every one compiled.
 # Every one was found by hand, over a day, after the fault had already cost a session. rerere cannot help: it reproduces a
-# wrong resolution faithfully. This file is the mechanical check, so the next upstream merge is "merge, run this, three
-# boots" instead of archaeology.
+# wrong resolution faithfully, and forward recordings reinstate the newer side when replaying backwards. This file is the
+# mechanical check, so the next upstream merge is "merge, run this, three boots" instead of archaeology.
 #
 # FORMAT:  pattern | file | expected_occurrences | status
 #   status REQUIRED                - count must match exactly; a miss is a dropped hunk
@@ -12,6 +12,11 @@
 #
 # RULES: fail closed. A missing file, a malformed line, a non-integer count or a pattern found zero times are failures,
 # never skips. Counts were derived from cd52717 (the tree verified to run 796 clean rotor entries) unless noted.
+#
+# PROVENANCE, verified against maya-patches/reference/ALL-our-changes-vs-upstream-base.diff (the authoritative
+# e16dec85a..cd52717 export): every entry below except one traces to a hunk there, as an added or a removed line. The
+# exception is marked POST-BASE with the commit that introduced it - it is a new invariant of our own, not a restoration.
+# If an entry is neither in the export nor marked POST-BASE, it does not belong in this file.
 
 # --- losses found on 2026-10-30, restored; the ones that must never vanish again ---
 std::min<size_t>(8, F->stage.size()) | src/core/glm_fast_path.cu | 1 | REQUIRED
@@ -23,7 +28,9 @@ h.part = per_row_bufs ? nullptr : F->part; | src/core/glm_rows.cu | 1 | REQUIRED
 h.counter = per_row_bufs ? nullptr : F->counter; | src/core/glm_rows.cu | 1 | REQUIRED
 S->hc_part_n = (4 * E / 512) * 26 + 64; | src/core/glm_rows.cu | 1 | REQUIRED
 
-# --- added after cd52717 by this fork; the rotor's BF16 fallback must stay conditioned on it ---
+# --- POST-BASE: not in the export, introduced by 8ae4b91. The rotor's BF16 fallback must stay conditioned on this, or the
+# fallback pre-empts the rotation and n = 2 measures the fallback instead. Needed on any tree whose loader keeps BF16
+# tensors out of ws_map_ - which 50a3313 made true, so it applies to v1.1.42.
 rotor_will_run | src/core/glm_rows.cu | 2 | REQUIRED
 
 # --- acknowledged divergences: deliberately NOT what cd52717 had. Expected counts are for the CURRENT tree. ---
