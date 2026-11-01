@@ -467,3 +467,22 @@ its OLD boot (33.37) matches this run's (33.41) to 0.04 tok/s.
 
 **Plan shape at n=4:** the win grows with concurrency (+6.8% at n=1, +11.8% at n=2, +23.9% steady at
 n=4) and the run-1 cold cost shrinks (-21.9%, then -3.6%).
+
+## 2026-11-01 - PRE-REGISTERED (before the back-off data): three-way reading, and a silent detector BLOCKS adoption
+
+The planner now sends **every** non-resident expert to the CPU lane. We already measured that the lane
+degrades under contention (`cpu_threads` 32 vs 16 = **-12.84 tok/s**). So if the lane degrades and the
+detector cannot see it, there is **no safety net at all** - which makes a silent detector a deployment
+blocker, not a failed checkbox.
+
+**The three-way reading, fixed now:**
+- **retreat and recovery both observed** -> gate **PASS**, proceed to restart persistence.
+- **retreat without recovery** -> **FAIL**: one-way back-off, a blocker.
+- **retime never fires** -> **FAIL**: the detector is too coarse (its trigger is a >15% drift sustained
+  over two 2,000-expert windows, capped at 3 changes), a blocker. **Do not deploy, do not re-tag, do not
+  repoint the config - report and stop.** The fix would be a detector that sees **per-expert cost**
+  rather than a windowed average: a design change, not a tuning one.
+
+Arm verification is part of the gate, not a preliminary: a **request-level `cpu_threads=32`** (never
+`STRATA_GLM_CPU_LANE_MAX`, which only sizes the pool), and `active()` read from the engine log
+(`CPU lane active threads N`) **before any timing is read**.
