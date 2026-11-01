@@ -447,3 +447,23 @@ mattering.
   arm using it measures the 16-thread plan under a 32-thread label;
 - **verify `active()` from the log before timing anything**, and exercise **recovery as well as
   retreat** - a back-off that engages and never releases passes a one-way test.
+
+## 2026-11-01 - GATE TABLE for `d098fa7` (lane_plan wave count) - COMMITTED, NOT ADOPTED
+
+| gate | result | statistic | binary |
+|---|---|---|---|
+| quality (planner vs frozen old plan) | **PASS** - tie, KLD(good) 0.152 +-0.005, top-1 **untested** (no argmax in the dump); dumps **bit-identical** to the `pcie_frac=0` arm | paired block/doc-cluster/sign tests | uninstrumented |
+| n=2 | **PASS** +11.8% (per-pair +3.56/+3.94; OLD boots 31.80/31.81, 0.03% apart) | steady, paired **ABBA**, 5 runs/boot | uninstrumented |
+| n=1 | **MEASURED** steady **+6.8%**, run 1 **-21.9%** | steady = last 3 of 8; unpaired with a **drift bound**: boot-mean spread 0.35-0.61 vs 2xSE 1.74-3.13 | uninstrumented |
+| n=4 | **PASS** steady **+23.9%**, full mean **+17.7%**; run 1 -3.6% | steady = runs 6-8, paired **ABBA**; VALID: OLD spread 0.337 <= 2xSE 0.763, per-pair +7.57/+8.42 same sign | uninstrumented (clean rebuild) |
+| residency / cold-cost cause | **CLOSED - UNEXPLAINED** (occupancy flat, promotions **zero** -> excluded by mechanism) | 8 serial runs, two boots | **instrumented** (tier line) |
+| back-off (request-level `cpu_threads=32`, retreat AND recovery) | **OUTSTANDING** | | |
+| restart persistence (throughput across two boots) | **OUTSTANDING** | | |
+
+**Statistics are not interchangeable and must be quoted with their names.** n=2's +11.8% is a
+5-run-mean ABBA; n=1 and n=4 are steady-state (last 3 of 8). n=4's **full 8-run mean is +17.7%**,
+which reproduces the earlier voided run's +17.9% - the two agree once the same statistic is used, and
+its OLD boot (33.37) matches this run's (33.41) to 0.04 tok/s.
+
+**Plan shape at n=4:** the win grows with concurrency (+6.8% at n=1, +11.8% at n=2, +23.9% steady at
+n=4) and the run-1 cold cost shrinks (-21.9%, then -3.6%).
