@@ -773,3 +773,28 @@ conclude the old path is acceptable. It is not - Group A has the retreat line to
 **And the saturation question is UNOPENED, not revived and not refuted.** With zero probes, `ratio` and
 `want` were never computed; hypotheses 2 (detector reference) and 3 (wave economics absorb degradation)
 are **untested**. No conclusion follows about whether a cost trigger can work for the decode lane.
+
+## 2026-11-01 - BACK-OFF: the DETECTOR works and the TRIGGER cannot fire (measured, not inferred)
+
+One boot, `RETIME_V2=1`, request-level `cpu_threads=32`, whole log copied before any restart.
+
+1. **`active()` = 32** - the arm ran (three `CPU lane active threads 32` lines).
+2. **`ratio` crosses the threshold**: 1.10 -> 1.14 -> 1.20 -> 1.21 -> 1.29 -> 1.31, `dir` +1 from 1.20.
+   **The detector sees the degradation; the boot c_ms reference is not wrong.**
+3. **`want == current` at every sample** (`0 1 2 3 4 5 6 7 8`), with `margin` 1.32 -> 1.13 and
+   `cpu_term` 0.428 -> 0.501 against `pcie 0.567`.
+
+**The wave economics absorb it.** A lane degraded from 0.352 to 0.501 ms/expert - **+43% per-expert
+price** for a **-34% throughput** loss - still prices BELOW `p_ms`, so the planner's own objective says
+all-CPU at every sample. **A cost-based trigger cannot fire for the decode lane while that holds, however
+well the detector is built.**
+
+**What this establishes:** the signal that sees this failure is NOT price. 32 threads on 16 cores costs a
+third of the throughput while moving the per-expert price 43% and leaving it under the staging cost - so
+by construction the planner is blind to it. This is the first evidence that a safety net must be built on
+**saturation** (wait, queue depth, throughput), not on `c_ms`.
+
+**Consequences:** `RETIME_V2` cannot be completed as a cost-triggered controller - its detector works, its
+trigger is structurally unable to fire on the failure we care about. **The back-off gate remains FAILED and
+adoption remains blocked**, on a demonstrated signal/failure mismatch rather than a missing measurement.
+No new controller is designed until these numbers have been reviewed.
