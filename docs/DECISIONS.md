@@ -798,3 +798,39 @@ by construction the planner is blind to it. This is the first evidence that a sa
 trigger is structurally unable to fire on the failure we care about. **The back-off gate remains FAILED and
 adoption remains blocked**, on a demonstrated signal/failure mismatch rather than a missing measurement.
 No new controller is designed until these numbers have been reviewed.
+
+## 2026-11-01 - ADOPTION RECOMMENDATION: boot plan all-CPU with `STRATA_GLM_CPU_RETIME=0`
+
+**The recommendation:** ship the committed planner (`d098fa7`) with the **all-CPU boot plan** and
+**`STRATA_GLM_CPU_RETIME=0`**. Quality-gated; **+6.8 / +11.8 / +23.9% at n=1/2/4 steady**. The n=4 arm is
+a **deployment smoke test, not a safety gate** (see below). No retime work, no `RETIME_V2`
+dependency, no saturation controller.
+
+**Why retime is disabled - and the reasoning matters more than the conclusion.** Retime is **not** "pure
+downside". If the CPU genuinely degrades, retreating toward staging **is the correct response** - if the
+CPU really is slower, more PCIe staging is what the cost model should choose. **The defect is that a
+retreat is UNRECOVERABLE**: it fires on a condition that is usually transient and can never come back when
+the transient passes. So the controller's only upside requires recovery, which it does not have.
+
+**The accepted risk, stated explicitly:** with retime disabled, **the box keeps the all-CPU plan even if
+the CPU genuinely degrades.** Judged acceptable here, for three reasons:
+1. a competing workload on this box is visible and transient, and standing policy is that no CPU work runs
+   during measurement anyway;
+2. an unrecoverable retreat would outlast the transient that caused it, so the enabled controller is
+   **worse than the disabled one even in its own best case**;
+3. it is a lab box - a degraded-CPU window costs throughput, not correctness.
+
+**REOPEN CONDITION: if recovery is ever built, this decision must be revisited.** The controller becomes
+worth enabling exactly when a retreat can be undone.
+
+**Reachability, which is what settled it:** the old controller's window measures `cpu_us / cpu_experts` -
+one expert on one thread - while `t_eff` enters only the planner's `waves = ceil(kk / t_eff)`. So
+concurrency changes the plan's arithmetic, not the measured price: `ms` stays ~0.35 at n=4. A retreat
+therefore needs genuine per-expert lane degradation, which needs oversubscription (32 on 16), which needs
+two deliberate overrides (`STRATA_GLM_CPU_LANE_MAX` to size the pool **and** a request's `cpu_threads`,
+since `set_active` clamps to pool size and the pool's single `active_` is REPLACED, never summed).
+Corroboration: n=4 showed the largest win and no retreat line, and a retreat would have shrunk it.
+
+**Carried forward, unexplained, and it must be seen beside the wins:** the **replicated -21.9% n=1 cold-run
+cost** (steady +6.8%), reproduced across four boots, with host-side warming as the named but never
+confirmed candidate. That is a real cost on the first request after a boot.
