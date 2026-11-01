@@ -729,3 +729,25 @@ prefill vs decode on our workload; that is the coefficient the phase split rests
 inequality flips. (3) the phase-dependent plan (all-CPU decode, stage prefill), flag-gated. (4) the
 trace replay ONLY if 1-3 leave a placement question open - its question is "does a phase-split plan beat
 a uniform one", not "which eviction policy wins"; Belady remains the right bound if we get there.
+
+## 2026-11-01 - PREFILL IS OUT OF SCOPE: the residency term is SHELVED, trace/Belady cancelled
+
+**Direction: no prefill work.** Items 2 and 3 (measure `s` by phase, phase-dependent plan) are
+**CANCELLED** - no `s` measurement, no phase signal, no kernel/args change. Do not pick it back up.
+
+**Consequence:** the residency-value term loses its only remaining justification. Fiddler's model says
+CPU for decode, so staging was only ever going to pay at prefill `s`; with prefill out of scope there is
+no live question for `R_est` to answer. It stays **flag-gated and DORMANT** (`STRATA_GLM_RESIDENCY_VALUE`,
+off by default), not removed - `R_est 9.28`, the selection-bias caveat and the missing displacement term
+stay recorded as a closed line. **The trace replay and Belady bound are CANCELLED, not deferred.**
+
+**Closed line, kept for the record:** the flip point falls out of measured constants -
+`cpu_lat(s) = 0.350·s` vs `p_ms + g_ms = 0.567 + 0.43 = 0.997`, so **s >= 3 flips to staging**, and decode
+(s=1) is CPU on the paper's own inequality. That is *why* all-CPU fell out of the units fix and why the
+decode win was never in tension with the literature. It is also why the term had nothing left to decide
+once prefill was cancelled.
+
+**What remains is adoption.** The planner at `d098fa7` is worth +6.8 / +11.8 / +23.9 at n=1/2/4 steady and
+is quality-gated; what is idle is two gates: (1) the two decode-side retime defects, (2) the back-off gate
+with `RETIME_V2=1`, (3) restart persistence. **RETIME_V2=on is non-negotiable at adoption** - shipping
+all-CPU with the old controller is the no-safety-net condition.
