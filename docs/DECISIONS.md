@@ -521,3 +521,30 @@ under contention - and contention is measured, not hypothetical (-12.84 tok/s at
 windowed average, a retreat that does not overwrite the start plan, and a recovery path that is not
 capped by a global window budget. That is item 3 territory (the residency-value term), and it is now
 also the prerequisite for adoption.
+
+## 2026-11-01 - THE LANE'S ADAPTATION IS BOOT-SCOPED, BY CONSTRUCTION (standalone finding)
+
+`lane_retime` is **not** an adaptive controller. Its budget is `rt_windows >= 8` with `rt_changes >= 3`,
+and a 96-token request consumes **~3 windows** (~63 lane experts/token x 96 / 2,000). So the window
+budget is exhausted **within roughly three requests of a boot**, after which retime is permanently
+inert for the life of the process.
+
+Combined with `cpu_plan_start = plan`, the failure mode is worse than one-way: **the first contention
+event during a boot's first three requests sets a ~30% downgrade as the permanent baseline, and nothing
+can undo it.** A transient at the wrong moment is a permanent penalty.
+
+**This invalidates any claim - past or future - that the lane "adapts" at runtime.** It applies beyond
+the back-off gate: any design that assumes a self-correcting lane/split is assuming something the code
+does not do.
+
+**Harness defect found while checking this, recorded deliberately:** the measurement scripts delete the
+config log at every boot, so **cross-boot evidence is destroyed** - the four n=1 residency boots cannot
+be interrogated afterwards. Keep per-boot logs (an offset or a unique name) in any harness that will be
+asked a question later.
+
+**The check that could not be run, and the inference that replaces it:** whether a retime fired during
+the n=1 residency boots (which would make plan drift a candidate for the cold-start ramp). Those logs
+are gone. Inference from throughput: a retimed plan measures ~26.66 tok/s against ~38 for all-CPU, and
+the n=1 boots sustained **44.2-44.6 tok/s steady** - the best figures observed on this plan. A drift
+worth ~30% is incompatible with that, so **plan drift is very unlikely to explain the ramp**, and
+host-side warming stands as the sole candidate. Inferred, not grepped.
