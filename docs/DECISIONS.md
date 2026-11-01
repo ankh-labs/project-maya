@@ -486,3 +486,38 @@ blocker, not a failed checkbox.
 Arm verification is part of the gate, not a preliminary: a **request-level `cpu_threads=32`** (never
 `STRATA_GLM_CPU_LANE_MAX`, which only sizes the pool), and `active()` read from the engine log
 (`CPU lane active threads N`) **before any timing is read**.
+
+## 2026-11-01 - BACK-OFF GATE: **FAIL (retreat without recovery) - ADOPTION BLOCKED**
+
+Measured (instrumented build, one boot, `active()` read from the log before any timing):
+
+```
+arm verified: request-level cpu_threads=32 -> "CPU lane active threads 32"   OK
+setup plan:   0 1 2 3 4 5 6 7 8   (all-CPU)
+phase A 32 threads: 20.14 24.60 21.46 23.17 21.84 22.15   mean 22.23 tok/s
+phase B 16 threads: 27.03 27.80 26.26 25.30 26.45 27.13   mean 26.66 tok/s
+retimes: 1
+  "an expert 0.561 ms (planned with 0.427) -> of 0..8: 0 0 1 2 3 4 5 6 7  (PCIe share 0.34)"
+active() at end: 16
+```
+
+**Observed: retreat, and no recovery.** The plan moved off all-CPU once the lane measured
+0.561 ms/expert against a planned 0.427, and never moved back after `active()` returned to 16.
+
+**The cost is visible, not inferred:** phase B ran at **26.66 tok/s** on the retreated plan, against
+~38 tok/s for all-CPU at n=2 on this box. The one-way retreat is a **~30% permanent downgrade**.
+
+**Mechanism (leading, from the code plus the window arithmetic):** `lane_retime` stops for good once
+`rt_windows >= 8`, and a 96-token request consumes roughly three 2,000-expert windows (~63 lane
+experts/token), so the budget is spent within about **three requests**. It also sets
+`cpu_plan_start = plan`, so the retreat becomes the new baseline rather than a provisional state. A
+later recovery therefore cannot fire even when the conditions that caused the retreat have gone.
+
+**Consequence, exactly as pre-registered: do NOT deploy, do NOT re-tag, do NOT repoint the config.**
+All-CPU is the plan for every non-resident expert, so with a one-way detector there is no safety net
+under contention - and contention is measured, not hypothetical (-12.84 tok/s at 32 threads).
+
+**The fix is a design change, not a tuning one:** a detector on **per-expert cost** rather than a
+windowed average, a retreat that does not overwrite the start plan, and a recovery path that is not
+capped by a global window budget. That is item 3 territory (the residency-value term), and it is now
+also the prerequisite for adoption.
