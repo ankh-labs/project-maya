@@ -696,3 +696,36 @@ configuration we have never measured, whose nearest neighbour measured *worse*.
 3. **Re-measure `R` under a plan that stages a REPRESENTATIVE sample, not only deep routes** - the whole
    term rests on that number.
 4. **Add the displacement/eviction term**, then re-run the four checks.
+
+## 2026-11-01 - CORRECTION TO THE BRIEF: online replacement was the WRONG FAMILY (do not follow it by default)
+
+An earlier instruction in this file sent the next reader to **ARC / LIRS / W-TinyLFU / GDSF** as the
+policy family. **Fiddler says the dominant lever is offline POPULARITY PLACEMENT plus a per-expert
+RUNTIME rule, with no online eviction policy at all.** Online replacement is the wrong shelf for this
+problem; the ARC/LIRS/W-TinyLFU list is **dropped** unless a trace later says otherwise.
+
+Fiddler's actual design (read 2026-11-01, arXiv 2402.07033):
+- placement: the most POPULAR experts, by offline profiling, pinned in GPU up to capacity; the rest in
+  CPU memory - its two environments hold 56/256 and 125/256 experts on GPU (22-49% resident);
+- runtime, per expert: if resident -> GPU; else if `cpu_lat(s) > gpu_lat(s) + transfer_lat()` ->
+  transfer and run on GPU; else -> copy the ACTIVATION to the CPU and run there;
+- measured shape: GPU exec ~constant in s, CPU exec ~LINEAR in s, activation copy <1%, weight transfer
+  2-5x the GPU compute time.
+
+**THE CONSEQUENCE THAT MATTERS HERE:** at small s (decode) the inequality is FALSE, so the paper's own
+model chooses CPU - our all-CPU decode result (+23.9% at n=4) is what the model predicts, not an
+anomaly. At large s (prefill) the inequality FLIPS and staging wins - a configuration we have never
+run. **Prefill owns real latency on this box (~67% of an agent turn, ~5.10 s fixed), so the staging win
+lives in the phase that owns two thirds, while this session optimised decode.**
+
+**FINDING 1 (verified in Maya's own code, not carried over):** the pool fill is ALREADY popularity
+ranked. `fast_warm` (`glm_fast_path.cu:3802-3825`) builds each layer's order from the `--expert-profile`
+ranked list (`profile_`), else `pack_dir/expert_prior.txt`, with an opt-in per-user usage overlay
+(`STRATA_GLM_USAGE` / `save_usage`) leading each layer's order. So placement is already Fiddler-shaped;
+**the gap is the phase split, not the policy.**
+
+**REVISED SEQUENCE:** (1) DONE - placement is profile-ranked. (2) OUTSTANDING - measure `s` per expert in
+prefill vs decode on our workload; that is the coefficient the phase split rests on and where the
+inequality flips. (3) the phase-dependent plan (all-CPU decode, stage prefill), flag-gated. (4) the
+trace replay ONLY if 1-3 leave a placement question open - its question is "does a phase-split plan beat
+a uniform one", not "which eviction policy wins"; Belady remains the right bound if we get there.
