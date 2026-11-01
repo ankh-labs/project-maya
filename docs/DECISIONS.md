@@ -588,3 +588,45 @@ premise is true again (cpu_wait 7.2-8.3 vs x+y+z ~= 5.5) but every coefficient i
 **Open, not chased:** the all-CPU plan still shows 0.36-0.48 ms of `moe_fetch` (p95 6.86, max 8.55 at
 n=4). An all-CPU plan should fetch nothing from the RAM tier - so that residual is disk-tier reads,
 the scratch path, or prefetch. 2% of the token, but the plan is not as link-free as "all-CPU" implies.
+
+## 2026-11-01 - THE 33% / 34.6% REVERSAL, AND HOW IT MUST BE READ (verbatim framing)
+
+**The spec-era 34.6% is back at ~33% not because the old figure was right, but because the planner moved
+the work onto the lane.** Those are different claims about different engines. At the old plan the same
+instrument measured 12.9%, and that measurement stands. Anyone reading 34.6% and 33% side by side
+without this sentence will conclude we flip-flopped; we did not - the plan changed under a fixed
+instrument.
+
+## 2026-11-01 - THE ATTENTION/KDA BLOCK IS A FIRST-CLASS item-3 CANDIDATE, not a footnote
+
+~7 ms per token (`kda_proj_mv` 2.70 + `kda_out_mv` 1.12 + `dsa_out_mv` 0.59 + `hc_attn` 0.53 +
+`hc_ffn` 0.55 + `mla_attend` 0.54), **identical across both plans to three decimals**, and never
+touched by any work in this project.
+
+It was invisible for as long as fetch dominated - which means it has **never been attacked, not that it
+was ruled out**. Everything else on the board has been tried, closed, or re-derived; this is the only
+genuinely **unexplored** territory, and it is now roughly the same size as the lane.
+
+## 2026-11-01 - RETIME CHECK: no retime fired in any n=1..n=4 boot (scheduler exonerated)
+
+Asked three times; answered now with direct evidence. Across six preserved profile boots (both plans,
+n=1/2/4, 7-28 requests each): **0 `CPU lane timed again` lines after each boot's own setup line.**
+
+**How the first attempt got it wrong, because the trap generalises:** the naive grep reported "1 retime
+in every boot" - one **stale line from the back-off run** at line 282 in all six logs, carried in
+because `stage.ps1` does not truncate the log. *Identical text AND identical line number across six
+independent boots is the tell*; a real retime would differ in value and position. Always count after
+the boot's own setup line.
+
+**Consequence:** plan drift does **not** explain the cold-start ramp. The scheduler is exonerated and
+**host-side warming stands as the sole candidate**. Caveat: the original residency boots' logs were
+destroyed by per-boot truncation, so this is an equivalent-regime substitute (same plan, same 16
+threads, 7 serial requests), not literally the four originals.
+
+## 2026-11-01 - residual `moe_fetch` under the all-CPU plan: cannot be localised with existing data
+
+The profile reports `moe_fetch` **aggregated per stage**, not per layer. The engine holds a per-layer
+miss array, but it is not emitted, so **whether the 0.36-0.48 ms residual is uniform or concentrated in
+specific layers is not answerable from the data on disk**. Concentration would point at disk-tier or a
+prefetch path; uniformity at something structural in the plan. Left open, not chased - but the question
+now has a precise form: *emit the per-layer miss counts and look.*
