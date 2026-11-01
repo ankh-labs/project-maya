@@ -751,3 +751,25 @@ once prefill was cancelled.
 is quality-gated; what is idle is two gates: (1) the two decode-side retime defects, (2) the back-off gate
 with `RETIME_V2=1`, (3) restart persistence. **RETIME_V2=on is non-negotiable at adoption** - shipping
 all-CPU with the old controller is the no-safety-net condition.
+
+## 2026-11-01 - TWO GROUPS OF EVIDENCE, KEPT APART: the old controller's defects are NOT excused by the prime bug
+
+**Group A - ESTABLISHED, and why `RETIME_V2` is required for adoption.** The FIRST back-off gate ran on
+the committed binary's **old** controller, before `RETIME_V2` existed, and observed `retimes: 1` - a real
+retreat, plan `0 1 2 3 4 5 6 7 8` -> `0 0 1 2 3 4 5 6 7`, then **no recovery**. The two structural
+defects behind it were **read from source**, not inferred from a silence:
+`cpu_plan_start = plan` (a retreat becomes the permanent baseline) and `rt_windows >= 8` (a terminal
+budget - the adaptation is boot-scoped). **Retreat-without-recovery, permanent downgrade and a boot-scoped
+budget all stand.**
+
+**Group B - ESTABLISHED NOTHING.** The two silent runs (the new controller, zero transitions then zero
+probes) are explained by a bug in my own priming fix: the prime branch reset the window origin on every
+call, so the guard for "no baseline yet" made a baseline impossible. **Those runs say nothing about the
+detector, in either direction.**
+
+**The distinction matters:** a reader who takes "it was just a prime bug" as clearing the controller would
+conclude the old path is acceptable. It is not - Group A has the retreat line to prove it.
+
+**And the saturation question is UNOPENED, not revived and not refuted.** With zero probes, `ratio` and
+`want` were never computed; hypotheses 2 (detector reference) and 3 (wave economics absorb degradation)
+are **untested**. No conclusion follows about whether a cost trigger can work for the decode lane.
