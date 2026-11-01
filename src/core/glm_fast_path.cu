@@ -3092,16 +3092,27 @@ static std::string cal_vals(double c, double p, double ps, double ref) {
 }
 
 // the CPU lane's lane-call overhead the split plans with (ms a call), and the split itself: of f RAM-tier experts,
-// the k the host computes so the slower lane finishes first - max(PCIe (f - k) p, overhead + k c); ties keep the PCIe
-// lane.  `tab`: the k's, one per f, for the log
+// the k the host computes so the slower lane finishes first - max(PCIe (f - k) p, overhead + cpu waves); ties keep
+// the PCIe lane.  `tab`: the k's, one per f, for the log
+//
+// THE CPU SIDE IS A WAVE COUNT, NOT A SUM.  c_ms is one expert on ONE host thread; the lane runs t_eff of them at
+// once, so kk experts cost ceil(kk / t_eff) waves, not kk x c_ms.  Pricing them serially (c_ms * kk) compares a
+// per-thread latency against the link's AGGREGATE throughput - p_ms is bandwidth-saturated at ~18 GB/s, so more
+// transfers in flight buy no more bytes - and over-prices the CPU by the lane's parallelism.  The error is visible
+// on this box without any model: the pcie_frac=0 arm moves ~95 lane experts a token and decodes in 20.9 ms, which
+// is 33 ms of serial work and therefore impossible, and 2.1 ms at sixteen waves.  t_eff is the threads actually
+// available to THIS layer's plan (the lane's count divided by the rows in flight), so concurrency stays an input;
+// past the pool's threads the lane degrades (32 threads measured 34% slower) and the re-timed c_ms says so.
 constexpr double kLaneOverMs = 0.04;
-static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab = nullptr) {
+static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab = nullptr, int t_eff = 1) {
+    const int waves_of = std::max(1, t_eff);
     unsigned long long plan = 0;
     for (int f = 0; f <= 8; ++f) {
         int k = 0;
         double best = p_ms * f;
         for (int kk = 1; kk <= f; ++kk) {
-            const double t = std::max(p_ms * (f - kk), kLaneOverMs + c_ms * kk);
+            const int waves = (kk + waves_of - 1) / waves_of;
+            const double t = std::max(p_ms * (f - kk), kLaneOverMs + c_ms * (double) waves);
             if (t < best - 1e-9) {
                 best = t;
                 k = kk;
@@ -3461,7 +3472,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const char* sv = getenv("STRATA_GLM_PCIE_SHARE");
     const double share = sv != nullptr ? std::max(0.0, std::min(1.0, std::atof(sv))) : -1.0;
     if (pv == nullptr && share < 0.0) {
-        plan = lane_plan(c_ms, p_ms, &tab);
+        plan = lane_plan(c_ms, p_ms, &tab, std::max(1, threads));
         F->cpu_retime = true;   // a split the timing chose: decode may time it again (lane_retime)
         F->rt_c_ms = c_ms;
     } else {
@@ -4239,7 +4250,9 @@ void Glm5Model::lane_retime() {
         const double c_ms = 0.5 * (ms + F->rt_prev_ms);
         F->rt_dir = 0;
         std::string tab;
-        const unsigned long long plan = lane_plan(c_ms, F->cpu_p_ms, &tab);
+        const int rows = std::max(1, seq_count());
+        const int t_eff = std::max(1, m->cpu_lane_threads() / rows);
+        const unsigned long long plan = lane_plan(c_ms, F->cpu_p_ms, &tab, t_eff);
         const double was = F->rt_c_ms;
         F->rt_c_ms = c_ms;
         if (plan == 0ull || plan == F->cpu_plan_start) continue;   // (a lane that would stop stays: the CPU may recover)
