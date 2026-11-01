@@ -548,3 +548,43 @@ are gone. Inference from throughput: a retimed plan measures ~26.66 tok/s agains
 the n=1 boots sustained **44.2-44.6 tok/s steady** - the best figures observed on this plan. A drift
 worth ~30% is incompatible with that, so **plan drift is very unlikely to explain the ramp**, and
 host-side warming stands as the sole candidate. Inferred, not grepped.
+
+## 2026-11-01 - ITEM 2: STAGE ANATOMY RE-MEASURED - the ranking is RE-DERIVED, not re-sequenced
+
+**PROFILE ONLY.** `STRATA_GLM_PROF=1` perturbs, so **no throughput number from these six boots may be
+quoted beside the +6.8 / +11.8 / +23.9 figures**. Both plans instrumented identically, one boot per
+(plan, concurrency), plan verified from each boot's own log line
+(new `0 1 2 3 4 5 6 7 8`, old `0 1 1 2 3 3 4 4 5`).
+
+Stage medians, ms/token:
+
+| stage | new n=1 | new n=2 | new n=4 | old n=1 | old n=2 | old n=4 |
+|---|---|---|---|---|---|---|
+| moe_fetch | 0.401 | 0.361 | 0.478 | 1.319 | 1.089 | 1.370 |
+| **moe_cpu_wait** | **8.275** | **7.202** | **8.330** | 6.229 | 5.346 | 6.979 |
+| moe_gate_up | 2.243 | 2.214 | 2.180 | 2.519 | 2.160 | 2.152 |
+| moe_down | 1.393 | 1.324 | 1.331 | 1.369 | 1.287 | 1.265 |
+| moe_route | 0.776 | 0.793 | 0.789 | 0.818 | 0.789 | 0.792 |
+| router_shexp_mv | 0.863 | 0.847 | 0.846 | 0.862 | 0.850 | 0.846 |
+| kda_proj_mv | 2.708 | 2.702 | 2.719 | 2.709 | 2.709 | 2.721 |
+| kda_out_mv | 1.122 | 1.119 | 1.119 | 1.121 | 1.120 | 1.122 |
+| dsa_out_mv / hc_attn / hc_ffn / mla_attend | 0.594 / 0.531 / 0.551 / 0.543 | same | same | same | same | same |
+
+GPU stream ms/token: new 23.45 / 21.86 / 24.81, old 22.12 / 22.20 / 25.93.
+
+**The trade is exact:** fetch falls ~3x (1.32 -> 0.40 at n=1) and cpu_wait rises by about the same
+(6.23 -> 8.28). Every attention/KDA/compute stage is bit-comparable across plans - the control that
+the instrument measures the plan, not the boot. **`moe_cpu_wait` is now 33-34% of GPU stream time**,
+almost exactly the spec-era 34.6% we disproved at the old plan (12.9%) - it is back by a different
+route, because the planner moved the work there.
+
+**Verdicts:** `pcie_frac->0` CONSUMED (now the default). **CPU-lane capacity now #1** (7.2-8.3 ms, and
+32 threads already measured -12.84 tok/s). `k` 7->6 SURVIVES (cuts compute and lane work). **The
+attention/KDA block (~7 ms) is PROMOTED** - comparable to the lane now, untouched by the planner, and
+invisible while fetch dominated. Residency/ring/eviction, row dedupe, wire compression and
+overlap-hiding are **MOOT for throughput** (fetch is 2% of the token). **§9 NEEDS RE-DERIVING:** its
+premise is true again (cpu_wait 7.2-8.3 vs x+y+z ~= 5.5) but every coefficient is new.
+
+**Open, not chased:** the all-CPU plan still shows 0.36-0.48 ms of `moe_fetch` (p95 6.86, max 8.55 at
+n=4). An all-CPU plan should fetch nothing from the RAM tier - so that residual is disk-tier reads,
+the scratch path, or prefetch. 2% of the token, but the plan is not as link-free as "all-CPU" implies.
