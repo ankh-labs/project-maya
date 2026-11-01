@@ -999,6 +999,7 @@ struct Glm5Model::FastState {
     int explore_left = 0;          // exploration quota: tokens still forced to stage, so R is measurable
     // ---- the back-off rewrite (per-expert EWMA; no lifetime budget) ----
     double lane_ewma = 0.0;        // EWMA of the measured per-expert lane cost, ms
+    bool lane_primed = false;      // the first call ONLY establishes the window origin
     int cost_streak = 0;           // consecutive windows on the same side of the threshold
     int last_dir = 0;              // +1 retreat, -1 recovery
     uint64_t last_change_ms = 0;   // the minimum interval between plan changes (thrash guard)

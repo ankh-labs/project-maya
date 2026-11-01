@@ -4309,6 +4309,13 @@ void Glm5Model::lane_retime() {
         }
 
         // ---- V2 ----
+        // PRIME on the first call: the first window must be one request, not boot -> now (which inflated the
+        // EWMA to 0.776 against a true ~0.36 and overstated every ratio derived from it).
+        if (!F->lane_primed) {
+            F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
+            F->lane_primed = true;
+            continue;
+        }
         if (e - F->rt_e0 < 2000) continue;
         const double ms = ((double) (us - F->rt_us0) / 1000.0 - kLaneOverMs * (double) (r - F->rt_r0)) /
                           (double) (e - F->rt_e0);
@@ -4414,6 +4421,7 @@ bool Glm5Model::set_cpu_lane_threads(int n) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr) continue;
         F->cpu_pool->set_active(n > 0 ? n : F->cpu_threads0 > 0 ? F->cpu_threads0 : F->cpu_pool->size());
+                    std::fprintf(stderr, "glm fast: CUDA%d CPU lane active threads %d\n", m->dev_, F->cpu_pool->active());
         any = true;
     }
     return any;
