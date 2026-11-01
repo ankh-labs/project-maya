@@ -630,3 +630,69 @@ miss array, but it is not emitted, so **whether the 0.36-0.48 ms residual is uni
 specific layers is not answerable from the data on disk**. Concentration would point at disk-tier or a
 prefetch path; uniformity at something structural in the plan. Left open, not chased - but the question
 now has a precise form: *emit the per-layer miss counts and look.*
+
+## 2026-11-01 - PINNED: `STRATA_GLM_RETIME_V2` defaulting OFF is BUILD HYGIENE, not a shipping choice
+
+`STRATA_GLM_RETIME_V2` (the rewritten back-off controller: per-expert EWMA detector, minimum interval
+between changes instead of a lifetime budget, retreat on the LIVE plan with `cpu_plan_start` immutable)
+defaults **off** so the committed planner is bit-behaviour-identical unless the flag is set. That is a
+build-hygiene choice.
+
+**It does not fix the default.** With the flag off, the OLD controller remains the default path - the
+first-three-requests one-shot that turns one contention transient into a permanent ~30% downgrade.
+Configuring it off is not a safety improvement; it is a refusal to change behaviour under a flag that
+was meant to protect the default.
+
+**ADOPTION = the corrected planner WITH `RETIME_V2=on`, and the back-off gate must pass with the flag
+set.** Shipping all-CPU under the old controller is exactly the no-safety-net condition the back-off
+gate failed on. This sits beside the "committed != adopted" heading: neither a commit nor a green
+gate table ships anything on its own.
+
+**CORRECTION (cadence):** `lane_retime` is called from `next_line` (`generate.cpp:1285`), i.e. **once per
+request**, so `rt_windows >= 8` is **~8 requests**, not the ~3 an earlier note derived from an expert-rate
+argument (63 lane experts/token x 96 / 2,000). The conclusion is unchanged - the adaptation is boot-scoped
+and its first event is permanent - only the number was wrong.
+
+## 2026-11-01 - THE RESIDENCY TERM SAYS "STAGE EVERYTHING"; THE MEASUREMENTS SAY ALL-CPU WINS
+
+First probe line from the `RETIME_V2` build (32 threads, residency term on):
+
+```
+rt2 probe: ewma 0.776 ratio 2.19 dir +1 margin 0.07
+           (cpu 0.816 vs pcie 0.061, waves 1) explore_left 7 R_est 9.28
+```
+
+- `R_est 9.28` -> `p_use = p_ms / R = 0.061 ms/expert`, against `cpu_term 0.816`: amortised staging is
+  **~13x cheaper**, so the term wants to **stage everything**.
+- **The ~8x margin prediction is REFUTED** (`margin 0.07`, not 8): a cost-ratio trigger has ample
+  headroom in the staging direction, so it is not futile and the saturation redesign is not needed on
+  these numbers. `ratio 2.19` shows the detector does see a degraded lane.
+- Candidate 1 (cadence) CONFIRMED as the blocker: **one probe line in six requests**, `explore_left`
+  still 7. Candidate 3 contributing: the first window spans boot -> first request (`rt_e0` is not
+  initialised at setup), inflating EWMA to 0.776 against a true ~0.36 - which also overstates the 2.19.
+
+**THE TENSION, stated plainly: the residency term currently says stage everything, and the measured data
+says all-CPU wins** (+23.9% at n=4 steady, +6.8% at n=1, both against a partial-PCIe plan). Both cannot
+be right. Two candidate reasons, and either one means **the model is incomplete, not the measurement**:
+
+1. **`R_est` is selection-biased.** It was measured while the exploration plan `0 0 0 1 2 3 4 5 6` staged
+   only the DEEP routes - plausibly the hottest, most-reused experts. R over all experts will be lower,
+   perhaps much lower, and an R measured on a hand-picked subset cannot be applied to the whole set.
+2. **No displacement term, a real omission.** `p_ms / R` prices the transfer and nothing else. The pool
+   sits at ~96% occupancy, so **every stage evicts something**; if the evicted expert would have been
+   used, the true cost is `p_ms/R + displacement`. A model blind to eviction will always want to stage
+   everything - which is exactly what we now see. That is not evidence the economics favour staging; it
+   is evidence the cost function is missing a term.
+
+**Until R is unbiased and eviction is priced, the term is NOT trustworthy enough to act on.** The cadence
+fix must therefore not be allowed to swing the plan to all-PCIe untested: it would move into a
+configuration we have never measured, whose nearest neighbour measured *worse*.
+
+**Next session, in order:**
+1. **`rt_e0` initialised at first use** (kills the inflated first-window EWMA).
+2. **The call-site fix** so `lane_retime` runs at the intended cadence - **with a clamp on how far the
+   residency term may move the plan from `cpu_plan_start` per decision.** `RESIDENCY_VALUE` stays OFF by
+   default, so nothing moves unless asked.
+3. **Re-measure `R` under a plan that stages a REPRESENTATIVE sample, not only deep routes** - the whole
+   term rests on that number.
+4. **Add the displacement/eviction term**, then re-run the four checks.

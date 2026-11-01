@@ -3104,15 +3104,21 @@ static std::string cal_vals(double c, double p, double ps, double ref) {
 // available to THIS layer's plan (the lane's count divided by the rows in flight), so concurrency stays an input;
 // past the pool's threads the lane degrades (32 threads measured 34% slower) and the re-timed c_ms says so.
 constexpr double kLaneOverMs = 0.04;
-static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab = nullptr, int t_eff = 1) {
+static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab = nullptr, int t_eff = 1,
+                                   double p_use = -1.0) {
     const int waves_of = std::max(1, t_eff);
+    // THE RESIDENCY-VALUE TERM (STRATA_GLM_RESIDENCY_VALUE, off by default): a fetch is an INVESTMENT -
+    // p_ms paid once, then free GPU compute on every later token that uses the expert before eviction.
+    // p_use = p_ms / R_est amortises it.  With R_est = 1, p_use == p_ms and this is today's plan
+    // exactly - the flag-off path and the correctness check.
+    const double pe = p_use > 0.0 ? p_use : p_ms;
     unsigned long long plan = 0;
     for (int f = 0; f <= 8; ++f) {
         int k = 0;
-        double best = p_ms * f;
+        double best = pe * f;
         for (int kk = 1; kk <= f; ++kk) {
             const int waves = (kk + waves_of - 1) / waves_of;
-            const double t = std::max(p_ms * (f - kk), kLaneOverMs + c_ms * (double) waves);
+            const double t = std::max(pe * (f - kk), kLaneOverMs + c_ms * (double) waves);
             if (t < best - 1e-9) {
                 best = t;
                 k = kk;
@@ -3475,6 +3481,30 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         plan = lane_plan(c_ms, p_ms, &tab, std::max(1, threads));
         F->cpu_retime = true;   // a split the timing chose: decode may time it again (lane_retime)
         F->rt_c_ms = c_ms;
+        F->cpu_plan = F->cpu_plan_start = plan;   // the boot plan: cpu_plan_start stays IMMUTABLE
+        // ---- THE RESIDENCY-VALUE TERM (off by default) ----
+        F->resid_value = getenv("STRATA_GLM_RESIDENCY_VALUE") != nullptr;
+        if (const char* rv = getenv("STRATA_GLM_R_MAX")) F->r_max = std::max(1.0, std::atof(rv));
+        // THE CHICKEN-AND-EGG, ANSWERED DELIBERATELY: all-CPU never stages, so it never learns what staging
+        // is worth and R_est is undefined.  Spend a bounded quota - the first N decode windows stage the
+        // deepest routes (k = f - 2), which creates promotions so R becomes measurable - then let the
+        // amortised term decide.  The quota costs a few steps, not a session.
+        if (F->resid_value) {
+            const char* xv = getenv("STRATA_GLM_EXPLORE_STEPS");
+            F->explore_left = xv ? std::max(0, std::atoi(xv)) : 8;
+            if (F->explore_left > 0) {
+                plan = 0;
+                tab.clear();
+                for (int f = 0; f <= 8; ++f) {
+                    const int k = std::max(0, f - 2);   // stage the deep routes, keep the lane alive
+                    plan |= (unsigned long long) k << (4 * f);
+                    tab += " " + std::to_string(k);
+                }
+                F->cpu_plan = plan;                 // exploration: the LIVE plan only
+                std::fprintf(stderr, "glm fast: CUDA%d residency term ON: exploring for %d window(s) -> "
+                             "of 0..8:%s (R_MAX %.0f)\n", dev_, F->explore_left, tab.c_str(), F->r_max);
+            }
+        }
     } else {
         for (int f = 0; f <= 8; ++f) {
             const int k = pv != nullptr ? (f < (int) std::strlen(pv) ? std::max(0, std::min(f, pv[f] - '0')) : 0)
@@ -4216,51 +4246,136 @@ void Glm5Model::lane_drift_check() {
 // link is steady) - at most three times.  Only a split the timing
 // chose (not STRATA_GLM_CPU_PLAN / STRATA_GLM_PCIE_SHARE, setup's tuning), and only from windows run on that split (a
 // request's own pcie_frac is setup's calibration at work).  STRATA_GLM_CPU_RETIME=0 turns it off.
+static uint64_t now_ms() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void Glm5Model::lane_retime() {
     static const bool on = [] {
         const char* v = getenv("STRATA_GLM_CPU_RETIME");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (!on) return;
+    // STRATA_GLM_RETIME_V2: the REWRITTEN controller, OFF by default so the committed planner's
+    // behaviour is unchanged unless the flag is set.  This is build hygiene, NOT a shipping choice:
+    // with the flag off the OLD controller stays the default path - a first-few-requests one-shot that
+    // turns one contention transient into a permanent downgrade.  ADOPTION = planner + V2 on.
+    static const bool v2 = [] {
+        const char* v = getenv("STRATA_GLM_RETIME_V2");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    static const uint64_t kMinMs = [] {
+        const char* v = getenv("STRATA_GLM_RETIME_MIN_MS");
+        return (uint64_t) (v ? std::max(0, std::atoi(v)) : 3000);
+    }();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
-        if (F == nullptr || F->cpu_pool == nullptr || !F->cpu_retime || F->rt_windows >= 8 || F->rt_changes >= 3)
-            continue;
+        if (F == nullptr || F->cpu_pool == nullptr || !F->cpu_retime) continue;
         const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load(), r = F->cpu_routes.load();
-        if (F->cpu_plan != F->cpu_plan_start) {   // a request's own split: its window is not this one's
+
+        if (!v2) {
+            // ---- the ORIGINAL controller, verbatim: a lifetime window budget and a permanent retreat ----
+            if (F->rt_windows >= 8 || F->rt_changes >= 3) continue;
+            if (F->cpu_plan != F->cpu_plan_start) {
+                F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
+                continue;
+            }
+            if (e - F->rt_e0 < 2000) continue;
+            const double ms0 = ((double) (us - F->rt_us0) / 1000.0 - kLaneOverMs * (double) (r - F->rt_r0)) /
+                               (double) (e - F->rt_e0);
             F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
+            const int dir0 = !(ms0 > 0.0) ? 0 : ms0 > 1.15 * F->rt_c_ms ? 1 : ms0 < F->rt_c_ms / 1.15 ? -1 : 0;
+            if (++F->rt_windows == 1 || dir0 == 0 || dir0 != F->rt_dir) {
+                F->rt_dir = F->rt_windows == 1 ? 0 : dir0;
+                F->rt_prev_ms = ms0;
+                continue;
+            }
+            const double c_ms0 = 0.5 * (ms0 + F->rt_prev_ms);
+            F->rt_dir = 0;
+            std::string tab0;
+            const int rows0 = std::max(1, seq_count());
+            const int t0 = std::max(1, m->cpu_lane_threads() / rows0);
+            const unsigned long long plan0 = lane_plan(c_ms0, F->cpu_p_ms, &tab0, t0);
+            const double was0 = F->rt_c_ms;
+            F->rt_c_ms = c_ms0;
+            if (plan0 == 0ull || plan0 == F->cpu_plan_start) continue;
+            F->cpu_plan = F->cpu_plan_start = plan0;   // (the defect: the retreat becomes the baseline)
+            ++F->rt_changes;
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane timed again in decode: an expert %.3f ms (planned "
+                         "with %.3f) -> of 0..8:%s (PCIe share %.2f)\n",
+                         m->dev_, c_ms0, was0, tab0.c_str(), plan_share(plan0));
             continue;
         }
+
+        // ---- V2 ----
         if (e - F->rt_e0 < 2000) continue;
         const double ms = ((double) (us - F->rt_us0) / 1000.0 - kLaneOverMs * (double) (r - F->rt_r0)) /
                           (double) (e - F->rt_e0);
         F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
-        // the first window warms the lane up (Maya-L on nine GPUs: 0.49-0.59 ms an expert, then 0.31-0.38 against the
-        // start's 0.28) and is not used; after it a change takes two windows in a row off the same way, and plans with
-        // their mean - one noisy window swung the split back and forth
-        const int dir = !(ms > 0.0)                ? 0
-                        : ms > 1.15 * F->rt_c_ms   ? 1
-                        : ms < F->rt_c_ms / 1.15   ? -1
-                                                   : 0;
-        if (++F->rt_windows == 1 || dir == 0 || dir != F->rt_dir) {
-            F->rt_dir = F->rt_windows == 1 ? 0 : dir;
-            F->rt_prev_ms = ms;
-            continue;
+        if (!(ms > 0.0)) continue;
+        F->lane_ewma = F->lane_ewma > 0.0 ? 0.7 * F->lane_ewma + 0.3 * ms : ms;
+        ++F->retime_calls;
+        double p_use = -1.0;
+        if (F->resid_value) {
+            const FastStats sn = m->fast_stats();
+            const double raw = sn.promotions > 0 ? (double) sn.hits / (double) sn.promotions : 1.0;
+            const double cl = std::min(F->r_max, std::max(1.0, raw));
+            F->r_est = F->r_est <= 1.0 ? cl : 0.7 * F->r_est + 0.3 * cl;
+            p_use = F->cpu_p_ms / std::max(1.0, F->r_est);
         }
-        const double c_ms = 0.5 * (ms + F->rt_prev_ms);
-        F->rt_dir = 0;
-        std::string tab;
         const int rows = std::max(1, seq_count());
         const int t_eff = std::max(1, m->cpu_lane_threads() / rows);
-        const unsigned long long plan = lane_plan(c_ms, F->cpu_p_ms, &tab, t_eff);
-        const double was = F->rt_c_ms;
-        F->rt_c_ms = c_ms;
-        if (plan == 0ull || plan == F->cpu_plan_start) continue;   // (a lane that would stop stays: the CPU may recover)
-        F->cpu_plan = F->cpu_plan_start = plan;   // (the next route reads it; set_pcie_share(-1) restores this one)
-        ++F->rt_changes;
-        std::fprintf(stderr, "glm fast: CUDA%d CPU lane timed again in decode: an expert %.3f ms (planned with %.3f) "
-                             "-> RAM-tier experts to the CPU, of 0..8:%s (PCIe share %.2f)\n",
-                     m->dev_, c_ms, was, tab.c_str(), plan_share(plan));
+        const double pe = p_use > 0.0 ? p_use : F->cpu_p_ms;
+        // THE MARGIN, for the deepest route (f = 8, one wave): the CPU's per-expert price against what
+        // staging ONE more expert costs.  >> 1 means the planner will keep choosing CPU no matter how
+        // badly the lane degrades - a cost-ratio trigger then cannot fire by construction.
+        const int waves8 = (8 + t_eff - 1) / t_eff;
+        const double cpu_term = kLaneOverMs + F->lane_ewma * (double) waves8;
+        const double margin = pe / std::max(1e-9, cpu_term);
+        const double ratio = F->lane_ewma / std::max(1e-9, F->rt_c_ms);
+        const int dir = ratio > 1.15 ? 1 : (ratio < 1.0 / 1.15 ? -1 : 0);
+        if (F->explore_left > 0) {          // the quota exists only to make R measurable
+            if (--F->explore_left > 0) {
+                std::fprintf(stderr, "glm fast: CUDA%d rt2 probe: ewma %.3f ratio %.2f dir %+d margin %.2f "
+                             "(cpu %.3f vs pcie %.3f, waves %d) explore_left %d R_est %.2f\n",
+                             m->dev_, F->lane_ewma, ratio, dir, margin, cpu_term, pe, waves8,
+                             F->explore_left, F->r_est);
+                continue;
+            }
+            std::string t0;
+            const unsigned long long p0 = lane_plan(F->lane_ewma, F->cpu_p_ms, &t0, t_eff, p_use);
+            if (p0 != 0ull && p0 != F->cpu_plan) {
+                F->cpu_plan = p0;
+                F->last_change_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::fprintf(stderr, "glm fast: CUDA%d residency term ON: exploration done, R_est %.2f "
+                             "(p_use %.3f vs p_ms %.3f) -> of 0..8:%s (PCIe share %.2f)\n",
+                             m->dev_, F->r_est, p_use, F->cpu_p_ms, t0.c_str(), plan_share(p0));
+            }
+            continue;
+        }
+        std::string tabc, tabs;
+        const unsigned long long plan_c = lane_plan(F->lane_ewma, F->cpu_p_ms, &tabc, t_eff, p_use);
+        (void) lane_plan(F->rt_c_ms, F->cpu_p_ms, &tabs, t_eff, p_use);
+        std::fprintf(stderr, "glm fast: CUDA%d rt2 probe: ewma %.3f (planned %.3f) ratio %.2f dir %+d "
+                     "streak %d margin %.2f (cpu %.3f vs pcie %.3f, waves %d) start:%s current:%s "
+                     "want:%s%s\n",
+                     m->dev_, F->lane_ewma, F->rt_c_ms, ratio, dir, F->cost_streak, margin, cpu_term, pe,
+                     waves8, tabs.c_str(), tabc.c_str(), tabc.c_str(),
+                     (now_ms() - F->last_change_ms) < kMinMs ? " (interval)" : "");
+        if (dir == 0) { F->cost_streak = 0; F->last_dir = 0; continue; }
+        if (dir != F->last_dir) { F->last_dir = dir; F->cost_streak = 1; continue; }
+        if (++F->cost_streak < 2) continue;
+        if ((now_ms() - F->last_change_ms) < kMinMs) continue;
+        if (plan_c != 0ull && plan_c != F->cpu_plan) {
+            F->cpu_plan = plan_c;               // the LIVE plan only; cpu_plan_start stays the boot plan
+            F->last_change_ms = now_ms();
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane %s -> of 0..8:%s (PCIe share %.2f)\n",
+                         m->dev_, dir > 0 ? "retreat" : "recover", tabc.c_str(), plan_share(plan_c));
+        }
+        F->cost_streak = 0;
+        F->last_dir = 0;
     }
 }
 
