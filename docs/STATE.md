@@ -70,3 +70,49 @@ rate. A paired re-measure is its own job.
 
 **Next lever, and only one:** `moe_cpu_wait`, ~33% of decode stage time -- the largest
 remaining stage, and the one the all-CPU plan itself created. Not opened here.
+
+## 2026-11-02 (later) - CORRECTION: the retime claim was true, the evidence for it was not
+
+**What was wrong with the v1.1.49 deploy report:** it listed "`STRATA_GLM_CPU_RETIME=0`
+(controller off)" and evidenced it with `retimes 0` in the STAT line. **That reading is
+expected under both states** - the controller cannot fire without two deliberate overrides -
+so it proves nothing. [[feedback_verify_the_arms_not_the_config]] in its exact form, and it
+was caught by the owner, not by me.
+
+**What the check then found, measured rather than read:**
+- The only name read is `STRATA_GLM_CPU_RETIME` (`glm_fast_path.cu:4223`), and the serving
+  config spelled it `MAYA_GLM_CPU_RETIME`. That looked damning and was not: `maya.py:721`
+  loads every config through `maya_names.env_in` (MAYA_ -> STRATA_) and
+  `serve/server.py child_env` exports **both** names to the engine (`export_env`).
+- **Re-measured with the engine's own words, on the pre-fix spelling:** it announced
+  `CPU lane retime OFF (STRATA_GLM_CPU_RETIME=0)`. **The setting was delivered all along;
+  the claim was true and the arm was worthless.**
+- **The spelling drifts back.** `maya_names.env_out` rewrites configs to the `MAYA_` form on
+  save (~20 sites in `maya.py`), so editing the file to `STRATA_` returned to `MAYA_` within
+  two boots. A hand-fix of the spelling is not durable, and the alias is what makes the key
+  work. **`maya_names`' write-back is a trap for anyone auditing a config by eye** - its own
+  entry, and arguably a tool fix, not a per-config typo.
+- **No config key is dead.** All 8 keys resolve to a reader, but `GLM_SLOTS`,
+  `GLM_SLOT_MIN` and `GLM_SLOT_GB` are read only via `env_num("STRATA_…", default)`
+  (`generate.cpp:1347-1349`) and are **invisible to a `getenv(` grep**.
+
+**What changed (binary included, so the tag moved):**
+- `glm_fast_path.cu` now **announces the switch at boot**, where the split is planned:
+  `glm fast: CPU lane retime OFF|ON (STRATA_GLM_CPU_RETIME=<value>)`. **Verified to
+  discriminate**, not to be a constant: config `1` -> `ON`, `0` -> `OFF`, key absent ->
+  `ON (unset)`.
+- New tag **`deployed/v1.1.49-lane-plan-20261102-2121`** on `f7d8888` (built and verified
+  serving; `v1.1.49-134-gf7d8888`). The earlier tag
+  `deployed/v1.1.49-lane-plan-20261101-1954` is **not deleted** - it honestly points at the
+  previous binary (`90cbc11`), which was correct; what changed is that the arm is now code.
+- `configs/maya-v3q-q4-par4.example.json` carries `STRATA_GLM_CPU_RETIME=0`.
+
+**Verified serving on the deployed build:** `17 tokens, reply 'serving confirmed.'`, plan
+`0 1 2 3 4 5 6 7 8`, `retimes 0`, `faults 0`, and the announcement `OFF (...=0)`.
+
+**Rule, now in `FORK_LAYOUT.md`'s deploy steps:** trace every config env name to the name the
+code reads (grep the NAME, covering `getenv(`, `env_num(` and `maya_names.lookup(`) before a
+deploy is called done - and take a boolean state from the engine's announcement, never from a
+counter that reads the same in both states.
+
+**The +6.8 / +11.8 / +23.9% remain inherited from the pre-merge tree, not re-verified.**

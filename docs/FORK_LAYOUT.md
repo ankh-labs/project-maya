@@ -168,6 +168,29 @@ instrument.
    the engine holds it** (`LNK1104: cannot open file 'maya.exe'`). Copy the running binary
    aside as a rollback, stop, build, then bring it back up and verify — the old build serves
    until the gate has passed and must not be taken down before it.
+7. **Trace every config env name to the name the code READS, and get the state from the
+   engine's own announcement.** Added 2026-11-02 after a deploy was signed off with an
+   invalid arm:
+   - **`retimes 0` is NOT evidence that the CPU-lane retime controller is off.** It is
+     expected whether the controller is OFF or merely DORMANT (it needs two deliberate
+     overrides to fire). The evidence is the boot line
+     `glm fast: CPU lane retime OFF|ON (STRATA_GLM_CPU_RETIME=<value>)`, and it was verified
+     to **discriminate**: config `1` -> `ON`, `0` -> `OFF`, key absent -> `ON (unset)`.
+     Boot it both ways once, so the arm is known to move.
+   - **Grep the NAME, not `getenv(`.** Three keys in the live config
+     (`GLM_SLOTS`, `GLM_SLOT_MIN`, `GLM_SLOT_GB`) are read only through
+     `env_num("STRATA_…", default)` (`generate.cpp:1347-1349`) and are invisible to a
+     `getenv(` search; `maya_names.lookup(` reads env without `getenv` too. A config key
+     that looks unread is usually a missed read path — and the reverse mistake (assuming a
+     spelling is what is read) is what produced this rule.
+   - **The on-disk spelling does not decide what the engine reads, and a hand-fix will not
+     survive.** Configs are written in the `MAYA_` form (`maya_names.env_out`, ~20 save
+     sites in `maya.py`), read as `STRATA_` (`env_in`), and `serve/server.py child_env`
+     exports **both** names to the engine (`export_env`). Measured: with the file spelling
+     `MAYA_GLM_CPU_RETIME`, the engine announced `OFF (STRATA_GLM_CPU_RETIME=0)`; editing
+     the file to `STRATA_` drifted back to `MAYA_` within two boots. So the alias layer is
+     what makes it work, and `maya_names`' write-back is a live trap for anyone auditing by
+     eye — its own entry, not a typo to fix per config.
 
 ## 2026-10-30 (late) — v1.1.42 merged onto the verified-good tree: a working n=2 rotor
 
