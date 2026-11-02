@@ -5,10 +5,12 @@
 # wrong resolution faithfully, and forward recordings reinstate the newer side when replaying backwards. This file is the
 # mechanical check, so the next upstream merge is "merge, run this, three boots" instead of archaeology.
 #
-# SCOPE: this manifest describes the RELEASE branch — a merge of upstream onto cd52717, the tree verified to run 796 clean
-# rotor entries. On that lineage ALL of our code is expected to be present, because cd52717 already contains it; the two
-# entries that once read "0" belonged to the v1.1.41-replay tree, where upstream had replaced our slot_load read and
-# butterfly. Expectation changes with the branch, so re-derive them from the tree you are gating, not from memory.
+# SCOPE (2026-11-02, re-derived): this manifest now describes the tree merged onto **upstream v1.1.49**, based on the
+# verified-good reference `0f50931` (v1.1.42 + 126 commits, the build verified serving). Every entry below was re-checked
+# to hold on `0f50931` BEFORE the merge was started, so a failure here is a loss in the merge, not a stale expectation.
+# That distinction is the whole point: the previous scope line described a merge onto cd52717, and run as-is against a
+# different base it would have failed closed on a stale expectation and read as a merge fault.
+# Expectation changes with the branch, so re-derive them from the tree you are gating, not from memory.
 #
 # FORMAT:  pattern | file | expected_occurrences | status
 #   status REQUIRED                - count must match exactly; a miss is a dropped hunk
@@ -35,6 +37,15 @@ S->hc_part_n = (4 * E / 512) * 26 + 64; | src/core/glm_rows.cu | 1 | REQUIRED
 # --- our own work that a replay replaced elsewhere; present here because the base is the tree that worked ---
 A single sequential read reached only | src/core/glm_fast_path.cu | 1 | REQUIRED
 s_qa[tid ^ stride] | src/kernels/cuda/glm_fast.cu | 1 | REQUIRED
+
+# --- POST-BASE (d098fa7): the lane plan, our newest work. Not covered by any earlier entry, because the manifest was
+# derived from cd52717 before the planner existed. `waves` is the units fix itself: experts on the CPU cost ceil(kk/t_eff)
+# WAVES, not kk x c_ms of serial work — the expression that made the planner price the lane as a throughput. If a merge
+# drops it, the planner silently reverts to serial pricing and every timing claim measured against it becomes void.
+const int waves = (kk + waves_of - 1) / waves_of; | src/core/glm_fast_path.cu | 1 | REQUIRED
+plan = lane_plan(c_ms, p_ms, &tab, std::max(1, threads)); | src/core/glm_fast_path.cu | 1 | REQUIRED
+void Glm5Model::lane_retime() | src/core/glm_fast_path.cu | 1 | REQUIRED
+F->cpu_retime = true; | src/core/glm_fast_path.cu | 1 | REQUIRED
 
 # --- POST-BASE and ABSENT BY DESIGN on this lineage (8ae4b91 added it): it conditions the BF16 output fallback, and the
 # cd52717 base has no such fallback. BF16 is handled here by the q8_1->float pre-pass that cd52717 carries in mv(), which
