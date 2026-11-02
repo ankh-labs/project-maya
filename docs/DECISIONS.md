@@ -874,8 +874,14 @@ the index line was read instead of the body:**
   **~5% of a real turn**, not 15.8%;
 - whether it holds at 106k context is **recorded as UNTESTED** (cache state, ubatch path, accept rate all
   differ there);
-- and it is a **llama.cpp-lab measurement; this box runs Maya**, which has MTP code
-  (`glm_mtp.cu`, `glm_mtp_rows.cu`, `mtp.cpp`) that has **never been measured there** - no Maya number exists.
+- **CORRECTED (owner): Maya MTP and DSpark HAVE been tested - same outcome as llama.cpp.** Maya's MTP is
+  therefore closed BY MEASUREMENT, not by a provenance caveat. (DSpark is DeepSeek's own drafting algorithm,
+  NOT DGX Spark: separate drafter GGUF, `--spec-type draft-dspark`, `LLM_TENSOR_DSPARK_MARKOV_W1/W2/CONF_PROJ`,
+  already in our fork, upstream PR 25784.)
+- **META-FINDING: that Maya MTP/DSpark result is NOT in the written record.** A grep of the memory store,
+  `project-maya/docs/STATE.md`, this file and `llama-server/TESTING.md` finds the llama.cpp-era MTP work and
+  the DSpark *mechanism*, but no Maya **result**. **Absence from TESTING.md is not absence of a test.** If the
+  run logs are found the result belongs in TESTING.md; if not, that gap is named here rather than papered over.
 
 **What changed was only that the lossless gate was invalid, which makes the old CLOSURE unsound - not the
 feature promising.** Those are different claims and they were conflated. MTP is not on the work list; if
