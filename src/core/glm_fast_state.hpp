@@ -992,18 +992,6 @@ struct Glm5Model::FastState {
     uint64_t rt_e0 = 0, rt_us0 = 0, rt_r0 = 0; // the counters at the window's start
     int rt_windows = 0, rt_changes = 0;        // windows looked at, splits changed
     double rt_c_ms = 0.0;                      // the CPU's cost an expert the split in use was planned with
-    // ---- the residency-value term (STRATA_GLM_RESIDENCY_VALUE; OFF by default) ----
-    bool resid_value = false;      // amortise a fetch over the uses it buys (p_use = p_ms / R_est)
-    double r_est = 1.0;            // smoothed uses per staged expert (hits / promotions)
-    double r_max = 32.0;           // the clamp: one lucky window cannot swing the plan to all-PCIe
-    int explore_left = 0;          // exploration quota: tokens still forced to stage, so R is measurable
-    // ---- the back-off rewrite (per-expert EWMA; no lifetime budget) ----
-    double lane_ewma = 0.0;        // EWMA of the measured per-expert lane cost, ms
-    bool lane_primed = false;      // the first call ONLY establishes the window origin
-    int cost_streak = 0;           // consecutive windows on the same side of the threshold
-    int last_dir = 0;              // +1 retreat, -1 recovery
-    uint64_t last_change_ms = 0;   // the minimum interval between plan changes (thrash guard)
-    uint64_t retime_calls = 0;     // windows looked at (diagnostic only)
     int rt_dir = 0;                            // the last window's way off it (+1 slower, -1 faster, 0 within 15%)
     double rt_prev_ms = 0.0;                   // ... and its cost an expert
     bool lane_pending = false;                 // the lane and the service thread wait for fast_setup_finish

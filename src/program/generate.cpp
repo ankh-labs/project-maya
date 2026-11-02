@@ -2846,7 +2846,6 @@ static int glm_pack_generate(const Options& o) {
             g.hist.clear();
         }
         if (multi_n % 8 == 0) {   // the Monitor's live counters, over everything decoded since the engine was idle
-            model.lane_retime();   // the controller's CADENCE: every 8 tokens, not once per request (next_line)
             const auto sn = model.fast_stats();
             const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - multi_t1).count();
             const double n = (double) std::max<uint64_t>(1, multi_n);
