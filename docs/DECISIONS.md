@@ -925,3 +925,28 @@ that should be UP**, on the latest build, except while restarting or fixing a fa
 (repointed: all-CPU boot plan, `STRATA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`), engine **running and
 serving** (pid 14988, port 8080, plan `0 1 2 3 4 5 6 7 8`, retimes 0, faults 0, a real request returning 44
 tokens). Launch is shell-independent: it was started in one session and found alive in the next.
+
+## 2026-11-01 - DEPLOY TAG NAMING: the release id comes from the MAYA lineage, never `STRATA_VERSION`
+
+Two bogus tags were minted tonight - `deployed/v0.1.27-…` twice - from `CMakeLists.txt:11`
+(`project(strata VERSION 0.1.27 ...)`). That same file documents at **lines 32-36** that `STRATA_VERSION`
+*"is the static `project(strata VERSION ...)` string and **never moves with a Maya release**"*. The tag
+named a strata project version, not a Maya release; both were **local-only** and have been deleted.
+
+**Correct tag:** `deployed/v1.1.42-lane-plan-20261101-1834` on `0f50931`, verified by
+`git describe --tags --match 'v1.1.*'` -> **`v1.1.42-125-g0f50931`**. Convention read from the repo first:
+`deployed/<release>-<date>`, with a suffix precedent (`-picks487`).
+
+**Add to the deploy checklist:** the release identifier must come from **`git describe --tags --match
+'v1.1.*'`**, never from `STRATA_VERSION` or `CMakeLists.txt`, **because that string is a static project
+identifier that never moves with a Maya release** (CMakeLists.txt:32-36). Verify the tag resolves to the
+built commit before deploying - the same one-command check whose absence produced the false "tag divergence"
+report earlier.
+
+**Upstream state, data only (fetched, nothing merged):** seven releases unseen - `v1.1.43`..`v1.1.49`, the
+newest `v1.1.49` dated 2026-11-02 00:16 UTC. **50 commits** in `v1.1.42..v1.1.49`. Conflict surface against
+our 126 commits: ours touch **41** files, upstream **54**, and **5 collide** -
+`include/strata/core/glm_model.hpp`, `serve/server.py`, `src/core/glm_fast_path.cu`,
+`src/core/glm_fast_state.hpp`, `src/program/generate.cpp`. That is smaller than the v1.1.39->42 surface
+(14 of 39) and must still go through `tools/patch_invariants.txt` as its own planned job - the v1.1.41
+replay silently dropped or thinned seven of our changes and all seven compiled.
