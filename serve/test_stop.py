@@ -28,7 +28,7 @@ try:
 except ImportError:                                     # (the CI's and setup's environments have it)
     psutil = None
 try:
-    import regex  # noqa: F401  (the GLM tokenizer's, which --engine strata loads: else the mock engine, no process)
+    import regex  # noqa: F401  (the GLM tokenizer's, which --engine maya loads: else the mock engine, no process)
     FAKE_ENGINE = True
 except ImportError:
     FAKE_ENGINE = False
@@ -65,7 +65,7 @@ def fake_config(d: Path) -> Path:
 
 
 def server_cmd(cfg: Path, port: int) -> list:
-    engine = ["--engine", "strata", "--config", str(cfg)] if FAKE_ENGINE else ["--engine", "mock"]
+    engine = ["--engine", "maya", "--config", str(cfg)] if FAKE_ENGINE else ["--engine", "mock"]
     return [sys.executable, str(ROOT / "serve" / "server.py"), *engine, "--port", str(port)]
 
 
@@ -198,6 +198,16 @@ class ServerStops(unittest.TestCase):
         out = p.rest()
         self.assertIn(f"[maya] stopping ({why}): the engine ends", out)
         self.assertEqual(gone(self.engine), [], "the engine outlived the server")
+
+    @unittest.skipUnless(FAKE_ENGINE, "the tokenizer's regex module")
+    def test_old_engine_name(self):
+        """--engine strata (the old name, in older run scripts) starts the configured engine, not the mock one."""
+        cmd = server_cmd(self.cfg, free_port())
+        cmd[cmd.index("maya")] = "strata"
+        p = Proc(cmd, stdin=subprocess.DEVNULL)
+        self.addCleanup(p.close)
+        self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
+        self.assertTrue(descendants(p.p.pid), "no engine process: --engine strata ran the mock engine")
 
     def test_parent_pipe_closed(self):
         p = self.start(["--parent-pipe"], stdin=subprocess.PIPE)

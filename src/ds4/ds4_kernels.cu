@@ -2638,7 +2638,7 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const ui
     pdl_wait();
     pdl_trigger();
     const int r = blockIdx.x;
-    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
+    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL / Q5_K blocks at the row's start: eg_block_value)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = eg_block_value(rows + (size_t) r * hd, e, fmt);
         return;
@@ -3451,7 +3451,7 @@ __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
-    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
+    if (fmt != 0) {   // (ggml Q6_K / IQ4_NL / Q5_K blocks at the row's start: eg_block_value)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = eg_block_value(rows, e, fmt);
         return;

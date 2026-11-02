@@ -820,6 +820,7 @@ struct Glm5Model::FastState {
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
+    size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
     struct Drain {
         int il, vslot, key, rclass, rslot;

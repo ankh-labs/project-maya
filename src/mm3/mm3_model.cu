@@ -1471,7 +1471,10 @@ struct Model::Impl {
         }
         st.experts = 0;
         for (const Layer& l : L)
-            if (l.moe) st.experts += g.n_exp;
+            if (l.moe) {
+                st.experts += g.n_exp;
+                st.all_gb += (double) ((size_t) g.n_exp * l.blob) / (1u << 30);
+            }
         // the resident blobs from the files, one thread a GPU
         {
             std::vector<std::thread> th;

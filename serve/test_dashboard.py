@@ -123,6 +123,56 @@ class Dashboard(unittest.TestCase):
             s, _, b = self.req("GET", "/metrics")
             self.assertIs(json.loads(b)["engine"]["dspark"], on)
 
+    def test_metrics_list_the_drafters_that_run(self):
+        # the Monitor's Speculation: the drafters this engine runs with, per model engine; empty = drafting is off
+        from serve.server import request_spec_off, speculation_modes
+        cases = [
+            ({"engine_kind": "glm-fast", "mtp": 1, "dflash": 0}, {}, ["MTP"]),
+            ({"engine_kind": "glm-fast", "mtp": 1, "dflash": 1}, {}, ["DFlash2"]),      # (DFlash decode takes the request first)
+            ({"engine_kind": "glm-fast", "mtp": 0, "dflash": 1}, {}, ["DFlash2"]),
+            ({"engine_kind": "glm-fast", "mtp": 0, "dflash": 0}, {}, []),
+            ({"engine_kind": "qwen", "mtp": 1, "lookup": 3}, {}, ["MTP", "Lookup"]),
+            ({"engine_kind": "qwen", "mtp": 0, "lookup": 0}, {}, []),
+            ({"engine_kind": "mm3", "dspark": 1}, {}, ["DSpark"]),
+            ({"engine_kind": "mm3", "dspark": 0}, {}, []),
+            ({"engine_kind": "ds4"}, {"dspark": True, "lookup": True}, ["DSpark", "Lookup"]),
+            ({"engine_kind": "ds4"}, {"dspark": False, "lookup": True}, ["Lookup"]),
+            ({"engine_kind": "ds4"}, {"dspark": False, "lookup": False}, []),
+        ]
+        for info, kw, want in cases:
+            with self.subTest(info=info, kw=kw):
+                self.assertEqual(speculation_modes(info, **kw), want)
+        self.assertTrue(request_spec_off({"strata_tune": {"spec": 1}}))
+        self.assertFalse(request_spec_off({"strata_tune": {"spec": 4}}))
+        self.assertFalse(request_spec_off({}))
+        self.assertFalse(request_spec_off(None))
+        s, _, b = self.req("GET", "/metrics")
+        self.assertEqual(json.loads(b)["engine"]["speculation"], [])               # (the mock engine drafts nothing)
+        self.engine.info.update(mtp=1)
+        self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["engine"]["speculation"], ["MTP"])
+
+    def test_stat_lines_carry_the_draft_counts_and_the_ssd_bytes(self):
+        # the engines' STAT lines (GLM, CYBER-FROST, DeepSeek, MiniMax): live draft_acc / draft_off and disk_gb reach the
+        # Monitor's tiers.now as numbers
+        class Stub:
+            pass
+        eng = Stub()
+        StrataEngine._parse_stat(eng, "STAT tok_s=31.20 vram_hit=0.9100 vram_used=300 ram_used=500 ram_gb=20.3 "
+                                      "vram_gb=12.5 disk_gb=31.4 draft_acc=124 draft_off=200")
+        self.assertEqual((eng.stat["draft_acc"], eng.stat["draft_off"], eng.stat["disk_gb"]), (124.0, 200.0, 31.4))
+        self.engine.stat = dict(eng.stat)
+        now = json.loads(self.req("GET", "/metrics")[2])["tiers"]["now"]
+        self.assertEqual((now["draft_acc"], now["draft_off"], now["disk_gb"]), (124.0, 200.0, 31.4))
+
+    def test_requests_carry_the_drafts_offered_and_kept(self):
+        # the page's last-answer acceptance: the engine's DONE counts reach the request row, None when it reported none
+        self.engine.last = None
+        self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        row = json.loads(self.req("GET", "/metrics")[2])["requests"][0]
+        self.assertIn("drafts_offered", row)
+        self.assertIn("spec_off", row)
+        self.assertFalse(row["spec_off"])
+
     def test_chat_gets_503_while_reloading(self):
         os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"
         self.req("POST", "/api/context", {"max_context": 16384})
@@ -636,6 +686,64 @@ console.log(JSON.stringify(out));""")
                     self.assertAlmostEqual(pill["at"], 100 * i / n)
                     self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
         self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
+    def test_speculation_says_off_waiting_or_the_acceptance(self):
+        # the Monitor's Speculation, three states: off (no drafter, or the request asked for none: "off" in the field and
+        # in the figure), drafting on with nothing drafted yet ("-", never a fake 0%), drafting on with drafts (accepted of
+        # drafted, %) - live from the STAT draft counts, else the last answer's
+        got = self.node("""
+const now = 1000;
+const eng = (modes) => ({speculation: modes});
+const live = (o) => ({state: "generating", elapsed_s: 5, ...o});
+const stat = (o) => ({now: {time: now - 1, ...o}});
+const v = (m) => sv.speculationView(m, now);
+const out = {
+  none: v({engine: eng([]), live: {state: "idle"}, requests: []}),
+  noneLive: v({engine: eng([]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  specOne: v({engine: eng(["MTP"]), live: live({spec_off: true}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  lastSpecOne: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{spec_off: true, drafts_offered: 0, drafts_accepted: 0}]}),
+  idleNever: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: []}),
+  idleZero: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 0, drafts_accepted: 0}]}),
+  idleNull: v({engine: eng(["DFlash2"]), live: {state: "idle"}, requests: [{drafts_offered: null, drafts_accepted: null}]}),
+  liveNone: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 0}), requests: []}),
+  liveNoKeys: v({engine: eng(["Lookup"]), live: live({}), tiers: stat({vram_hit: 1}), requests: []}),
+  liveOld: v({engine: eng(["MTP"]), live: live({elapsed_s: 5}), tiers: {now: {time: now - 100, draft_acc: 9, draft_off: 10}}, requests: []}),
+  beforeThis: v({engine: eng(["MTP"]), live: live({elapsed_s: 2}), tiers: {now: {time: now - 20, draft_acc: 9, draft_off: 10}}, requests: []}),
+  live: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 124, draft_off: 200}), requests: []}),
+  liveAllKept: v({engine: eng(["DSpark", "Lookup"]), live: live({}), tiers: stat({draft_acc: 50, draft_off: 50}), requests: []}),
+  liveRatio: v({engine: eng(["DSpark"]), live: live({}), tiers: stat({drafts: 0.5}), requests: []}),
+  zeroKept: v({engine: eng(["MTP"]), live: live({}), tiers: stat({draft_acc: 0, draft_off: 40}), requests: []}),
+  last: v({engine: eng(["MTP"]), live: {state: "idle"}, requests: [{drafts_offered: 1200, drafts_accepted: 600}]}),
+  oldServer: v({engine: {}, live: {state: "idle"}, requests: []}),
+};
+console.log(JSON.stringify(out));""")
+        for k in ("none", "noneLive", "specOne"):                              # state 1: off, in the field and the figure
+            self.assertEqual((got[k]["state"], got[k]["name"], got[k]["text"]), ("off", "off", "off"), k)
+        self.assertEqual((got["lastSpecOne"]["state"], got["lastSpecOne"]["name"], got["lastSpecOne"]["text"]),
+                         ("off", "MTP", "off"))                                # (idle: the engine's drafter, the last answer had none)
+        for k in ("idleNever", "idleZero", "idleNull", "liveNone", "liveNoKeys", "liveOld", "beforeThis"):
+            self.assertEqual((got[k]["state"], got[k]["text"]), ("waiting", "\u2014"), k)   # state 2: on, nothing drafted yet
+        self.assertEqual(got["idleNever"]["name"], "MTP")
+        self.assertEqual(got["idleNull"]["name"], "DFlash2")
+        self.assertEqual((got["live"]["state"], got["live"]["text"], got["live"]["name"]), ("kept", "62% (124 of 200)", "MTP"))
+        self.assertEqual(got["liveAllKept"]["text"], "100% (50 of 50)")
+        self.assertEqual(got["liveAllKept"]["name"], "DSpark + Lookup")
+        self.assertEqual(got["liveRatio"]["text"], "50%")                       # (an engine that gives the share only)
+        self.assertEqual(got["zeroKept"]["text"], "0% (0 of 40)")                  # a real 0%: drafted, none kept
+        self.assertEqual(got["last"]["text"], "50% (600 of 1,200)")
+        self.assertEqual(got["oldServer"]["state"], "none")
+
+    def test_experts_on_the_ssd_have_their_bytes_like_the_other_tiers(self):
+        got = self.node("""
+const n = {vram_used: 300, ram_used: 500, vram_gb: 12.5, ram_gb: 20.25, disk_gb: 31.4};
+const ds = {vram_used: 40, ram_used: 100, cpu_n: 400, vram_gb: 9, ram_gb: 25, disk_gb: 75.5};
+console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tierShares({vram_used: 5, ram_used: 5}, {experts: 10}),
+  ds4: sv.tierShares(ds, {engine_kind: "ds4"}), full: sv.tierShares({vram_used: 10, ram_used: 0, disk_gb: 0}, {experts: 10})}));""")
+        self.assertEqual((got["glm"]["vu"], got["glm"]["ru"], got["glm"]["disk"]), (300, 500, 1200))
+        self.assertEqual((got["glm"]["vramGb"], got["glm"]["ramGb"], got["glm"]["diskGb"]), (12.5, 20.25, 31.4))
+        self.assertEqual((got["ds4"]["total"], got["ds4"]["disk"], got["ds4"]["diskGb"]), (440, 300, 75.5))
+        self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
+        self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
 
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to

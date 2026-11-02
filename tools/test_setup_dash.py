@@ -288,12 +288,12 @@ class Loading(unittest.TestCase):
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
 class Start(unittest.IsolatedAsyncioTestCase):
-    """./maya.sh on an installed Maya: the real engine (server.py --engine strata) on the screen - its dashboard and
+    """./maya.sh on an installed Maya: the real engine (server.py --engine maya) on the screen - its dashboard and
     log, without the setup's steps or its log; --plain (or no terminal): in the terminal as before."""
 
     async def test_a_start_runs_the_engine_on_the_screen(self):
         got, served = {}, []
-        cmd = [sys.executable, "serve/server.py", "--engine", "strata", "--config", "maya-test.json"]
+        cmd = [sys.executable, "serve/server.py", "--engine", "maya", "--config", "maya-test.json"]
         ui = SimpleNamespace(serve=lambda c, env, info: served.append((c, info)) or 0)
 
         def run(body, version, log_path, me, steps=True):

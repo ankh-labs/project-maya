@@ -308,9 +308,9 @@ struct CompBatch {
 };
 void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
 
-/// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  q6k: the rows are
-/// ggml Q6_K superblocks instead (hd / 256 of them, 210 bytes each, at the start of each row's hd bytes; no scales),
-/// decoded as ggml's dequantize_row_q6_K.
+/// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  fmt 1 / 2 / 3: the rows are
+/// ggml Q6_K superblocks (210 bytes a 256 values), IQ4_NL blocks (18 a 32) or Q5_K superblocks (176 a 256) instead,
+/// at the start of each row's hd bytes (no scales), decoded as ggml's dequantize_row_* (eg_block_value).
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
 /// T tokens -> out F32 [T * cols][hd].

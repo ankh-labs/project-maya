@@ -223,8 +223,9 @@
   ]
  },
  "engram": {
-  "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
+  "revision": "758b04c62d2572f4381d067b32d4686a1c4275b3",
+  "folder": "Engram-BF16",
   "files": {
    "model-00047-of-00048.safetensors": [
     101535150936,

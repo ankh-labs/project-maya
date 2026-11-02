@@ -65,6 +65,53 @@ export async function poll() {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) emit(); });
 
+// ------------------------------------------------------------------ Monitor figures that are computed (unit-tested)
+// The Speculation card: which drafters the engine runs with (the server's engine.speculation, empty: none) and how many of
+// the tokens they drafted the model kept - live while an answer is written (the engine's STAT draft_acc / draft_off, the
+// drafts since the request began), else the last answer's (its DONE line).  Three states, never a made-up 0%:
+//   off      no drafter is configured, or the running request asked for none (spec=1)  -> "off", "off"
+//   waiting  drafting is on, nothing drafted yet                                       -> the mode, "-"
+//   kept     drafting is on and drafts were offered                                    -> the mode, "62% (124 of 200)"
+export function speculationView(m, now = Date.now() / 1000) {
+  const eng = (m && m.engine) || {}, live = (m && m.live) || {}, tn = m && m.tiers && m.tiers.now, last = ((m && m.requests) || [])[0];
+  const modes = Array.isArray(eng.speculation) ? eng.speculation : null;
+  if (modes == null) return {state: "none", name: null, text: ""};                  // (a server that does not say)
+  const running = live.state === "generating";
+  const reqOff = running ? !!live.spec_off : !!(last && last.spec_off);
+  const off = modes.length === 0 || (running && !!live.spec_off);
+  if (off) return {state: "off", name: "off", text: "off", pct: null};
+  // the figures: this answer's while it is written (a reading from before it began is the last answer's: not this one's),
+  // else the last answer's
+  let acc = null, offered = null, pct = null;
+  const since = running && live.elapsed_s != null ? now - live.elapsed_s - 1 : null;
+  if (running) {
+    if (tn && tn.time && (since == null || tn.time >= since) && now - tn.time <= 30) {
+      if (tn.draft_off != null) { offered = +tn.draft_off; acc = +tn.draft_acc || 0; }
+      else if (tn.drafts != null) pct = 100 * tn.drafts;                              // (an engine that gives the share only)
+    }
+  } else if (last && !reqOff && last.drafts_offered != null) {
+    offered = +last.drafts_offered; acc = +last.drafts_accepted || 0;
+  }
+  const name = modes.join(" + ");
+  if (reqOff && !running) return {state: "off", name, text: "off", pct: null};      // (the last answer asked for no drafting)
+  if (offered != null && offered > 0) pct = 100 * acc / offered;
+  if (pct == null) return {state: "waiting", name, text: "\u2014", pct: null};
+  const text = offered != null && offered > 0 ? `${fmt(pct, 0)}% (${fmt(acc)} of ${fmt(offered)})` : `${fmt(pct, 0)}%`;
+  return {state: "kept", name, text, pct, accepted: acc, offered,
+          short: `${fmt(pct, 0)}%`, detail: offered != null && offered > 0 ? `${fmt(acc)} of ${fmt(offered)} drafted` : ""};
+}
+
+// "Where the experts live": the experts in VRAM, in RAM and on the SSD only, each with its bytes (the engine's
+// vram_gb / ram_gb / disk_gb; a count alone when an engine reports no bytes)
+export function tierShares(n, eng = {}) {
+  const ds4 = eng.engine_kind === "ds4";
+  const vu = n.vram_used || 0, ru = n.ram_used || 0;
+  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);
+  const disk = Math.max(0, total - vu - ru);
+  const gbOf = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
+}
+
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request, "strata_mcp":
 // true, which only this page sends); Settings lists the servers and what they offer.

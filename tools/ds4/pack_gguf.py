@@ -1,6 +1,6 @@
 """tools/ds4/pack_gguf.py - the engine's pack for a DeepSeek-V4.1 GGUF (unsloth's DeepSeek-V4.1-Flash-1017 UD-Q8_K_XL
-and the like: dense BF16, routed experts MXFP4, Engram tables MXFP8 or Q6_K), beside the model's files (no weights
-copied).
+and the like: dense BF16, routed experts MXFP4, Engram tables MXFP8, Q6_K, Q5_K or IQ4_NL), beside the model's files
+(no weights copied).
 
     python tools/ds4/pack_gguf.py --model ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL
 
@@ -34,7 +34,7 @@ import sys
 
 TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17),
          67: ("MXFP8", 32, 33),          # ggml type -> (name, values a block, bytes a block); 67: unsloth's fork
-         43: ("MXFP8", 32, 33),          # llama.cpp's own id (unsloth's GGUFs from 2026-10-19 on)
+         43: ("MXFP8", 32, 33),          # unsloth's GGUFs from 2026-10-19 on (upstream's 43 is F8_E4M3: Gguf._type43)
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
@@ -71,6 +71,25 @@ class Gguf:
             pos = f.tell()
             self.data_start = (pos + align - 1) // align * align
         del self.f
+        self._type43(align)
+
+    def _type43(self, align: int):
+        """ggml type 43 means two things: unsloth's MXFP8 (33 bytes a 32 values: its GGUFs' Engram tables, every
+        revision so far) and, in upstream llama.cpp since, F8_E4M3 (one byte a value, no block scales).  The bytes a
+        tensor spans tell them apart: up to the next tensor, or (the last one) the file's end - a file still downloading
+        is never taken for the second (its span is not within an alignment of one byte a value)."""
+        offs = sorted(t[3] for t in self.tensors)
+        for name, typ, dims, off in self.tensors:
+            if typ != 43:
+                continue
+            nel = 1
+            for d in dims:
+                nel *= d
+            later = [o for o in offs if o > off]
+            span = (later[0] if later else self.path.stat().st_size - self.data_start) - off
+            if nel <= span < nel + align and span < nel // 32 * 33:
+                raise SystemExit("%s: %s is in upstream llama.cpp's F8_E4M3 (ggml type 43, one byte a value without "
+                                 "block scales) - the pack reads type 43 as unsloth's MXFP8 only" % (self.path.name, name))
 
     def _str(self):
         n = struct.unpack("<Q", self.f.read(8))[0]

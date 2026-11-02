@@ -1649,7 +1649,9 @@ struct Model::Impl {
     // the in-place pages may hold above the load's own (default 6 on Windows; 0 disables); TRIM_MS the pass interval.
     const float ip_trim_gb = [] {
 #if defined(_WIN32)
+        // (a config's env arrives renamed by tools/maya_names.py env_in: read both names, MAYA_ first, as lookup does)
         const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_GB");
+        if (v == nullptr) v = std::getenv("STRATA_DS4_INPLACE_TRIM_GB");
         return v != nullptr ? (float) std::atof(v) : 6.0f;
 #else
         return 0.0f;
@@ -1657,6 +1659,7 @@ struct Model::Impl {
     }();
     const int ip_trim_ms = [] {
         const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_MS");
+        if (v == nullptr) v = std::getenv("STRATA_DS4_INPLACE_TRIM_MS");
         return v != nullptr ? std::max(50, std::atoi(v)) : 250;
     }();
     std::atomic<bool> ip_on{false};
@@ -3514,6 +3517,9 @@ struct Model::Impl {
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
+        // (experts read from files on several GPUs: 4096 - 3x V100, Maya-XS: an 8K prompt +30%, 32K +8%, 3.5% more
+        // experts in VRAM, decode the same; --prefill-chunk sets it by hand)
+        if (dc == nullptr && o.prefill_chunk < 0 && chunk > 4096 && file_experts && devs.size() > 1) chunk = 4096;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
@@ -4207,8 +4213,8 @@ struct Model::Impl {
                 uint64_t total = 0;
                 for (int li = 0; li < pk.eg_layers; ++li) {
                     const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" && tw->dtype != "MXFP8" &&
-                                          tw->dtype != "F8_E4M3")) {
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "Q5_K" && tw->dtype != "IQ4_NL" &&
+                                          tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
                         err = "Engram RAM: unsupported table type"; return false;
                     }
                     if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
@@ -4221,7 +4227,7 @@ struct Model::Impl {
                     }
                 }
                 eg_io.require_ram();
-                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/Q5_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
             eg_io.start(paths, nth, eg_direct);
@@ -4229,17 +4235,18 @@ struct Model::Impl {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
                 const bool q6k = tw != nullptr && tw->dtype == "Q6_K", iq4 = tw != nullptr && tw->dtype == "IQ4_NL";
-                if ((q6k && pk.eg_hd % 256 != 0) || (iq4 && pk.eg_hd % 32 != 0)) {
+                const bool q5k = tw != nullptr && tw->dtype == "Q5_K";   // (unsloth's UD-IQ2_XXS, UD-Q2_K_XL)
+                if (((q6k || q5k) && pk.eg_hd % 256 != 0) || (iq4 && pk.eg_hd % 32 != 0)) {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " + tw->dtype + " rows of " +
                           std::to_string(pk.eg_hd) + " values (not whole blocks)";
                     return false;
                 }
-                if (tw != nullptr && !q6k && !iq4 && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3") {
+                if (tw != nullptr && !q6k && !q5k && !iq4 && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3") {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": tables in " + tw->dtype +
-                          " (the engine reads Q6_K, IQ4_NL, MXFP8 or FP8)";
+                          " (the engine reads Q6_K, Q5_K, IQ4_NL, MXFP8 or FP8)";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : 0);
+                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : q5k ? 3 : 0);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
@@ -4736,10 +4743,29 @@ struct Model::Impl {
                 ok = ok && rows <= room / 2.0;
             }
             if (groups.size() > 1 && ram != ~uint64_t{0}) ok = ok && 2.0 * C * hand_row * (double) devs.size() <= (double) ram / 8.0;
-            if (ok) return C;
+            if (ok) return gfx11_chunk_cap(C);
         }
         return c0;
     }
+    // RDNA 3 / 3.5 (gfx11, HIP): chunks of 4K tokens read a 16K prompt faster than the 32K / 16K default (Strix Halo,
+    // Maya-XS, experts resident: 16K prompt 524 -> 550 tok/s, the first one after a start 475 -> 550; 1K 492, 256
+    // 340) - so the default is capped there; DS4_CHUNK_GFX11=N changes the cap, 0 leaves the default
+    int gfx11_chunk_cap(int C) const {
+#if defined(STRATA_USE_HIP)
+        const char* e = std::getenv("DS4_CHUNK_GFX11");
+        const int cap = e != nullptr ? std::atoi(e) : kGfx11Chunk;
+        if (cap <= 0 || C <= cap || devs.empty()) return C;
+        for (const Dev& d : devs) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d.id) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx11", 5) != 0)
+                return C;
+        }
+        return cap / 16 * 16;
+#else
+        return C;
+#endif
+    }
+    static constexpr int kGfx11Chunk = 4096;
     // a device's chunk dimensions in a group of nm members: its heads' width, wo_a groups and FFN share (the widest
     // member's: member 0 takes split128's odd blocks), the attention's and the indexer's slabs (the indexer's scores
     // rows are the context wide - about 64 MB of them)
@@ -9505,9 +9531,10 @@ struct Model::Impl {
             std::atomic<bool>& f;
             ~Unflush() { f.store(false, std::memory_order_release); }
         } unflush_{copy_flush};
-        if (x3) copy_flush.store(true, std::memory_order_release);
+        const bool rc = rc_in_tail();   // (recent slots: under the room too - as borrow_begin)
+        if (x3 || rc) copy_flush.store(true, std::memory_order_release);
         cache_drain();
-        if (ln_one || ln_land || x3) rc_drain(x3);
+        if (ln_one || ln_land || x3 || rc) rc_drain(x3 || rc);
         const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
         for (Layer& l : L) {
             if (l.dev != 0 || l.mtp || l.n_main >= l.n_slots) continue;
@@ -9632,8 +9659,8 @@ struct Model::Impl {
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
         const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
-        const bool iq4 = eg_q6k[(size_t) li] == 2;   // (IQ4_NL blocks of 32, their scales inside)
+        const int bfmt = eg_q6k[(size_t) li];        // (a GGUF's block rows, their scales inside: 1 Q6_K superblocks
+                                                     //  of 256, 2 IQ4_NL blocks of 32, 3 Q5_K superblocks of 256)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         if (!defer_dups) first.reserve((size_t) T * cols);
         int64_t hits = 0;
@@ -9688,8 +9715,8 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
-                        } else if (q6k || iq4) {   // (into the row's code bytes; its scale bytes unused)
-                            r.n = (uint32_t) (q6k ? hd / 256 * 210 : hd / 32 * 18);
+                        } else if (bfmt != 0) {   // (into the row's code bytes; its scale bytes unused)
+                            r.n = eg_block_row_bytes(bfmt, hd);
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else {
                             r.n = (uint32_t) hd;
@@ -10708,6 +10735,12 @@ struct Model::Impl {
     static constexpr double kRcDrainMs = 5000.0;
     // for_lend (an EXL3 lender: the recent slots its run borrows): the held fills issued now, and every one waited for -
     // one still to come could land in the run's buffers, or be mapped over what the run wrote there
+    // the recent slots in use (set up at the load while the one-GPU path was on - one_gpu_plan may turn that path off
+    // after its timing, and the slots and their fills stay): they lie in the tail a run of chunks or a picture borrows.
+    // A fill done but not yet mapped, or still to be issued, left there by a lend landed in the buffers or under them,
+    // and the tick after the hand-back mapped its expert over what the run wrote: the decode read garbage (NaN routing,
+    // then an illegal memory access) - a 32K prompt on one GPU after a few shorter ones
+    bool rc_in_tail() const { return recent_n > 0 && !rc_cs.empty(); }
     void rc_drain(bool for_lend = false) {
         if (recent_n <= 0 || rc_cs.empty()) return;
         const double t0 = now_ms();
@@ -17905,9 +17938,10 @@ struct Model::Impl {
             std::atomic<bool>& f;
             ~Unflush() { f.store(false, std::memory_order_release); }
         } unflush_{copy_flush};
-        if (x3) copy_flush.store(true, std::memory_order_release);   // (the drains wait on held swaps and fills)
+        const bool rc = rc_in_tail();   // (recent slots: under the buffers too - every fill done and mapped first)
+        if (x3 || rc) copy_flush.store(true, std::memory_order_release);   // (the drains wait on held swaps and fills)
         cache_drain();
-        if (ln_one || ln_land || x3) rc_drain(x3);   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
+        if (ln_one || ln_land || x3 || rc) rc_drain(x3 || rc);   // (none: v1.1.27's path, no wait)
         bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
         for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
         // (every lending device's room first, before any is touched: a refusal leaves every slot as it was)
@@ -21150,6 +21184,7 @@ Model::Tiers Model::tiers() const {
     else t.ram = t.cpu;
     if (m.store) t.ram = (int) std::min<size_t>((size_t) t.cpu, (size_t) t.ram + m.store->held());
     t.ram_gb = t.ram * t.cpu_blob / 1e9;
+    t.disk_gb = std::max(0, t.cpu - t.ram) * t.cpu_blob / 1e9;
     return t;
 }
 

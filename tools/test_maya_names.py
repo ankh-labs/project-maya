@@ -112,5 +112,13 @@ class EngineSeesMayaOnlySettings(unittest.TestCase):
             self.assertEqual(os.environ["MAYA_UPDATE_CHECK"], "0")
 
 
+class EngineReadsTheConfigName(unittest.TestCase):
+    def test_the_in_place_trim_settings_are_read_under_the_config_name(self):
+        # #728: env_in leaves a config's MAYA_DS4_INPLACE_* settings under STRATA_; the engine must read that name too
+        src = (Path(__file__).resolve().parents[1] / "src" / "ds4" / "ds4_model.cu").read_text(encoding="utf-8")
+        for name in ("MAYA_DS4_INPLACE_TRIM_GB", "MAYA_DS4_INPLACE_TRIM_MS"):
+            self.assertIn(f'"{N.read_as(name)}"', src)
+
+
 if __name__ == "__main__":
     unittest.main()

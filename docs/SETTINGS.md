@@ -191,7 +191,8 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
 | `MAYA_FAIR_SLICE_S` | 0 (off) | the server: an answer that has been decoding this many seconds while another request waits gives the engine to it and continues afterwards, from where it was (the engine keeps its state with what it wrote: one token is read again). Concurrent chats and an agent's side requests no longer wait for a whole answer (4x RTX 4090, a short question during a 3000-token answer: first token after 34 s -> 13-17 s at 15-20). Each switch sets a conversation aside on disk (0.1-1 s up to 100K tokens on a SATA SSD array), so a slow disk wants a longer slice |
 | `MAYA_LOOP_GUARD` | on | the server, every model: an answer that falls into a loop (one block of tokens repeated back to back) is caught as it starts and steered out of it - see [The loop guard](#the-loop-guard). `0` = off (as `"loop_guard": false` in the config) |
-| `MAYA_MODEL_MANAGEMENT` | off | the server: llama.cpp's model management endpoints `POST /models/load`, `POST /models/unload` and `GET /models/sse`, for Open WebUI's Models page (load the model, free its GPU memory, watch its state). They need the API key when one is set. `1` = on (as `"model_management": true` in the config); off, they answer 404 |
+| `MAYA_LOOP_GUARD_COLLAPSE_MAX` | 32000 | the server: how many characters of conversation (content, reasoning and tool calls, roughly tokens x 3.5) the loop guard may still rewrite history in. Above it the prompt is left whole - a collapse changes the prompt's prefix, so the engine's snapshot and checkpoints no longer match and the whole conversation is read again (a 126K-token prompt: 16 chunks, about 2 minutes). The generation-side protections (`stops_short`, `keep_going`, the repetition penalty) still apply there. `0` = no limit, the behaviour before this setting. See #702. |
+| `MAYA_MODEL_MANAGEMENT` | on | the server: llama.cpp's model management endpoints `POST /models/load`, `POST /models/unload` and `GET /models/sse`, for API clients and commands (load the model, free its GPU memory, watch its state). They need the API key when one is set. `0` = off (as `"model_management": false` in the config); off, they answer 404 |
 | `MAYA_VIDEO_MAX_FRAMES` | 240 | the server (GLM): the most frames a video may give (read at 4 a second, so 240 = a minute); a longer video is refused before it is decoded, with its length in the message. Every frame takes an image's share of the context. Videos need ffmpeg and ffprobe installed |
 
 **The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
@@ -381,6 +382,23 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   same thoughts to go on from (GLM-5.3 had one sentence 543 times in an 88K prompt). Only the prompt changes, and each
   message depends only on the ones before it, so the next request's prompt starts the same and the cache holds.
   Counted in `loop_guard.collapsed` and `maya:loop_guard_collapsed_total`.
+- **An answer that ends the turn with nothing new:** in a conversation that repeats itself a model can end its turn
+  with its own words about the loop ("OK - the loop guard is right. Break out: use what I have") or with what it
+  already said - and the agent stops there while the work is not done. Such an answer goes on: a short user message,
+  marked as the server's, follows it ("do not stop here, the task is not done: take the next concrete step") and the
+  model continues in the same answer. An answer with anything new in it - a finding, an answer to the user, one line
+  of it - ends the turn as always, however short it is, and so does any answer after 3 such notes in one answer. The
+  reasoning is not re-opened: it was closed before the answer went out, so the model goes on in the answer's own
+  channel (a client sees the answer continue, not its thinking rewritten). Counted in `loop_guard.kept_going` and
+  `maya:loop_guard_kept_going_total`.
+- **A turn-end marker inside the thinking:** a model that quotes these markers, or writes about them, wrote them in its
+  thinking - and there the server ended the turn (or the engine itself, at its EOS token): the thinking was cut off
+  and the answer never came. Inside the thinking such a marker is the model's text, not the turn's end: the server
+  skips the marker's token and the thinking goes on; at the engine's own end-of-sequence token it goes on from the
+  quote with a short note as the server's (at most twice), and the thinking continues in its own channel. In the
+  answer a marker other than the engine's own EOS token, written as text - quoted in inline code or a code fence, or
+  inside a tool call's arguments - is text too; a marker spelled out of ordinary pieces in the answer's prose still
+  ends it, and so does the engine's EOS token there (a call cut off by it is incomplete, not failed).
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
@@ -461,7 +479,7 @@ context shares the memory beside the model among the N conversations.
   piece's (a prompt that fits in one piece still goes after one token). A share helps a short answer beside a long
   read (on 3 GPUs, 20: a 24-token answer beside a 101K read done in 15-30 s, not 56 s) but delays the next long
   reads, so it is off: in `tools/ds4/agent_bench.py` it made a turn's first token later.
-  `MAYA_DS4_READ_ORDER=arrival` reads each prompt whole as it comes, the others waiting (as v1.1.34 did). On 3 GPUs
+  `MAYA_DS4_READ_ORDER=arrival` reads each prompt in the order it came, the others waiting (as v1.1.34 did); with an answer running, the prompt is read in pieces and the answer writes between them, so it never stalls for a whole read. On 3 GPUs
   (2x RTX 5090 + RTX 3090, GSQ IQ2_XXS, about half the experts in RAM), `tools/ds4/agent_bench.py` - 4 agents x 8
   turns, 4-12K-token first prompts, tool results of 150-2,000 tokens with one in ten of 5-20K: a turn's first token
   5.23 s on the mean and 13.5 s at p95, against 6.14 and 29.1 s whole; a turn done and the wall the same (20.0 s,
@@ -1838,7 +1856,7 @@ Engine options, in the config's `"args"`:
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
-| `MAYA_EXPERT_STAGERS` | a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
+| `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
 ## HIP EXL3 single-row matrix jobs
 

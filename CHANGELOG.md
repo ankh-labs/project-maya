@@ -4,6 +4,99 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.49 - 2026-11-02
+
+A fix release: Maya-XS updates start cleanly and give back their disk space, and Qwen CYBER-FROST runs on 8 GB cards again.
+
+- **DeepSeek Maya-XS v1 -> v2 update:** a start could stop with "changed after the pack was built" even after `--setup --repack`, because the old copy of the n-gram tables was checked instead of the shared one the model reads (#777, thanks @waxinz). Running the setup once also turns that old copy into a link to the shared one, giving back about 161 GB.
+- **Qwen CYBER-FROST on 8 GB cards:** v1.1.48 could run out of GPU memory on the first request or during the speed calibration. Maya now keeps room for the first request's buffers on small cards; bigger cards are unchanged. On an RTX 3050 8 GB it writes about as fast as before or faster, and the speed calibration completes.
+
+## v1.1.48 - 2026-11-01
+
+Faster prompt reading for DeepSeek on several GPUs, no more re-reading after the thinking budget, and fixes.
+
+- **DeepSeek on several GPUs, with some experts read from the disk or RAM:** prompts are read in 4K-token pieces by default, which reads an 8K prompt about 24-30% faster on 3x V100 and leaves room for about 3.5% more experts on the GPUs. `--prefill-chunk` still sets it by hand.
+- **DeepSeek's thinking budget:** when the budget closes the thinking, the next turn no longer reads the whole thinking again (59 s at 32K tokens before); it continues from the cache (#746).
+- **`MAYA_DS4_READ_ORDER=arrival`:** a running answer keeps writing while another long prompt is read, instead of stopping until the read ends (#751).
+- **Setup screen:** no longer stuck at "Loading the model" when the model is already serving (#729).
+- **`--engine strata`** (the old name in older run scripts) starts the real engine again; v1.1.47 started the test engine instead (#770, thanks @cresslank, #771).
+- `tools/ds4/slot_keep_test.py` runs on Windows (#743).
+
+## v1.1.47 - 2026-11-01
+
+A better and faster DeepSeek-V4.1-Flash Maya-XS, smaller downloads for unsloth's DeepSeek quants, and a cleaner Monitor.
+
+- **DeepSeek Maya-XS v2:** about 12% closer to the original model (KLD 0.251 against 0.284) and about 20% faster at writing, at almost the same size (117 GB). The weights every token uses are now stored more compactly, which leaves room for more experts on the GPU, and 12 layers get a higher-quality format. Running the setup again asks whether to update an existing Maya-XS or keep it: the update downloads only the new model files (117 GB), keeps the n-gram tables, and removes the old files once the new ones are complete.
+- **One set of n-gram tables for every DeepSeek quant:** unsloth's quants now use Maya's Q6_K n-gram tables, shared with Maya's own quants on disk. Measured with the same scorer, they lose nothing against the larger MXFP8 tables, and the Q8 download drops from 508 to 467 GB.
+- **Monitor:** the peak decode speed sits small beside the live Decode figure, Decode and Prefill sit side by side on a phone, and Speculation shows the share of drafts kept as the main figure, with the drafter below it.
+- **Load and unload models from any API client or command:** the `/models/load`, `/models/unload` and `/models/sse` endpoints are now on by default (`"model_management": false` turns them off).
+- **`--engine maya`** for the server (the old name still works), and Maya introduces itself as Maya to MCP servers.
+
+## v1.1.46 - 2026-10-31
+
+DeepSeek reads long prompts about 5% faster on AMD Strix / Gorgon Halo, and three fixes.
+
+- **Strix / Gorgon Halo:** DeepSeek reads a 16K prompt about 5% faster (the prompt is read in 4K-token pieces on these GPUs, with the same answers).
+- **Long agent sessions:** a request whose messages carry their content as parts no longer fails with an error (#717).
+- **Tool calls:** a tool call with an unclosed parameter tag is handled as a malformed call instead of failing the request (#706).
+- **DeepSeek on Windows:** the in-place memory trim settings given in a config now reach the engine (#728).
+
+## v1.1.45 - 2026-10-31
+
+A fix for DeepSeek-V4.1-Flash on one GPU.
+
+- **DeepSeek on one GPU: no more illegal memory access after a few long prompts.** After several requests of different lengths, a long prompt on one GPU could overlap experts the engine was still loading in the background, and the next step failed with an illegal memory access (often reported later as an error in an unrelated call). The background loads are now finished before a prompt uses that memory. Prompts of 32K, 64K and 128K on one GPU run, with the same answers and the same speed as before. The problem had been there since at least v1.1.41; setups with two or more GPUs were not affected.
+
+## v1.1.44 - 2026-10-31
+
+DeepSeek-V4.1-Flash's setup lists one more of unsloth's quants, UD-IQ1_M, for PCs with about 150 GB of VRAM + RAM, and the Q8 now says in the setup how close it is to the original.
+
+- **UD-IQ1_M in the setup's list** (`--ds4-quant gguf-iq1_m`): unsloth's UD-IQ1_M, about 140 GB of VRAM + RAM plus 110 GB of n-gram tables read from the SSD (a 250 GB download). It sits after Maya's own quants, before UD-IQ3_S.
+- **The Q8 (UD-Q8_K_XL) in the setup:** its line now gives its quality next to the others' (the closest to the original model), and it and UD-Q4_K_XL are pinned to unsloth's current revision. The files are the same, so an existing install downloads nothing again.
+- **docs/MODELS.md:** the unsloth rows say in short who each is for.
+
+## v1.1.43 - 2026-10-31
+
+DeepSeek-V4.1-Flash now runs unsloth's DeepSeek GGUF quants, and the setup lists UD-IQ3_S: close to Q8's quality for PCs
+with about 270 GB of VRAM + RAM. Long agent conversations are no longer read again from the start when the loop guard
+steps in (the next turn came back about 15x sooner in our tests), answers that write a turn-end marker inside their
+thinking now finish, and the Monitor shows which drafter runs and how many of its drafts the model keeps, live. Maya
+started as a service skips the speed calibration instead of looping, and experts read from the SSD use as many reads at
+once as the drive serves fastest. Against v1.1.42 on our test PCs, decode and prompt speeds
+are unchanged for every model.
+
+- **DeepSeek: unsloth's GGUF quants** (thanks to unsloth for the quants):
+  - **UD-IQ3_S** is in the setup's list, between Maya-S and the Q8 (`--ds4-quant gguf-iq3_s`). It measures close to
+    Q8: a KLD of 0.061 against the original model, where Q8 has 0.047 and Maya-S 0.119 (KLD: how far the quant's
+    next-token choices drift from the original's; lower is better). About 262 GB of VRAM + RAM hold it, plus the
+    161 GB of n-gram tables read from the SSD.
+  - The other unsloth quants can be set up by hand: `--ds4-quant gguf-iq1_s`, `gguf-iq1_m`, `gguf-iq2_xxs`,
+    `gguf-q2_k_xl`, `gguf-iq3_xxs` and `gguf-q3_k_xl`, pinned to unsloth's 2026-10-28 upload; UD-Q4_K_XL and
+    UD-Q8_K_XL work as before.
+  - Pictures with every unsloth quant, from the picture encoder file in unsloth's own repo (a 0.97 GB download).
+  - One copy of the n-gram tables: UD-IQ3_S and Maya's quants hold the same 161 GB of tables, so with one of them on
+    the disk the setup of the other reuses that copy instead of downloading it again.
+  - The setup's free-space check counts each file against the disk it actually lands on.
+- **Agents and the loop guard:**
+  - A long conversation's prompt is kept whole when the loop guard steps in, so the conversation cache is still used:
+    on a 150K-token agent conversation the next turn took about 15x less time with GLM and with DeepSeek (#704, thanks
+    @tonykee; fixes #702). `MAYA_LOOP_GUARD_COLLAPSE_MAX` sets the size from which a prompt is left whole.
+  - The loop guard's follow-up call always fits the context: an answer it lets go on, or a request without
+    `max_tokens`, no longer ends in an engine error (a v1.1.41 regression; #696, thanks @Jellepepe).
+  - A turn-end marker written inside the thinking is now read as the model's text: the answer goes on and finishes
+    instead of stopping mid-thinking, with DeepSeek and GLM, and a client's own stop strings work inside code again
+    (#709, thanks @markrussi).
+- **Monitor:** the Speculation card shows the drafter that runs (DSpark, DFlash2, MTP, prompt lookup) and the share of
+  its drafts the model keeps, live while an answer is written, for GLM, DeepSeek, MiniMax and Qwen. "SSD only" in
+  "Where the experts live" now shows its GB, and the Throughput card has no blank space on a phone any more.
+- **Running Maya as a service:** a start with no terminal (systemd, a script, or `--yes`) begins with the default
+  settings instead of measuring first, and prints the one command to run the calibration later. A service no longer
+  loops for ever when its start timeout ends the calibration. docs/SETUP.md has a systemd section (#690, thanks
+  @ZackO2o for the report).
+- **Experts read from the SSD (Linux):** how many reads run at once is now measured for each drive at its first start (about
+  a second, then remembered), instead of guessed from the CPU. On an NVMe beside an 8 GB card, Qwen CYBER-FROST
+  decoded up to 5% faster with its experts read from the SSD.
+
 ## v1.1.42 - 2026-10-30
 
 Pictures on every model and every build: GLM-5.3-Flash now reads pictures on AMD GPUs too, Qwen-3.8-Flash-Next

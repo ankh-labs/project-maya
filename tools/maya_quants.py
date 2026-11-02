@@ -65,6 +65,11 @@ QUANTS = (
 # the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name); also
 # the ones an install can still have though the list no longer offers them (DeepSeek's UD-Q4_K_XL: maya.DS4_BY_HAND)
 OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4_K_XL",
+          # (unsloth's smaller UD quants: maya.DS4_UD, chosen by hand too)
+          ("deepseek", "gguf-iq1_s"): "UD-IQ1_S", ("deepseek", "gguf-iq1_m"): "UD-IQ1_M",
+          ("deepseek", "gguf-iq2_xxs"): "UD-IQ2_XXS", ("deepseek", "gguf-q2_k_xl"): "UD-Q2_K_XL",
+          ("deepseek", "gguf-iq3_xxs"): "UD-IQ3_XXS", ("deepseek", "gguf-iq3_s"): "UD-IQ3_S",
+          ("deepseek", "gguf-q3_k_xl"): "UD-Q3_K_XL",
           ("deepseek", "exl3"): "EXL3 2.9 bpw", ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",

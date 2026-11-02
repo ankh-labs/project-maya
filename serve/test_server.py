@@ -2152,13 +2152,14 @@ class ModelManagement(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_off_unless_the_config_turns_it_on(self):
+    def test_on_unless_the_config_turns_it_off(self):
         for method, path in (("POST", "/models/load"), ("POST", "/models/unload"), ("GET", "/models/sse")):
             self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 404, path)
         self.assertEqual((self.engine.closes, self.engine.restarts), (0, 0))
         from serve.server import model_management_setting
-        self.assertFalse(model_management_setting({}, env={}))
+        self.assertTrue(model_management_setting({}, env={}))
         self.assertTrue(model_management_setting({"model_management": True}, env={}))
+        self.assertFalse(model_management_setting({"model_management": False}, env={}))
         self.assertFalse(model_management_setting({"model_management": True}, env={"MAYA_MODEL_MANAGEMENT": "0"}))
         self.assertTrue(model_management_setting({}, env={"MAYA_MODEL_MANAGEMENT": "on"}))
 
@@ -2500,6 +2501,18 @@ class ThinkingBudgetAtASentenceEnd(unittest.TestCase):
         _, calls = self.run_one(self.SENT, 1500, 1501)            # (no room: the budget alone, as before)
         self.assertEqual(calls[0]["_think_budget"], 1500)
         self.assertNotIn("_think_soft", calls[0])
+
+    def test_engine_gets_the_soft_close_tables(self):   # (#746)
+        class Tok:
+            tokens = ["a", "end.", ".", "\n", "3.", "x"]
+
+            def decode(self, ids):
+                return self.tokens[ids[0]]
+        from serve import server
+        keys = server.think_stop_tables(Tok())
+        self.assertEqual(keys, " think_stop=1,3 think_weak=2 think_dig=1,2,4")
+        smp = {"_think_budget": 612, "_think_end": 9, "_think_soft": 100, "_think_stops": keys}
+        self.assertIn("think_soft=100 think_stop=1,3", StrataEngine.sampling_keys(smp))
 
 
 class MalformedToolCallAnswers(unittest.TestCase):

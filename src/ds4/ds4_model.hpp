@@ -369,6 +369,7 @@ public:
     struct Tiers {
         int vram = 0, ram = 0, cpu = 0;
         double vram_gb = 0, ram_gb = 0, cpu_blob = 0;
+        double disk_gb = 0;   // the CPU lane's experts neither copied nor read ahead into RAM: on the SSD only
     };
     Tiers tiers() const;
 

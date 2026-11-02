@@ -46,6 +46,8 @@
 .speed__big { font-size: var(--st-fs-hero); font-weight: 600; letter-spacing: -.03em; line-height: 1.05; }
 .speed__mid { font-size: 30px; font-weight: 600; letter-spacing: -.02em; line-height: 1.15; }
 .speed__mid small { font-size: var(--st-fs-md); }
+.speed__row { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+.speed__peak { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; }
 .spark-wrap { position: relative; height: 72px; }
 .spark-wrap__empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .spark-wrap.is-empty .spark-wrap__empty { display: flex; }
@@ -59,6 +61,8 @@
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; padding-top: 14px; border-top: 1px solid var(--st-line); }
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat__label { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.stat__value--text { white-space: normal; overflow-wrap: anywhere; }
+.stat__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .stat__value { font-size: var(--st-fs-stat); font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat__value small { margin-left: 4px; font-size: var(--st-fs-sm); }
 
@@ -179,7 +183,14 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
-  .speeds { row-gap: 14px; }
+  .speeds { row-gap: 14px; flex-wrap: nowrap; justify-content: space-between; gap: 16px; }
+  /* Decode and Prefill side by side; the peak a small line under Decode */
+  .speed__row { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .speed__mid { font-size: 26px; }
+  /* the three one-line figures side by side, the taller Speculation on its own row: no blank under a short one */
+  .stats { grid-template-columns: repeat(3, auto); justify-content: space-between; column-gap: 8px; }
+  .stats .stat__label { white-space: nowrap; }
+  .stat--spec { grid-column: 1 / -1; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }

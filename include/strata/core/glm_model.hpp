@@ -139,6 +139,7 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
     };
     FastStats fast_stats() const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total

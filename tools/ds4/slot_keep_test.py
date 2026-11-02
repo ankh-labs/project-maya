@@ -57,6 +57,31 @@ from typing import Callable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import maya_names  # noqa: E402  (tools/) a model config's settings under the names the engine reads
 
+if os.name == "nt":      # PeekNamedPipe, below: select() takes only sockets on Windows (WinError 10093)
+    import ctypes
+    import ctypes.wintypes
+    import msvcrt
+
+
+def _readable(stream, timeout_s: float) -> bool:
+    """Whether a read on `stream` would not block within `timeout_s` (data or end): select() on POSIX, PeekNamedPipe on Windows."""
+    if os.name != "nt":
+        r, _, _ = select.select([stream], [], [], timeout_s)
+        return bool(r)
+    end = time.monotonic() + timeout_s
+    handle = msvcrt.get_osfhandle(stream.fileno())
+    while True:
+        avail = ctypes.wintypes.DWORD(0)
+        if not ctypes.windll.kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None):
+            return True      # (the pipe is closed: the read reports the end)
+        if avail.value:
+            return True
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.02, left))
+
+
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
 META_MAGIC = 0x334154454d345344   # "DS4META3" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
 DS4_ENV = ("DS4_", "STRATA_DS4_")   # (the engine's own names: it aliases MAYA_DS4_* to STRATA_DS4_* at start)
@@ -134,8 +159,7 @@ class Engine:
                 raise RuntimeError("the engine did not answer in time")
             if self.proc.poll() is not None:
                 raise RuntimeError(f"the engine ended (exit {self.proc.returncode})")
-            r, _, _ = select.select([self.proc.stdout], [], [], min(left, 1.0))
-            if not r:
+            if not _readable(self.proc.stdout, min(left, 1.0)):
                 continue
             chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
             if not chunk:
@@ -175,8 +199,7 @@ class Engine:
             pass
         end = time.monotonic() + timeout
         while time.monotonic() < end and self.proc.poll() is None:
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.2)
-            if not r:
+            if not _readable(self.proc.stdout, 0.2):
                 continue
             chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
             if not chunk:

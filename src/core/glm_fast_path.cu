@@ -1954,6 +1954,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
         }
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) F->all_bytes += (size_t) g.n_expert * (size_t) F->lp[(size_t) il].stride;
         F->upd_at.assign((size_t) (2 * F->n_keys + NL * gf::kSpares), 0);
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
@@ -4356,6 +4358,7 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.pool_slots += F->pool_slots;
         s.pool_gb += (double) F->pool_bytes / 1073741824.0;
         s.ram_gb += (double) F->ram_bytes / 1073741824.0;
+        s.all_gb += (double) F->all_bytes / 1073741824.0;
         for (const auto& P : F->lp)
             for (char c : P.st) s.pool_used += c == FastState::kResident;
         for (const auto& R : F->rc) {

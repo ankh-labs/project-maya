@@ -27,6 +27,10 @@ and runs it again (GLM-5.3 ran two commands in turn 25 times over opencode, unti
                      all the same - come TOOL_REPS times among the last TOOL_WINDOW calls since the user's last
                      message?  Then tool_note() follows that result as a message of its own, for the model to read before it
                      answers (inside the tool's result GLM-5.3 ran the call a 4th time; as a message it moved on).
+    stops_short      ... and the conversation repeats itself (collapse): the same model ended its turn with talk about
+                     its loop, or with what it had already said, and the agent stopped there.  Such an answer - one
+                     that says nothing new - goes on (KEEP_NOTE, answered, not thought about), at most KEEP_MAX times
+                     in one answer; an answer with anything new in it ends the turn as always.
 
 Until a loop is seen nothing changes: the engine gets the same calls with the same sampling and writes the same
 tokens (the stream only holds back up to HOLD_MAX tokens of a tail that repeats while it does).  Legit repetition - a table's rows, an array
@@ -39,6 +43,7 @@ it on for that request when the server has it off).
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from typing import Callable, NamedTuple
@@ -323,12 +328,20 @@ GO_ON = re.compile(r"(?i)\s*(please\s+)?(continue|proceed|go on|go ahead|keep go
                    r"yes|y|sure|do it)\s*[.!]*\s*")
 
 
+def _text(c) -> str:
+    """A message's content as text: a string as is; a list of content parts (OpenAI form) by its text parts, joined.
+    Anything else (None, a part without text) is ""."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(p.get("text", "") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
 def go_on(m: dict) -> bool:
     """A user message that only says to go on ("continue", "proceed", "ok"): it says nothing new, so it does not
     start the count over (a user's "continue" set GLM-5.3 off on the same loop again, twice)."""
-    c = m.get("content")
-    text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c or [] if isinstance(p, dict))
-    return bool(GO_ON.fullmatch(text))
+    return bool(GO_ON.fullmatch(_text(m.get("content"))))
 
 
 def _gist(result: str) -> str:
@@ -535,6 +548,29 @@ def echoes(messages: list[dict]) -> bool:
         longest >= ECHO_TURNS
 
 
+# Above this many characters of conversation (roughly tokens x 3.5) the prompt is left whole: collapsing history
+# rewrites the prompt's prefix, and the engine's conversation cache (snapshot/checkpoints) then no longer matches, so
+# the whole conversation is read again (a 126K-token prompt: 16 chunks, ~2 minutes, #702).  The generation-side
+# protections (stops_short, keep_going, the repetition penalty) still apply to long conversations.
+# MAYA_LOOP_GUARD_COLLAPSE_MAX overrides it; 0 = no limit (the behaviour before #702).
+COLLAPSE_MAX_CHARS = 32000
+
+
+def conv_chars(messages: list[dict]) -> int:
+    """The conversation's size in characters (content, reasoning and tool calls): what COLLAPSE_MAX_CHARS bounds."""
+    n = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            n += len(c)
+        r = m.get("reasoning_content")
+        if isinstance(r, str):
+            n += len(r)
+        for tc in m.get("tool_calls") or []:
+            n += len(json.dumps(tc, ensure_ascii=False))
+    return n
+
+
 def collapse(messages: list[dict]) -> Collapse | None:
     """The prompt of a conversation that carries a loop (echoes()) without what the model already wrote: a paragraph
     of its reasoning or text that it wrote before (an earlier message, or earlier in the same one) is left out, and
@@ -542,10 +578,16 @@ def collapse(messages: list[dict]) -> Collapse | None:
     bytes) goes with its results and its thinking.  What the
     model sees is then what it found, once - not dozens of copies of the same thoughts to go on from (GLM-5.3 had
     "Hmm - hold on: I realize something important." 543 times in an 88K prompt, 89% of its own text repeats).  Each
-    message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop, or
-    nothing to leave out."""
+    message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop,
+    nothing to leave out, or a conversation above COLLAPSE_MAX_CHARS (whose prompt must not change, #702)."""
     if not echoes(messages):
         return None
+    try:
+        limit = int(os.environ.get("MAYA_LOOP_GUARD_COLLAPSE_MAX") or COLLAPSE_MAX_CHARS)
+    except ValueError:          # (a setting that is not a number: the default, not a failed request)
+        limit = COLLAPSE_MAX_CHARS
+    if limit and conv_chars(messages) > limit:
+        return None          # a long conversation keeps its prompt whole: the engine's cache stays valid (#702)
     out, seen, made, paras, rounds, i, last = [], set(), set(), 0, 0, 0, None
     while i < len(messages):
         m = messages[i]
@@ -573,14 +615,14 @@ def collapse(messages: list[dict]) -> Collapse | None:
             # a round that repeats: the call and its result go, and the thinking around them (the loop's own
             # talk); text the model wrote to the user, if new, stays
             rounds += 1
-            if (m.get("content") or "").strip():
+            if _text(m.get("content")).strip():
                 out.append({"role": "assistant", "content": m["content"]})
             i = j
             continue
         made.update(keys)
         if keys:
             last = gists
-        if (m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip() or m.get("tool_calls"):
+        if _text(m.get("content")).strip() or (m.get("reasoning_content") or "").strip() or m.get("tool_calls"):
             out.append(m)
         i += 1
     return Collapse(out, paras, rounds) if paras or rounds else None
@@ -590,8 +632,9 @@ def collapse(messages: list[dict]) -> Collapse | None:
 TALK = re.compile(r"(?i)loop.?guard|break(ing)? out|stop (repeating|re-running|theorizing)|act differently|"
                   r"change (approach|something real)|identical (output|result|nc|grep|command|call)|"
                   r"(been|keep|kept|am) (looping|stuck|repeating)|repeating myself|in a (reasoning )?loop")
-KEEP_SHORT = 300        # an answer that ends the turn with less text than this (or only TALK) in a looping conversation
-KEEP_MIN = 2            # ... and any answer that ends the turn there, the first this many times in an answer, goes on
+KEEP_MAX = 3            # an answer that ends the turn with nothing new in a looping conversation goes on: at most
+#                         this many times in one answer (then it ends - a model that only talks must not be pushed on
+#                         until the token cap)
 
 
 def talk(text: str) -> bool:
@@ -607,11 +650,11 @@ def said_before(messages: list[dict]) -> set[str]:
 
 def stops_short(text: str, seen: set[str] = frozenset()) -> bool:
     """Does an answer that ends the turn (no tool call) in a conversation that repeats itself end it with nothing new:
-    talk about its loop, what it already said (`seen`), or a line or two?  GLM-5.3 ended its turn with "OK - the
-    loop guard is right. ... Break out: use what I have or answer the user." - and the agent stopped; then with its
-    "What I actually know" list once more.  A report that says something new may end the turn."""
-    kept = [u for u, _ in _units(text, "content") if u.strip() and not talk(u) and _key(u) not in seen]
-    return len(" ".join(kept).strip()) < KEEP_SHORT
+    talk about its loop, or what it already said (`seen`) - or nothing at all?  GLM-5.3 ended its turn with "OK -
+    the loop guard is right. ... Break out: use what I have or answer the user." - and the agent stopped; then with
+    its "What I actually know" list once more.  Anything new in the answer - a finding, an answer to the user, one
+    line of it - may end the turn: "30.10.2026" said to a user who asked for the date is not nothing."""
+    return not any(u.strip() and not talk(u) and _key(u) not in seen for u, _ in _units(text, "content"))
 
 
 KEEP_NOTE = ("[The server's loop guard, not the user: do not stop here, the task is not done. Keep working on it: "

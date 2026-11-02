@@ -1072,7 +1072,10 @@ struct TpEngine::Impl {
             }
         }
         for (const Layer& l : L)
-            if (l.moe) st.experts += g.n_exp;
+            if (l.moe) {
+                st.experts += g.n_exp;
+                st.all_gb += (double) ((size_t) g.n_exp * l.blob * G[(size_t) l.group].mem.size()) / (1u << 30);
+            }
         // the resident slices from the files, a thread a GPU (two pinned buffers each, alternating)
         {
             std::vector<std::thread> th;

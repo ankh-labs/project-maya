@@ -2550,6 +2550,37 @@ void test_engram_iq4nl(cudaStream_t s) {
     std::printf("%-52s %s\n", "Engram IQ4_NL rows = ggml's, bit for bit", same ? "ok" : "FAIL");
     cudaFree(d_rows), cudaFree(d_out);
 }
+// ---------------------------------------------------------------- Engram rows in Q5_K (unsloth's UD-IQ2_XXS / Q2_K_XL)
+__global__ void q5k_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's Q5_K branch)
+    const int r = blockIdx.x;
+    for (int e = threadIdx.x; e < hd; e += blockDim.x)
+        out[(size_t) r * hd + e] = strata::ds4::eg_block_value(rows + (size_t) r * hd, e, 3);
+}
+void test_engram_q5k(cudaStream_t s) {
+    const int n = 64, hd = 512, sb = hd / 256;   // rows hd bytes apart (as the engine keeps them), 2 superblocks of 176
+    const std::vector<uint8_t> packed = q_rand(gg::iq::kQ5_K, n, hd);
+    std::vector<uint8_t> rows((size_t) n * hd, 0);
+    for (int r = 0; r < n; ++r)
+        std::memcpy(&rows[(size_t) r * hd], &packed[(size_t) r * sb * strata::ds4::kQ5kBytes],
+                    (size_t) sb * strata::ds4::kQ5kBytes);
+    std::vector<float> want((size_t) n * hd);
+    ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(packed.data(), want.data(), (int64_t) n * hd);
+    uint8_t* d_rows = dev(rows);
+    float* d_out = dev(std::vector<float>((size_t) n * hd));
+    q5k_rows_kernel<<<n, 256, 0, s>>>(d_rows, hd, d_out);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> got = host(d_out, (size_t) n * hd);
+    size_t bad = 0, at = got.size();
+    for (size_t i = 0; i < got.size(); ++i)
+        if (std::memcmp(&got[i], &want[i], 4) != 0 && bad++ == 0) at = i;
+    const bool same = bad == 0 && strata::ds4::eg_block_row_bytes(3, hd) == (uint32_t) sb * 176;
+    if (!same) ++g_fail;
+    if (same) std::printf("%-52s ok\n", "Engram Q5_K rows = ggml's, bit for bit");
+    else
+        std::printf("%-52s FAIL  %zu values differ (first at %zu: %.9g vs %.9g)\n", "Engram Q5_K rows = ggml's, bit for bit",
+                    bad, at, at < got.size() ? got[at] : 0.0f, at < got.size() ? want[at] : 0.0f);
+    cudaFree(d_rows), cudaFree(d_out);
+}
 void test_q6k_host() {
     const int nb = 512;
     std::vector<uint8_t> w = q_rand(gg::iq::kQ6_K, 1, nb * 256);
@@ -3055,6 +3086,7 @@ int main(int argc, char** argv) {
     test_mv(s);
     test_engram_q6k(s);
     test_engram_iq4nl(s);
+    test_engram_q5k(s);
     test_q5k_host();
     test_q6k_host();
     test_experts(512, 256, s);

@@ -351,9 +351,9 @@ int pack_info(const std::string& dir, const std::string& profile_path, const Ker
         if (name.find(".engram.embed.") != std::string::npos) {   // the Engram tables: the host's reader, from the files
             b_engram += (double) x.bytes;
             if (ends_with(name, ".weight")) eg_types.insert(x.dtype);
-            if (ends_with(name, ".weight") && x.dtype != "Q6_K" && x.dtype != "IQ4_NL" && x.dtype != "MXFP8" &&
-                x.dtype != "F8_E4M3")
-                bad("an Engram table in " + x.dtype + " (the reader takes Q6_K, IQ4_NL, MXFP8 or FP8)");
+            if (ends_with(name, ".weight") && x.dtype != "Q6_K" && x.dtype != "Q5_K" && x.dtype != "IQ4_NL" &&
+                x.dtype != "MXFP8" && x.dtype != "F8_E4M3")
+                bad("an Engram table in " + x.dtype + " (the reader takes Q6_K, Q5_K, IQ4_NL, MXFP8 or FP8)");
             continue;
         }
         if (name == "embed.weight") {   // the token embedding: pinned RAM, decoded to BF16 rows at the load

@@ -37,6 +37,24 @@ STEPS = {1: "This PC", 2: "Choices", 3: "Packages", 4: "Engine", 5: "Model", 6: 
          9: "Tuning", 10: "Dashboard", 11: "Log"}
 SERVE, LOG = 10, 11
 ROOT = Path(__file__).resolve().parents[1]              # the Maya folder (top right)
+READY = re.compile(r"(?:^|\s|\x1b\[[0-9;]*m)ready: http")      # the server's "ready:" line, wherever it sits in the chunk
+PROBE_S = 3.0                                       # while it loads: ask /health this often (a missed "ready:" line)
+
+
+def is_ready(line: str) -> bool:
+    return bool(READY.search(line)) or "the model runs with" in line or "engine is running again" in line
+
+
+def health_ok(api: str) -> bool:
+    """Maya's server answers /health: it is up (api: http://host:port/v1)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(api.rstrip("/").removesuffix("/v1") + "/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:                                # noqa: BLE001 - not up yet
+        return False
+
+
 DONE = re.compile(r"\] done: (\d+) tokens in [\d.]+ s \(([\d.]+) tok/s\)")   # the server, after an answer
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 DRAIN_S, IDLE_DRAIN_S = 0.05, 0.25                        # the setup's events: looked for this often / when quiet
@@ -73,6 +91,7 @@ class SetupApp(App):
         self.written, self.flow = 0, 0                  # lines in the output box, and the width they wrap at
         self.printed = ""                               # print() from other threads, until its line ends
         self.serving = None                             # Maya's server, once it runs here: what the card shows
+        self.probed, self.probing = 0.0, None            # the last /health look while it loads, and its thread
         self.served = deque(maxlen=5000)                # its output (only here: it can run for days)
 
     def get_css_variables(self) -> dict[str, str]:
@@ -247,6 +266,9 @@ class SetupApp(App):
             self.set_bar(done / total, f"{done} of {total}{left}")
 
     def ev_status(self, line: str) -> None:
+        if self.serving and is_ready(line):             # (a "ready:" that came with a carriage return: still ready)
+            self.ev_live(line)
+            return
         meter = curl_meter(line)
         if meter:
             self.set_bar(*meter)
@@ -290,7 +312,7 @@ class SetupApp(App):
         if self.view == LOG:
             self.write("live", line)
         s, m = self.serving, DONE.search(line)
-        if line.startswith("ready:") or "the model runs with" in line or "engine is running again" in line:
+        if is_ready(line):
             s["state"], s["since"], self.state[SERVE] = "ready", time.monotonic(), "ready"
             self.draw_tabs()
         elif "reloading the model" in line or "the engine had stopped" in line:   # (a load again: from 0%)
@@ -299,6 +321,26 @@ class SetupApp(App):
                                                          "Starting the engine again"), time.monotonic(), "run"
         elif m:
             s["speed"] = f"{m.group(1)} tokens at {m.group(2)} tok/s"
+
+    def ev_up(self) -> None:
+        """/health answered while the screen still said it loads: the line that says so was missed."""
+        s = self.serving
+        if s and s["state"] != "ready":
+            s["state"], s["since"], self.state[SERVE] = "ready", time.monotonic(), "ready"
+            self.draw_tabs()
+
+    def probe(self) -> None:
+        """While the screen says the model loads, /health is asked now and then (a thread; never blocks the screen)."""
+        s, now = self.serving, time.monotonic()
+        if not s or s["state"] == "ready" or not s.get("api") or now - self.probed < PROBE_S:
+            return
+        self.probed = now
+        api = s["api"]
+        if self.probing and self.probing.is_alive():
+            return
+        self.probing = threading.Thread(target=lambda: health_ok(api) and self.bridge.events.put(("up",)),
+                                        daemon=True)
+        self.probing.start()
 
     def ev_end(self, end: tuple) -> None:
         self.end_step("fail" if end[0] in ("fail", "error") else None)
@@ -455,6 +497,7 @@ class SetupApp(App):
     def tick(self) -> None:
         self.set_tick(TICK_S if self.animating() else IDLE_TICK_S)
         self.frame += 1
+        self.probe()
         if self.state.get(self.cur) == "run":
             self.draw_tabs()
         if self.serving is None or self.pending:

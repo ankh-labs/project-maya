@@ -70,6 +70,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
 #include <io.h>
@@ -501,6 +502,27 @@ struct Req {
     // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
     long long think_budget = 0;
     int think_end = -1;
+    // the soft close (#746; think_soft=<n> think_stop=<ids> think_weak=<ids> think_dig=<ids>, the server's THINK_GRACE
+    // close): past n tokens, the first token that ends a sentence or line (think_stop; think_weak: a bare . ! ? that
+    // does not follow a token ending in a digit or a dot, think_dig) ends the reasoning as the budget does - the
+    // rounds are cut at n and are single steps past it, so the state ends at that token and the next token is
+    // think_end: the prompt that follows is a continuation of the state (no re-read of the thinking)
+    long long think_soft = 0;
+    std::unordered_set<int> soft_stop, soft_weak, soft_dig;
+    int soft_prev = -1;
+    bool soft_hit = false;
+    bool soft_check(int tok, long long produced) {
+        bool hit = false;
+        if (think_soft > 0 && produced >= think_soft)
+            hit = soft_stop.count(tok) != 0 || (soft_weak.count(tok) != 0 && soft_dig.count(soft_prev) == 0);
+        soft_prev = tok;
+        return hit;
+    }
+    // a round's room under the soft close: cut at the soft point, single steps past it
+    long long soft_room(long long room, long long produced) const {
+        if (think_soft <= 0) return room;
+        return produced < think_soft ? std::min(room, think_soft - produced) : std::min<long long>(room, 1);
+    }
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
     long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
@@ -634,6 +656,10 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "think_soft") r.think_soft = std::atoll(v.c_str());
+        else if (k == "think_stop") { for (int x : parse_ids(v)) r.soft_stop.insert(x); }
+        else if (k == "think_weak") { for (int x : parse_ids(v)) r.soft_weak.insert(x); }
+        else if (k == "think_dig") { for (int x : parse_ids(v)) r.soft_dig.insert(x); }
         else if (k == "rid") r.rid = std::atoll(v.c_str());
         else if (k == "marks") {
             for (int x : parse_ids(v))
@@ -1297,8 +1323,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // the SSD) and, a token, the CPU lane's experts from the SSD (the storage's reads over an expert's bytes, at
         // most the CPU lane's) and from RAM (the rest of them)
         const strata::ds4::Model::Tiers tr = m.tiers();
-        std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f", tr.vram,
-                      tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb);
+        std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f disk_gb=%.2f",
+                      tr.vram, tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb, tr.disk_gb);
         out += b;
         std::snprintf(b, sizeof b, " eg_cache_rows=%lld eg_cache_cap=%lld eg_cache_row_bytes=%lld eg_lookup_rows=%lld",
                       (long long) s.eg_cached, (long long) s.eg_cache_cap, (long long) s.eg_cache_row_bytes,
@@ -1337,7 +1363,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       s.verify_ms - s_dec.verify_ms);
         out += b;
         if (d_off > 0) {
-            std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
+            std::snprintf(b, sizeof b, " drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off,
+                          (long long) d_acc, (long long) d_off);
             out += b;
         }
         if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
@@ -1802,6 +1829,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             ++produced;
             if (lk) lk->sfx.append(tok);
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
+            else if (in_think && r.soft_check(tok, produced)) r.soft_hit = true;   // (#746: closed like the budget)
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
             bool end = false;
@@ -1813,9 +1841,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (produced >= limit || m.pos() >= m.max_context()) break;
             if (got.empty()) {   // the next round: the drafts (if any) and the token after them
                 int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
-                const bool close_think = in_think && produced >= r.think_budget;
+                const bool close_think = in_think && (produced >= r.think_budget || r.soft_hit);
                 if (close_think) room = 1;
-                else if (in_think) room = (int) std::min<long long>(room, r.think_budget - produced);
+                else if (in_think) room = (int) r.soft_room(std::min<long long>(room, r.think_budget - produced), produced);
                 int off = 0, acc = 0;
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
@@ -1976,7 +2004,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
-        const auto close_think = [](const Act& a) { return a.in_think && a.produced >= a.r.think_budget; };
+        const auto close_think = [](const Act& a) {
+            return a.in_think && (a.produced >= a.r.think_budget || a.r.soft_hit);
+        };
         // the next of a round's tokens to write (and its row: logprobs=<k>)
         const auto next_tok = [](Act& a) {
             a.tok = a.got.back();
@@ -2044,7 +2074,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // is through in its turn, so a short question does not wait a round of long reads' pieces
         const auto one_piece = [&](const Act* a) { return a->r.ids.size() - a->P.done <= read_piece; };
         const auto join_read = [&](Act* a) {
-            if (!one_piece(a)) {
+            if (!read_pieces || !one_piece(a)) {   // (arrival: in the order they came)
                 read_line.push_back(a);
                 return;
             }
@@ -2100,7 +2130,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             a->seq = best;
             a->reading = true;
-            if (!read_pieces || !a->P.pics.empty()) {
+            // (arrival reads a prompt whole, unless an answer is running: it then writes tokens between the pieces)
+            const bool answering_now = std::any_of(acts.begin(), acts.end(),
+                                                   [](const std::unique_ptr<Act>& x) { return !x->reading; });
+            if ((!read_pieces && !answering_now) || !a->P.pics.empty()) {
                 read_turn(*a, r.ids.size(), false);
                 if (a->ended) {
                     in.forget(rid);
@@ -2171,6 +2204,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     ++busy_n;
                     if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
                     if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
+                    else if (a.in_think && a.r.soft_check(a.tok, a.produced)) a.r.soft_hit = true;
                     bool eos_tok = false;
                     for (int e : eos) eos_tok = eos_tok || a.tok == e;
                     if (eos_tok) {
@@ -2204,7 +2238,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
                 const bool closing = close_think(a);
                 if (closing) room = 1;
-                else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                else if (a.in_think)
+                    room = (int) a.r.soft_room(std::min<long long>(room, a.r.think_budget - a.produced), a.produced);
                 // (the prompt lookup alone only: its history follows one request)
                 Lookup* L = a.r.lookup == 0 || acts.size() > 1 ? nullptr : lk;
                 if (L != nullptr && lk_owner != a.r.rid) {   // (its history: what it consumed, then the token written)
@@ -2255,7 +2290,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
                     closing[(size_t) i] = close_think(a);
                     if (closing[(size_t) i]) room = 1;
-                    else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                    else if (a.in_think)
+                        room = (int) a.r.soft_room(std::min<long long>(room, a.r.think_budget - a.produced), a.produced);
                     room_all[(size_t) i] = room;
                     rooms[(size_t) i] = room = std::min(room, share);
                     if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
@@ -2420,7 +2456,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             read_line.pop_front();
             const bool alone = read_line.empty() && !answering;
             if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone);
-            if (a->reading && !a->done) read_line.push_back(a);
+            if (a->reading && !a->done) {   // (arrival: the prompt in front keeps its turn, the later ones wait for it)
+                if (read_pieces) read_line.push_back(a);
+                else read_line.push_front(a);
+            }
         };
         std::function<void()> settle;
         // the next turn: a piece once the rounds since the last one are due (piece_due) while a prompt is being read,

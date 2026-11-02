@@ -190,16 +190,110 @@ def pack(d: pathlib.Path, man: dict, marks_url: str | None = None) -> dict:
     return info
 
 
+# unsloth's mmproj of the tower (mmproj-BF16.gguf, llama.cpp's "clip" GGUF): the same weights as the checkpoint's -
+# every tensor equal bit for bit once mapped (2026-10-30: all 266, the F32 ones exactly BF16 values): the aligner as
+# mm.1 / mm.2, a block's mlp.w1 as its ffn_gate rows then its ffn_up rows, the patch embedding [1024][3][14][14] as
+# [1024][588], the three marker rows beside them.  Its geometry: the keys below; the ones it does not hold
+# (rope_theta, max_image_tokens, image_token_id) are config.json's at the revision the manifest's "vision" pins.
+MMPROJ_CONFIG = {"vision.num_hidden_layers": ("clip.vision.block_count", 32), "vision.hidden_size":
+                 ("clip.vision.embedding_length", 1024), "vision.num_attention_heads": ("clip.vision.attention.head_count", 16),
+                 "vision.intermediate_size": ("clip.vision.feed_forward_length", 2816), "vision.patch_size":
+                 ("clip.vision.patch_size", 14), "vision.rope_theta": (None, 10000), "vision.downsample_ratio":
+                 ("clip.vision.projector.scale_factor", 3), "vision.max_image_tokens": (None, 1024), "vision.min_pixels":
+                 ("clip.vision.image_min_pixels", 295936), "image_token_id": (None, 129264)}
+
+
+def mmproj_names(blocks: int) -> dict:
+    """The checkpoint's name -> the mmproj's (a list: rows put one after the other)."""
+    m = {"aligner.w1.weight": ["mm.1.weight"], "aligner.w1.bias": ["mm.1.bias"], "aligner.w2.weight": ["mm.2.weight"],
+         "aligner.w2.bias": ["mm.2.bias"], "vision.norm.weight": ["v.post_ln.weight"],
+         "vision.patch_embed.proj.weight": ["v.patch_embd.weight"], "vision.patch_embed.proj.bias": ["v.patch_embd.bias"]}
+    for b in range(blocks):
+        p, q = "v.blk.%d." % b, "vision.blocks.%d." % b
+        m.update({q + "attn.wo.weight": [p + "attn_out.weight"], q + "attn.wo.bias": [p + "attn_out.bias"],
+                  q + "attn.wqkv.weight": [p + "attn_qkv.weight"], q + "attn.wqkv.bias": [p + "attn_qkv.bias"],
+                  q + "mlp.w1.weight": [p + "ffn_gate.weight", p + "ffn_up.weight"],
+                  q + "mlp.w2.weight": [p + "ffn_down.weight"], q + "norm1.weight": [p + "ln1.weight"],
+                  q + "norm2.weight": [p + "ln2.weight"]})
+    return m
+
+
+MMPROJ_MARKS = {"image_start": "v.token_embd.img_start", "image_newline": "v.image_newline",
+                "image_end": "v.token_embd.img_end"}
+
+
+def pack_mmproj(d: pathlib.Path, src: pathlib.Path, repo: str = "", revision: str = "") -> dict:
+    """vision.bin + vision.json in d from unsloth's mmproj (BF16 / F32 tensors only): the same file pack() makes from
+    the checkpoint, read back and checked; an F32 value that is not a BF16 one stops it (nothing rounded)."""
+    sys.path.insert(0, str(HERE))
+    from pack_gguf import Gguf   # (its GGUF reader)
+    g = Gguf(src)
+    if g.kv.get("general.architecture") != "clip" or g.kv.get("clip.projector_type") != "deepseek41v":
+        raise SystemExit(f"{src}: not DeepSeek-V4.1's mmproj (clip, projector deepseek41v)")
+    geo = {}
+    for k, (key, want) in MMPROJ_CONFIG.items():
+        if key is not None and g.kv.get(key) != want:
+            raise SystemExit(f"{src}: {key} = {g.kv.get(key)!r}, DeepSeek-V4.1's tower has {want}")
+        geo[k] = want
+    raw = np.memmap(src, np.uint8, mode="r")
+    infos = {n: (typ, dims, off) for n, typ, dims, off in g.tensors}
+
+    def bf16(name: str):
+        typ, dims, off = infos[name]
+        cnt = int(np.prod(dims))
+        if typ == 30:
+            return np.frombuffer(raw[g.data_start + off:g.data_start + off + 2 * cnt], np.uint16), list(reversed(dims))
+        if typ != 0:
+            raise SystemExit(f"{src}: {name} in ggml type {typ} (BF16 or F32 expected: mmproj-BF16.gguf)")
+        u = np.frombuffer(raw[g.data_start + off:g.data_start + off + 4 * cnt], np.uint32)
+        if np.any(u & 0xffff):
+            raise SystemExit(f"{src}: {name} holds F32 values that BF16 does not (not the checkpoint's)")
+        return (u >> 16).astype(np.uint16), list(reversed(dims))
+
+    names = mmproj_names(geo["vision.num_hidden_layers"])
+    entries, off = [], 0
+    part = d / "vision.bin.part"
+    with part.open("wb") as f:
+        for name in sorted(names) + list(MARKS):
+            parts = [bf16(n) for n in (names[name] if name in names else [MMPROJ_MARKS[name]])]
+            a = np.concatenate([p[0] for p in parts])
+            shape = [sum(p[1][0] for p in parts)] + parts[0][1][1:] if len(parts[0][1]) > 1 else [a.size]
+            if name == "vision.patch_embed.proj.weight":
+                shape = [shape[0], a.size // shape[0]]
+            b = a.tobytes()
+            f.write(b)
+            entries.append([name, "BF16", off, len(b), shape])
+            off += len(b)
+            pad = (-off) % ALIGN
+            f.write(b"\0" * pad)
+            off += pad
+    back = np.memmap(part, np.uint8, mode="r")
+    for name, _dt, o, nb, _shape in entries:   # (read back: as written)
+        want = np.concatenate([bf16(n)[0] for n in (names[name] if name in names else [MMPROJ_MARKS[name]])])
+        if not np.array_equal(back[o:o + nb].view(np.uint16), want):
+            raise SystemExit(f"vision.bin: {name} differs from the mmproj after the copy")
+    del back, raw
+    part.replace(d / "vision.bin")
+    info = {"from": {"repo": repo, "revision": revision, "files": [src.name]}, "config": geo, "tensors": entries}
+    (d / "vision.json").write_text(json.dumps(info))
+    return info
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dir", required=True, help="the folder with shard 1 and config.json")
+    ap.add_argument("--dir", required=True, help="the folder with shard 1 and config.json (--mmproj: the output folder)")
     ap.add_argument("--manifest", default=str(MANIFEST))
     ap.add_argument("--marks-url", help="shard 2 elsewhere (a URL or a local file; default: Hugging Face, pinned)")
+    ap.add_argument("--mmproj", help="unsloth's mmproj-BF16.gguf instead of the checkpoint's shard (the same weights)")
     a = ap.parse_args()
     d = pathlib.Path(a.dir)
-    info = pack(d, manifest_entry(pathlib.Path(a.manifest)), a.marks_url)
+    if a.mmproj:
+        info = pack_mmproj(d, pathlib.Path(a.mmproj))
+    else:
+        info = pack(d, manifest_entry(pathlib.Path(a.manifest)), a.marks_url)
     nb = sum(e[3] for e in info["tensors"])
-    print(f"vision.bin: {len(info['tensors'])} tensors ({nb / 1e9:.2f} GB), every one equal to the checkpoint's; "
+    print(f"vision.bin: {len(info['tensors'])} tensors ({nb / 1e9:.2f} GB), every one equal to the "
+          f"{'mmproj' if a.mmproj else 'checkpoint'}'s; "
           f"{info['config']['vision.num_hidden_layers']} blocks, image token {info['config']['image_token_id']}")
     return 0
 

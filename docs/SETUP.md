@@ -129,6 +129,46 @@ downloads the new code (git), compiles only the engine files that changed and lo
 is not downloaded again, and your settings stay. By hand: `git pull`, then `./setup.sh`.
 (The check asks GitHub for the latest release, at most every six hours; `MAYA_UPDATE_CHECK=0` turns it off.)
 
+## Running Maya as a systemd service
+
+Set the model up and start it by hand once first, then let a unit start it at boot. The unit runs the config the setup
+wrote (`maya-<model>.json`, in the Maya folder):
+
+```ini
+[Unit]
+Description=Maya
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=you
+WorkingDirectory=/path/to/maya
+ExecStart=/path/to/maya/maya.sh --config /path/to/maya/maya-<model>.json
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=3600
+TimeoutStopSec=600
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- **Time to start and stop.** A big model at a long context takes a long time to load (the engine pins its expert tier
+  in RAM and warms its caches), and the more context you give it (1M tokens, say), the longer. systemd ends a unit that
+  is not up inside `TimeoutStartSec` and starts it again, which then loads again, for ever. Set it well above the
+  slowest start you have seen by hand (`TimeoutStartSec=infinity` turns it off). `TimeoutStopSec` is the time Maya has
+  to save its conversations and free the GPUs after the stop signal; give a big model several minutes.
+- **Run the calibration once, by hand, first.** A start measures nothing when nobody is there to wait (a service, a
+  pipe, `--yes`): it prints one line naming what it skipped and starts with the engine's defaults. Run the
+  calibrations yourself in a terminal while the service is stopped (`./maya.sh --config maya-<model>.json
+  --speed-calibration --no-start`, and for MiniMax `--calibrate --no-start` too). They load the model a few times and
+  keep the answer in the config, so the service starts straight from it afterwards. A terminal start of the same config
+  still measures what is missing, as before.
+- **Logs.** The server's output (the same lines a terminal shows) goes to the journal: `journalctl -u maya -f`. The
+  engine writes its own log to the file named by `"log"` in the config, `maya-<model>.log` beside it by default.
+- The model needs the whole machine: stop the service before a calibration, a setup or `--check`, and do not start two
+  units on the same GPUs.
+
 ## Options
 
 | Option | |

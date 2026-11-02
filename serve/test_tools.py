@@ -61,7 +61,8 @@ class GlmCalls(unittest.TestCase):
 
     def test_malformed(self):
         for body in ("<arg_key>a</arg_key><arg_value>1</arg_value>", "f<arg_key>a<arg_value>1</arg_value>",
-                     "f junk <b>"):
+                     "f junk <b>", "<function=f><parameter=a>1</parameter><parameter=b",
+                     "<function=f><parameter=a"):   # (#706: an unclosed <parameter= tag is malformed, not a crash)
             with self.assertRaises(ValueError, msg=body):
                 parse_tool_call(body)
 
