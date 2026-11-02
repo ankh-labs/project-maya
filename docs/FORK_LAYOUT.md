@@ -12,18 +12,29 @@ facts that `git branch -a` would have printed in one second.
 > their own branches" (false: 22 of them are, 7 pushed to Sia) and a bisect across a
 > rewritten lineage (the range was empty; `git merge-base --is-ancestor` would have said so).
 
-## Upstream base — one base for every recent release
+## Upstream base — CURRENT (2026-11-02): v1.1.49
 
-`e16dec85a` is the merge base of our tree with **every** release from v1.1.39 through
-v1.1.42. So "our changes" is one well-defined series regardless of which release we
-target: **96 commits, `e16dec85a..cd52717`, 39 files, +4776/-345.**
+**Supersedes the `e16dec85a` / `cd52717` identity this section used to carry. Read only
+this one — a document with two bases is how a merge got started against the wrong tree.**
+
+Our tree is now **upstream `v1.1.49` (`26aacb6`)** with our work merged onto it, on branch
+**`feat/v1149-from-good`**. The merge base with upstream was `v1.1.42`; the merge commit is
+`6edde5d`; the built and deployed commit is `90cbc11` (`git describe --tags --match
+'v1.1.*'` → **`v1.1.49-127-g90cbc11`**), tagged
+**`deployed/v1.1.49-lane-plan-20261101-1954`**.
+
+**"Our changes", as of this merge: 127 commits, `v1.1.49..90cbc11`, 42 files,
++5925/-325.** That is the series the export is generated from and the number to quote.
 
 ## The reference tree
 
-**`cd52717` is the verified working `n=2` de-fused rotor** — 41-47 rotor entries per
-boot, ~24 tok/s, six coherent replies, 3/3 clean boots. Tagged
-`backup-pre-20261030-0835`. Every quality or liveness claim is referenced against it.
-It is the base for `feat/v1142-from-good`.
+**`0f50931` is the verified-good pre-merge tree** — `v1.1.42-125-g0f50931`, deployed and
+observed serving (plan `0 1 2 3 4 5 6 7 8`, `retimes 0`, 44-token reply, pid 14988 on
+port 8080). Tagged `backup-pre-v1149-20261101`. **Base every future series on it, never on
+a previous replay.** It supersedes `cd52717` as the reference: `cd52717` was the verified
+`n=2` de-fused rotor (41-47 rotor entries, ~24 tok/s, 3/3 boots, tagged
+`backup-pre-20261030-0835`), and is now historical — still the right reference for any
+claim about *that* lineage, but not the base for a new merge.
 
 ## Branches (2026-10-31)
 
@@ -51,27 +62,52 @@ git.ankh-labs.com/ankh-labs/project-maya (**ours — 7 branches pushed**).
 
 Regenerate after significant work. `README.md` there is the index.
 
-- `series-cd52717/` — the 96 commits as `format-patch` files, re-appliable with `git am`
+- **`series-v1149/` — CURRENT.** The series against the v1.1.49 base, **pared into logical
+  patches by subsystem** instead of one patch per commit: **261 -> 14** (14 subsystem
+  patches covering all 43 changed files). The count is the point — a patch per commit is a
+  replay log, and replaying one is what dropped seven changes on the v1.1.41 attempt.
+  `maya-patches/README.md` is the index and lists every patch.
 - `by-file/` — one squashed diff per touched file, to review or re-apply one subsystem
 - `reference/CONFLICT-SURFACE.txt`, `CONFLICT-FORECAST-*.txt` — the tables below
+- **`series-v1142/` (261 files, `e16dec85a..f383c28`) and `series-cd52717/` (96 files) are
+  HISTORICAL.** Keep them; they are the record of the two previous lineages. Do not apply
+  them to anything: they are based on trees that v1.1.49 has moved past.
 
 ## The conflict surface — the number that decides how we organise
 
-**14 of our 39 touched files** are also touched by upstream across v1.1.39 -> v1.1.42.
-The **v1.1.42 delta alone reaches only 5**: `glm_fast_path.cu`, `glm_prefill.cu`,
-`generate.cpp`, `serve/server.py`, `CMakeLists.txt`.
+**CURRENT (2026-11-02, measured against v1.1.49): 5 of our 42 touched files are also
+touched upstream across v1.1.42 -> v1.1.49.** Ours changed 42 files, upstream 54.
 
-| File | upstream lines | our changed lines |
-|---|---|---|
-| `src/program/generate.cpp` | 8804 | 278 |
-| `src/core/glm_fast_path.cu` | 7562 | 339 |
-| `src/kernels/cuda/glm_fast.cu` | 7006 | 411 |
-| `src/core/glm_prefill.cu` | 4899 | 64 |
+| File | upstream lines | our changed lines | resolution this merge |
+|---|---|---|---|
+| `src/core/glm_fast_path.cu` | 7747 | 339 / 41 | auto-merged; upstream added 3 lines (Monitor's `all_bytes`) |
+| `src/program/generate.cpp` | 9255 | 262 / 16 | auto-merged; upstream added 65 lines (STAT fields, spec counters, serve cache floor) |
+| `src/core/glm_fast_state.hpp` | 961 | 193 / 2 | auto-merged; upstream added 1 line (`all_bytes`) |
+| `include/strata/core/glm_model.hpp` | 1087 | 34 / 4 | auto-merged; upstream added 1 line (`all_gb`) |
+| `serve/server.py` | 6186 | 5 / 0 | **the one textual conflict, 24 hunks — see below** |
 
-**`src/core/glm_rows.cu` — our LARGEST change at 902 lines — is not in the conflict set.**
-Upstream has not touched it in four releases. Our biggest change is our cheapest to
-carry, because it lives in a file that is ours. **That is the case for extracting more
-logic behind seams rather than editing upstream files in place.**
+**Superseded:** the earlier table ("14 of our 39 touched files ... across v1.1.39 -> v1.1.42",
+with `glm_fast.cu`, `glm_prefill.cu`, `CMakeLists.txt` in the set) described the previous
+lineage. It is kept only as history. **The instruction it earned still stands and is the
+reason this merge was cheap: extract logic behind seams rather than editing upstream files
+in place — `glm_rows.cu`, our largest change, collides with nothing because it is ours.**
+
+### `serve/server.py` — why "theirs" was the correct resolution, not a shortcut
+
+The 24 hunks looked like a large merge and were **formatting**: our `server.py` was
+v1.1.42's content reformatted (1255 lines over 100 characters -> 675). Resolved by
+**whitespace-collapsed token-stream comparison of the whole file**, not by the compiler and
+not by hunk-by-hunk guessing:
+
+- it found exactly **two** ours-only segments: the `[engine env]` print (genuine — re-applied
+  after `maya_names.export_env`) and one statement upstream had merely *moved*;
+- therefore taking upstream's file whole loses **no behaviour**, and drops our reformatting,
+  which also deletes the conflict surface for the next merge.
+
+Upstream's file was taken; the env print was re-added at the same site; `py_compile` passes.
+**The general lesson: when a conflicted file is a reformat of the other side, the token
+stream is the instrument, and a union of 24 hunks would have been 24 chances to reintroduce
+the loss shape this document exists to prevent.**
 
 ## What the v1.1.41 rebase cost, and the gate against a repeat
 
@@ -120,6 +156,18 @@ instrument.
    **Do not restart `llama-server8080` for a Maya change, and do not run the llama.cpp drift
    checker.** Carry deploy rules across projects only after checking they apply — that is the
    same failure as inferring repo structure without running the inventory command.
+   **The deploy is not finished until the engine is up and verified SERVING** — see step 6.
+6. **Start it, then prove it serves.** `maya.py` on the deployed config, then a real request
+   returning tokens, the `plan` line, and `retimes`/`faults`. **A process existing is not
+   readiness.** On 2026-11-01 a deploy ended with a verified artefact and an **idle box**:
+   tag, commit, config and smoke all done, engine stopped. The contrast that must not be
+   confused: **`llama-server8080` is `DEMAND_START` and STOPPED is its normal resting state
+   (the owner arbitrates the GPU with it); Maya is the opposite — it is the thing that
+   should be UP**, on the latest build, except while restarting or fixing a failed restart.
+   Note the practical consequence for a merge: **the build cannot relink `maya.exe` while
+   the engine holds it** (`LNK1104: cannot open file 'maya.exe'`). Copy the running binary
+   aside as a rollback, stop, build, then bring it back up and verify — the old build serves
+   until the gate has passed and must not be taken down before it.
 
 ## 2026-10-30 (late) — v1.1.42 merged onto the verified-good tree: a working n=2 rotor
 
@@ -176,3 +224,43 @@ Repointing the services: **there is no Maya NSSM service** (`sc query maya` -> 1
 `G:\AI\llama-server\tools\` - both belong to the llama.cpp lab, not this project. The Maya engine is launched from the
 config (`exe: build\maya.exe`) by `maya.py`, so the deploy step is the config plus that server, not an NSSM restart.
 Confirm before anything is restarted.
+
+## 2026-11-02 — v1.1.49 merged: the plan survived upstream's seven releases
+
+**Branch `feat/v1149-from-good`.** Merge commit `6edde5d` (parents `0f50931` + `26aacb6` =
+`v1.1.49`), built and deployed commit `90cbc11`, tagged
+`deployed/v1.1.49-lane-plan-20261101-1954`, verified to resolve to that commit.
+Upstream `v1.1.42..v1.1.49` was **50 commits**; ours is **127 commits, 42 files, +5925/-325**.
+
+**Procedure that worked, and is now the template:** base on the verified-good tree, merge
+upstream INTO it (`git merge v1.1.49`), so our side is the base and theirs is the incoming
+side. 41 of 42 files merged without a textual conflict; the 5-file collision surface above
+was resolved from the token stream, not the compiler.
+
+### Gates
+
+| gate | result |
+|---|---|
+| `tools/patch_invariants.py` (re-derived first, see below) | **PASS 15/15** |
+| per-row loss-shape audit, all 41 owned files | **0 markers fell** — no `R(i)`/`per_row`/`rows_`/`& 7`/`ch` count decreased |
+| build | clean, `build\maya.exe` relinked |
+| boot | plan **`0 1 2 3 4 5 6 7 8`**, `retimes 0` — planner and all-CPU plan survived |
+| n=4 smoke | **4/4 answered, 258 tokens, 12.7 s, rotor 59, faults 0** — no wedge |
+| serving | real request → 14 tokens, reply `ready`; engine left running |
+
+### The invariant manifest had to be re-derived BEFORE the merge (step 1, not gate 5)
+
+Its header described a merge onto `cd52717`; run unmodified against a v1.1.49 base it would
+have **failed closed on a stale expectation and read as a merge fault**. Every entry was
+re-checked against `0f50931` first (11/11 held there), so a failure during the merge is a
+loss and not a stale reference. **Four entries were added for the lane plan (`d098fa7`)**,
+which no earlier entry covered because the manifest predates the planner — including
+`const int waves = (kk + waves_of - 1) / waves_of`, the units fix itself. A merge that
+drops it silently reverts the planner to serial pricing and voids every timing claim made
+against it.
+
+### Honesty line
+
+The **+6.8 / +11.8 / +23.9% at n=1/2/4 steady were measured on the PRE-merge tree.** On this
+build they are **inherited, not re-verified**. The smoke test is not a substitute — it shows
+the plan and no wedge, not a rate — and a paired re-measure is its own job.
