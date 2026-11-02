@@ -903,3 +903,50 @@ revisited it needs a **Maya measurement at real context first**, with ranked KLD
   wrong entry: the reader cannot tell which is live. (This retraction names the entry it supersedes.)
 - **Flag any entry relied on that is llama.cpp-lab provenance while the work is Maya.** Never carry it
   across silently - the same error as the `llama-server8080` / `config_drift.py` confusion.
+
+## 2026-11-01 - DEPLOY CHECKLIST: "engine left running and verified serving" is a REQUIRED final step
+
+The deploy checklist produced a verified artefact and an **idle box**: tag created, commit verified, config
+repointed, smoke passed - and then Maya was left stopped (no `maya` process, 0 MiB used on the GPU). That is
+a hole in the procedure, not a failed deploy.
+
+**Add as the last step of every Maya deploy, after tag/config/smoke:**
+1. **Start Maya on the deployed build** from the repointed config (`maya.py`).
+2. **Verify it is SERVING, not merely launched**: a real request returning tokens, the `plan` line reading
+   the expected table, `retimes` and `faults` as expected. **A process existing is not readiness.**
+3. **Confirm it survives the launching shell** - if the launch is tied to the session that started it, that
+   is the defect to name.
+
+**The contrast that must not be confused:** `llama-server8080` is deliberately `DEMAND_START`; **STOPPED is
+its normal resting state** (the owner arbitrates the GPU with it). **Maya is the opposite - it is the thing
+that should be UP**, on the latest build, except while restarting or fixing a failed restart.
+
+**Deployed state at close:** v0.1.27, tag `deployed/v0.1.27-20261101-1834`, commit `0f50931`, par4 config
+(repointed: all-CPU boot plan, `STRATA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`), engine **running and
+serving** (pid 14988, port 8080, plan `0 1 2 3 4 5 6 7 8`, retimes 0, faults 0, a real request returning 44
+tokens). Launch is shell-independent: it was started in one session and found alive in the next.
+
+## 2026-11-01 - DEPLOY TAG NAMING: the release id comes from the MAYA lineage, never `STRATA_VERSION`
+
+Two bogus tags were minted tonight - `deployed/v0.1.27-…` twice - from `CMakeLists.txt:11`
+(`project(strata VERSION 0.1.27 ...)`). That same file documents at **lines 32-36** that `STRATA_VERSION`
+*"is the static `project(strata VERSION ...)` string and **never moves with a Maya release**"*. The tag
+named a strata project version, not a Maya release; both were **local-only** and have been deleted.
+
+**Correct tag:** `deployed/v1.1.42-lane-plan-20261101-1834` on `0f50931`, verified by
+`git describe --tags --match 'v1.1.*'` -> **`v1.1.42-125-g0f50931`**. Convention read from the repo first:
+`deployed/<release>-<date>`, with a suffix precedent (`-picks487`).
+
+**Add to the deploy checklist:** the release identifier must come from **`git describe --tags --match
+'v1.1.*'`**, never from `STRATA_VERSION` or `CMakeLists.txt`, **because that string is a static project
+identifier that never moves with a Maya release** (CMakeLists.txt:32-36). Verify the tag resolves to the
+built commit before deploying - the same one-command check whose absence produced the false "tag divergence"
+report earlier.
+
+**Upstream state, data only (fetched, nothing merged):** seven releases unseen - `v1.1.43`..`v1.1.49`, the
+newest `v1.1.49` dated 2026-11-02 00:16 UTC. **50 commits** in `v1.1.42..v1.1.49`. Conflict surface against
+our 126 commits: ours touch **41** files, upstream **54**, and **5 collide** -
+`include/strata/core/glm_model.hpp`, `serve/server.py`, `src/core/glm_fast_path.cu`,
+`src/core/glm_fast_state.hpp`, `src/program/generate.cpp`. That is smaller than the v1.1.39->42 surface
+(14 of 39) and must still go through `tools/patch_invariants.txt` as its own planned job - the v1.1.41
+replay silently dropped or thinned seven of our changes and all seven compiled.
