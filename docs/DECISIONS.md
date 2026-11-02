@@ -903,3 +903,25 @@ revisited it needs a **Maya measurement at real context first**, with ranked KLD
   wrong entry: the reader cannot tell which is live. (This retraction names the entry it supersedes.)
 - **Flag any entry relied on that is llama.cpp-lab provenance while the work is Maya.** Never carry it
   across silently - the same error as the `llama-server8080` / `config_drift.py` confusion.
+
+## 2026-11-01 - DEPLOY CHECKLIST: "engine left running and verified serving" is a REQUIRED final step
+
+The deploy checklist produced a verified artefact and an **idle box**: tag created, commit verified, config
+repointed, smoke passed - and then Maya was left stopped (no `maya` process, 0 MiB used on the GPU). That is
+a hole in the procedure, not a failed deploy.
+
+**Add as the last step of every Maya deploy, after tag/config/smoke:**
+1. **Start Maya on the deployed build** from the repointed config (`maya.py`).
+2. **Verify it is SERVING, not merely launched**: a real request returning tokens, the `plan` line reading
+   the expected table, `retimes` and `faults` as expected. **A process existing is not readiness.**
+3. **Confirm it survives the launching shell** - if the launch is tied to the session that started it, that
+   is the defect to name.
+
+**The contrast that must not be confused:** `llama-server8080` is deliberately `DEMAND_START`; **STOPPED is
+its normal resting state** (the owner arbitrates the GPU with it). **Maya is the opposite - it is the thing
+that should be UP**, on the latest build, except while restarting or fixing a failed restart.
+
+**Deployed state at close:** v0.1.27, tag `deployed/v0.1.27-20261101-1834`, commit `0f50931`, par4 config
+(repointed: all-CPU boot plan, `STRATA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`), engine **running and
+serving** (pid 14988, port 8080, plan `0 1 2 3 4 5 6 7 8`, retimes 0, faults 0, a real request returning 44
+tokens). Launch is shell-independent: it was started in one session and found alive in the next.
