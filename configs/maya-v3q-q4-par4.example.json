@@ -73,6 +73,7 @@
     "MAYA_GLM_SLOT_MIN": "1024",
     "MAYA_GLM_SLOT_GB": "24",
     "MAYA_GLM_ROWS_ATTN": "1",
-    "MAYA_GLM_EXPERT_USED": "7"
+    "MAYA_GLM_EXPERT_USED": "7",
+      "STRATA_GLM_CPU_RETIME": "0"
   }
 }

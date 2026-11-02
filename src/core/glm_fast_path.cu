@@ -3466,6 +3466,17 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
+    // THE RETIME SWITCH, announced at boot.  `retimes 0` in the STAT line is expected whether the controller is OFF or
+    // merely DORMANT (it needs two deliberate overrides to fire at all), so that count can never prove this setting was
+    // delivered - a deploy was signed off on it on 2026-11-02 and the "arm" was the config's key spelling, which does
+    // not have to be the one this file reads (tools/maya_names.py exports a config's env under BOTH names).  Announce
+    // what this process actually sees; a setting nobody announced is a setting nobody verified.
+    {
+        const char* rv = getenv("STRATA_GLM_CPU_RETIME");
+        std::fprintf(stderr, "glm fast: CPU lane retime %s (STRATA_GLM_CPU_RETIME=%s) - the STAT line's retimes "
+                             "count reads 0 either way, so THIS line is the setting's evidence\n",
+                     (rv != nullptr && std::atoi(rv) == 0) ? "OFF" : "ON", rv != nullptr ? rv : "(unset)");
+    }
     // the split: k of f to the host minimises max(PCIe (f - k) p, lane overhead + k c) (lane_plan)
     unsigned long long plan = 0;
     std::string tab;
