@@ -5915,7 +5915,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                       const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
                       const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
                       return il >= from ? w : 0.0f;
-                  }(), win_rows, miss_to_cpu());
+                  }(), win_rows, miss_to_cpu(), il != mtp_il_);
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,
