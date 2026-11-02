@@ -35,3 +35,38 @@ DSpark being DeepSeek's drafting algorithm (not DGX Spark).
 
 **The +6.8 / +11.8 / +23.9% figures are INHERITED from the pre-merge tree, not re-verified.** A paired
 re-measure is a separate job; the smoke test is not a substitute.
+
+## 2026-11-02 - v1.1.49 MERGED, DEPLOYED AND SERVING (supersedes the "NOT STARTED" entry above)
+
+**Live state:** Maya runs **v1.1.49 + 127 commits** -- `90cbc11`, `git describe --tags --match
+'v1.1.*'` -> **`v1.1.49-127-g90cbc11`**, tagged **`deployed/v1.1.49-lane-plan-20261101-1954`**
+(verified to resolve to that commit), on branch `feat/v1149-from-good`, config **par4**
+(`maya-v3q-q4-par4.json`), `MAYA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`, engine
+**running and verified serving** (plan `0 1 2 3 4 5 6 7 8`, `retimes 0`, faults 0, a real
+request returning tokens). The planner is **adopted**, not queued: `lane_plan`'s wave count
+shipped in this build, and `RETIME_V2` and the residency term remain absent (the term is
+preserved at `40df967` on `feat/residency-term`, queued as *broken, so fix it*).
+
+**Series identity (the number to quote):** 127 commits, `v1.1.49..90cbc11`, **42 files,
++5925/-325**. Upstream `v1.1.42..v1.1.49` was 50 commits; the colliding surface is **5
+files** -- `glm_model.hpp`, `serve/server.py`, `glm_fast_path.cu`, `glm_fast_state.hpp`,
+`generate.cpp` -- of which only `serve/server.py` conflicted textually (24 hunks, resolved
+by whole-file token-stream comparison: it was v1.1.42's content reformatted, so upstream's
+side was taken and our one `[engine env]` print re-applied).
+
+**Evidence (all on the merged build):** `tools/patch_invariants.py` **PASS 15/15** after
+re-deriving the manifest for this base and adding four lane-plan entries; per-row audit
+across all 41 owned files, **0 markers fell**; build clean; n=4 smoke **4/4 answered, 258
+tokens, rotor 59, faults 0**; real request served.
+
+**Note, recorded because the brief assumed otherwise: there is no `docs/TESTING.md` in this
+repo.** The append-only evidence log named in AGENTS.md is the **llama.cpp lab's**
+(`G:\AI\llama-server\TESTING.md`) and must not be used for Maya. Merge evidence lives here
+and in `FORK_LAYOUT.md`; `docs/DECISIONS.md` holds the closed decisions.
+
+**The +6.8 / +11.8 / +23.9% at n=1/2/4 steady were measured on the PRE-merge tree. On this
+build they are INHERITED, not re-verified.** The smoke test shows plan and no wedge, not a
+rate. A paired re-measure is its own job.
+
+**Next lever, and only one:** `moe_cpu_wait`, ~33% of decode stage time -- the largest
+remaining stage, and the one the all-CPU plan itself created. Not opened here.
