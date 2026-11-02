@@ -862,3 +862,38 @@ unbiased `R_est`), and **re-test the MTP drafter** on the ranked-KLD gate - +15.
 0.945, parked on a token-equality gate since proven invalid on an engine that samples at temp 1.0. By the
 rule that is a feature that may well WORK and is going unused; spec-decoding's correctness claim is
 distributional, so KLD is the right and only test we have. Largest unclaimed win on the box.
+
+## 2026-11-01 - RETRACTION: the MTP re-test is OFF the queue (supersedes the "largest unclaimed win" line above)
+
+**Withdrawn.** The entry above selected an MTP re-test on the ranked-KLD gate and called it "the largest
+unclaimed win on the box". That was wrong, and the memory file it cited **already contained the refutation -
+the index line was read instead of the body:**
+
+- the **+15.8%** was measured on **~50-token prompts generating 300 tokens**. Real turns here are
+  **~106,699 prompt tokens generating 33-43**, where decode is ~33% of wall time - the honest figure is
+  **~5% of a real turn**, not 15.8%;
+- whether it holds at 106k context is **recorded as UNTESTED** (cache state, ubatch path, accept rate all
+  differ there);
+- and it is a **llama.cpp-lab measurement; this box runs Maya**, which has MTP code
+  (`glm_mtp.cu`, `glm_mtp_rows.cu`, `mtp.cpp`) that has **never been measured there** - no Maya number exists.
+
+**What changed was only that the lossless gate was invalid, which makes the old CLOSURE unsound - not the
+feature promising.** Those are different claims and they were conflated. MTP is not on the work list; if
+revisited it needs a **Maya measurement at real context first**, with ranked KLD as the correctness test.
+
+**Correct ranking after adoption, by measured share of what we are trying to improve:**
+1. **`moe_cpu_wait` ~33% of decode stage time** - the stage the all-CPU plan CREATED: biggest and newest.
+2. **the attention/KDA block ~7 ms, plan-invariant and NEVER attacked** (`kda_proj_mv` 2.7 + `kda_out_mv`
+   1.1 + `dsa_out_mv` 0.59 + `hc_attn` 0.53 + `hc_ffn` 0.55 + `mla_attend` 0.54) - plan-invariant means no
+   planner change can touch it, which is why it has survived unexamined.
+3. **the residency term's two defects** (eviction unpriced, `R_est` selection-biased) - broken, so fix it.
+
+## 2026-11-01 - CITATION RULES (the store is full of stale entries; an index line can contradict its body)
+
+- **When citing a prior finding to justify work, quote the CAVEAT paragraph, not the headline.** If the
+  file has no caveat section, say so explicitly - that absence is itself information.
+- **Before adding to this file, check whether the addition contradicts an entry already in it; if so,
+  CORRECT the old entry rather than appending a newer one.** Two entries that disagree are worse than one
+  wrong entry: the reader cannot tell which is live. (This retraction names the entry it supersedes.)
+- **Flag any entry relied on that is llama.cpp-lab provenance while the work is Maya.** Never carry it
+  across silently - the same error as the `llama-server8080` / `config_drift.py` confusion.
