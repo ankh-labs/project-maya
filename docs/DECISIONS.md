@@ -834,3 +834,31 @@ Corroboration: n=4 showed the largest win and no retreat line, and a retreat wou
 **Carried forward, unexplained, and it must be seen beside the wins:** the **replicated -21.9% n=1 cold-run
 cost** (steady +6.8%), reproduced across four boots, with host-side warming as the named but never
 confirmed candidate. That is a real cost on the first request after a boot.
+
+## 2026-11-01 - THE STANDING DISPOSITION TEST for every feature (owner's rule; supersedes "ship it disabled")
+
+> **"If the feature works, we should use it. If the feature is broken, then fix it. If the feature just
+> doesn't provide any improvement or open something else to be improved then get rid of it."**
+
+Three outcomes; **"ship it disabled" is not one of them.** Applied to the two features built this session:
+
+- **`RETIME_V2` -> REMOVE** (third branch). Its detector works, but the condition it protects against
+  needs two deliberate env overrides to produce (`LANE_MAX` to size the pool **and** a request
+  `cpu_threads`), so fixing the trigger would buy protection against a state the box cannot enter.
+- **The residency value term -> FIX, do NOT delete** (second branch - broken, not pointless). Its subject
+  is Aaron's original design point (stage-vs-compute scheduling), and its two defects are named and
+  fixable: `R_est = hits/promotions` is **selection-biased** (measured while staging only deep routes),
+  and **eviction/displacement is unpriced** in a pool ~96% occupied. Direct evidence it is wrong rather
+  than unproven: `R_est 9.28` says stage everything while measurement says all-CPU wins by up to +23.9%.
+  **A term that contradicts a measured result is a bug with a known sign.** The flag may stay only while
+  it is actively being worked - it is not a resting place.
+
+**Correction recorded:** an earlier instruction in this file lumped the residency term in with the
+removal. That was wrong; the rule distinguishes broken (fix) from useless (remove), and the residency
+term is the former.
+
+**The same rule selects two follow-on work items:** fix the residency term's two defects (eviction cost,
+unbiased `R_est`), and **re-test the MTP drafter** on the ranked-KLD gate - +15.8% decode warm at accept
+0.945, parked on a token-equality gate since proven invalid on an engine that samples at temp 1.0. By the
+rule that is a feature that may well WORK and is going unused; spec-decoding's correctness claim is
+distributional, so KLD is the right and only test we have. Largest unclaimed win on the box.
