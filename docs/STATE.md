@@ -116,3 +116,59 @@ deploy is called done - and take a boolean state from the engine's announcement,
 counter that reads the same in both states.
 
 **The +6.8 / +11.8 / +23.9% remain inherited from the pre-merge tree, not re-verified.**
+
+## 2026-11-02 - LOAD WINDOW SETUP: log preservation, per-config logs, PROF off
+
+Set up before agents put real load on the service. Nothing here changes the model or the
+plan; the binary is unchanged (the rotation is `maya.py`, not C++).
+
+1. **The log now survives a restart.** `maya.py` rotates it in `serve_on_screen`, before the
+   engine opens it with `"w"`: `<log>` -> `<log>.<YYYYmmdd-HHMMSS>.log`, keeping 40. Rotation
+   is a property of starting rather than a habit; it fails silently so a log it cannot move
+   never stops Maya. **Proven**: two boots, the second preserved the first's 5,321 B as
+   `maya-v3q-q4-par4.20261101-215724.log`.
+2. **Each config writes its own log.** par4 -> `maya-v3q-q4-par4.log`; standard ->
+   `maya-v3q-q4.log`. Before this both wrote `maya-v3q-q4.log`, so a par4 figure and a
+   standard one were indistinguishable afterwards - and par4's history sat under the
+   standard config's name. Today's misfiled log is preserved as
+   `maya-v3q-q4.PAR4-hist-20261101-215538.log`.
+3. **PROF is off** in both live configs: no `GLM_PROF`/`TRACE`/`TIMING` env keys (the only
+   `PROF` strings are `--expert-profile`, which is pool ranking, not profiling). Throughput
+   from this window is from the ordinary STAT path and can be quoted.
+
+### What the load window can be measured by
+
+- **Per request, from the engine log:** `[maya] done: <n> tokens in <t> s (<x> tok/s)
+  (<finish>), expert cache <p>% hit` and, in the multi path, `glm multi: request <id> done
+  (<finish>): <n> tokens in <t> s (<x> tok/s), <k> running`.
+- **Per request, from `/metrics`:** `totals` (cumulative since idle: requests,
+  prompt_tokens, reused, output_tokens, prompt_ms, decode_ms -> rate) and `history` (sampled
+  series: tok_s, prefill_tok_s_mean, cpu, ram_used, disk_read_mb, gpu_util, gpu_power,
+  gpu_temp, gpu_pcie_rx_mb). `totals` is a since-idle cumulative - a collector must take
+  deltas between polls, not read it as per-request.
+- **Live STAT counters, from `/metrics` `tiers.now`:** tok_s, ms_tok, vram_hit, ram_fetch,
+  disk, promo, vram_used/slots, ram_used/slots, ram_gb, vram_gb, disk_gb, draft_acc,
+  draft_off, active; `tiers.history` holds their series.
+- **Boot-time, from the log:** the plan line (`0 1 2 3 4 5 6 7 8`) and the retime
+  announcement (`CPU lane retime OFF (STRATA_GLM_CPU_RETIME=0)`).
+
+**Not available, and a collector should not look for them:** the **STAT lines are not in the
+log** - the engine writes them to the server's pipe and the server folds them into
+`/metrics` `tiers`, so a log-only collector gets the `[maya] done:` summary instead of the
+per-8-token tier counters. **`rotor`, `retimes` and `faults` are not metrics at all**: they
+exist only as log line patterns (`rotor entered`, `timed again`, `did not drain`), and at
+n=1 the rotation declines (`glm rows: ... rotation declined (n=1, ...)`). There is no
+per-request plan (boot only), no queue/latency percentiles, no quality (KLD) measurement, and
+no per-request prompt-cache ratio beyond `reused`.
+
+### Open list (none blocks the load window)
+
+1. **The +6.8 / +11.8 / +23.9% at n=1/2/4 steady are INHERITED from the pre-merge tree, not
+   re-verified.** This load window is unpaired and uncontrolled: it can reveal a regression,
+   it cannot confirm a gain. A paired re-measure is its own job and this is not it.
+2. **`maya_names`' write-back trap.** A hand-edited `STRATA_` key drifts back to `MAYA_`
+   within two boots (`env_out`, ~20 save sites) - harmless today because `env_in`/`export_env`
+   make the alias work, but a live trap for anyone auditing a config by eye. Fixing the tool
+   (preserve the spelling the code reads, or stop rewriting on save) is a candidate job.
+3. **`moe_cpu_wait`, ~33% of decode stage time** - the next lever, unopened. Real-load data
+   may re-rank it, which is a better reason to wait than an instruction to.
