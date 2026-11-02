@@ -287,3 +287,61 @@ against it.
 The **+6.8 / +11.8 / +23.9% at n=1/2/4 steady were measured on the PRE-merge tree.** On this
 build they are **inherited, not re-verified**. The smoke test is not a substitute — it shows
 the plan and no wedge, not a rate — and a paired re-measure is its own job.
+
+## 2026-11-02 — v1.1.50 merged, deployed and serving
+
+**Branch `feat/v1150-from-good`.** Merge `6c786a7` (parents `d7e15fb` + `10e69a0` = `v1.1.50`),
+built and deployed commit `6c786a7`, tagged **`deployed/v1.1.50-lane-plan-20261102-1147`**,
+verified to resolve to that commit. Series: **138 commits, `v1.1.50..HEAD`, 44 files,
++6,289/-325.** Upstream `v1.1.49..v1.1.50` was 32 commits, 51 files, +3,284/-165.
+
+**Supersedes `v1.1.49` as the upstream base, and `d7e15fb` as the reference tree.** The
+backup tag for this merge is `backup-pre-v1150-20261102` -> `6e92ebe` -> `d7e15fb`.
+
+### Conflict surface, and the one decision that mattered
+
+Six files collide (`glm_fast.hpp`, `maya.py`, `serve/server.py`, `glm_fast_path.cu`,
+`glm_prefill.cu`, `glm_fast.cu`); three conflicted textually. Both sides appended a
+parameter to **`moe_route()`**:
+
+```
+ours:   int win_rows = 0, int miss_to_cpu = 0
+theirs: int win_rows = 0, bool resident_ok = true
+```
+
+**A union would have compiled and been wrong**: the surviving call site passes one
+argument, `bool` binds into the `int miss_to_cpu` slot, so `miss_to_cpu` would have become
+`(il != mtp_il_)` while `resident_ok` kept its default. Both parameters are kept, in that
+order, in the declaration, the definition and the single call site:
+`..., int miss_to_cpu = 0, bool resident_ok = true)` / `win_rows, miss_to_cpu(), il != mtp_il_`.
+
+### Upstream's overlapping work, judged by what it does
+
+- **`29c075f` prefill CPU gate** — a hardcoded `cpu_p_ms > 2.0 * cpu_c_ms` became
+  `STRATA_GLM_PREFILL_CPU_GATE` (default 2.0, so unchanged unless set). It is the **prompt**
+  path; our `lane_plan` is decode-only and shares no env with it. Taken as-is; nothing of
+  ours is reinterpreted. **If prefill is ever reopened these two must be reconciled, not
+  stacked** — they are the same decision at different stages.
+- **`86bb00b` resident-expert cap** — `STRATA_GLM_RESIDENT_TOPK` / `_SKIP_W` keep the top-k
+  heaviest experts of a route, renormalise, and drop the rest to a null plan entry (no
+  fetch, no CPU work). **0 = all, and our config sets neither**, so `MAYA_GLM_EXPERT_USED=7`
+  is untouched. It is a Turbo preset knob that *would* fight our 7 if enabled: decide
+  deliberately, never by inheriting a preset.
+- **`9b2a07e` keep-every-expert** — Maya-XS presets; our model is GLM-5.3-Flash, inert.
+- **`24e2101` thinking budget 8192** — written by *setup* into a Maya-XS config. The server
+  default stays 0 and our config carries no `thinking_budget`, so the engine keeps 4096.
+- **`a6a4fc5` normalise line endings** — both sides' blobs were already LF; noise-free here.
+
+### Gates on the merged build
+
+`patch_invariants` **PASS 15/15** (run on the pre-merge tree first, so a failure would mean
+a loss); per-row audit across all 44 files, **0 markers fell**; build clean; boot plan
+`0 1 2 3 4 5 6 7 8`; retime announced `OFF`; **n=4 smoke 4/4, 266 tokens, rotor 31,
+retimes 0, faults 0**; real request served.
+
+### One claim retracted
+
+`1fb69f5` adds `HH:MM:SS` before each `[maya]` line. The code is present and wired
+(`StampedStdout` then `ServerLogTee`), **but no timestamps appear in our log** — so the
+"timestamps fix last night's blind spot" benefit is **not** delivered yet and must not be
+quoted. The log rotation did preserve the load-window log, so that evidence survived.

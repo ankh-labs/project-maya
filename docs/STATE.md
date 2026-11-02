@@ -172,3 +172,40 @@ no per-request prompt-cache ratio beyond `reused`.
    (preserve the spelling the code reads, or stop rewriting on save) is a candidate job.
 3. **`moe_cpu_wait`, ~33% of decode stage time** - the next lever, unopened. Real-load data
    may re-rank it, which is a better reason to wait than an instruction to.
+
+## 2026-11-02 (v1.1.50) - live state
+
+**Deployed:** Maya **v1.1.50 + 138 commits**, `6c786a7`, `git describe --tags --match 'v1.1.*'`
+-> `v1.1.50-138-g6c786a7`, tag **`deployed/v1.1.50-lane-plan-20261102-1147`** (verified to
+resolve to the built commit). Branch `feat/v1150-from-good`. Config **par4**,
+`STRATA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`, engine **running and verified serving**
+(plan `0 1 2 3 4 5 6 7 8`, retime announced OFF, n=4 smoke 4/4, a real request answered).
+
+**What v1.1.50 brought, and what it did not:**
+- taken and inert-for-us: the prefill CPU gate (threshold knob, default 2.0), the
+  resident-expert cap (opt-in, 0 = all - our EXPERT_USED=7 untouched), thinking-budget
+  defaults (Maya-XS setup only; we stay at 4096).
+- **NOT delivered despite the commit message:** `[maya]` log lines still carry no
+  `HH:MM:SS`. The stamping code is in the merged tree and wired, but nothing is stamped in
+  our log - **open item, needs its own diagnosis**, and the "log timestamps" benefit must
+  not be quoted until it works.
+
+**The merge's one real hazard, recorded because it is the shape that keeps costing us:**
+both sides appended a parameter to `moe_route()` (`int miss_to_cpu = 0` ours,
+`bool resident_ok = true` theirs). A union would have compiled and bound the bool into our
+int, silently mis-routing disk-only experts. Both are kept, in a defined order, at the
+declaration, the definition and the single call site.
+
+### Open list (carried forward)
+
+1. **The +6.8 / +11.8 / +23.9% at n=1/2/4 steady are INHERITED from the pre-merge tree,
+   never re-verified.** Now two merges old. A paired re-measure is its own job.
+2. **Sphinx's looping/garbage** (load window): the engine log showed one loop-guard firing
+   at 1,421 tokens of a 1-token pattern, sampling at `temperature=1.0` with
+   `repetition_penalty=1.0` and no presence/frequency penalty, and six answers capped at
+   ~150 tokens while the thinking budget is 4,096. The proposed fix (per-client sampling +
+   a token cap above the thinking budget) is **not applied**.
+3. **`[maya]` log timestamps** - in the tree, not in effect (above).
+4. **`maya_names` write-back trap** - a hand-edited `STRATA_` key drifts back to `MAYA_` on
+   save; harmless (the alias works) but a trap for anyone auditing a config by eye.
+5. **`moe_cpu_wait`, ~33% of decode stage time** - the next lever, unopened.
