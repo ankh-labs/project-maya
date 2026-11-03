@@ -5,9 +5,9 @@
 # wrong resolution faithfully, and forward recordings reinstate the newer side when replaying backwards. This file is the
 # mechanical check, so the next upstream merge is "merge, run this, three boots" instead of archaeology.
 #
-# SCOPE (2026-11-02, re-derived): this manifest now describes the tree merged onto **upstream v1.1.49**, based on the
-# verified-good reference `0f50931` (v1.1.42 + 126 commits, the build verified serving). Every entry below was re-checked
-# to hold on `0f50931` BEFORE the merge was started, so a failure here is a loss in the merge, not a stale expectation.
+# SCOPE (2026-11-03, re-verified): this manifest describes the tree merged onto **upstream v1.1.50**,
+# verified to hold on `615e36b` (v1.1.50-139, the deployed build plus docs) BEFORE the v1.1.52 merge was
+# started, so a failure here is a loss in the merge, not a stale expectation.
 # That distinction is the whole point: the previous scope line described a merge onto cd52717, and run as-is against a
 # different base it would have failed closed on a stale expectation and read as a merge fault.
 # Expectation changes with the branch, so re-derive them from the tree you are gating, not from memory.

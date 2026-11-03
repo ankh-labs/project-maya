@@ -199,7 +199,8 @@ declaration, the definition and the single call site.
 ### Open list (carried forward)
 
 1. **The +6.8 / +11.8 / +23.9% at n=1/2/4 steady are INHERITED from the pre-merge tree,
-   never re-verified.** Now two merges old. A paired re-measure is its own job.
+   never re-verified.** Now three merges old. A paired re-measure is its own job (owed for
+   v1.1.52's +8-9% decode claim too).
 2. **Sphinx's looping/garbage** (load window): the engine log showed one loop-guard firing
    at 1,421 tokens of a 1-token pattern, sampling at `temperature=1.0` with
    `repetition_penalty=1.0` and no presence/frequency penalty, and six answers capped at
@@ -209,3 +210,28 @@ declaration, the definition and the single call site.
 4. **`maya_names` write-back trap** - a hand-edited `STRATA_` key drifts back to `MAYA_` on
    save; harmless (the alias works) but a trap for anyone auditing a config by eye.
 5. **`moe_cpu_wait`, ~33% of decode stage time** - the next lever, unopened.
+
+## 2026-11-03 - v1.1.52 MERGED, DEPLOYED AND SERVING
+
+**Live state:** Maya runs **v1.1.52 + our series** -- `c367e85`, `git describe --tags --match
+'v1.1.*'` -> **`v1.1.52-140-gc367e85`**, tagged **`deployed/v1.1.52-lane-plan-20261103-1605`**
+(verified to resolve to that commit; branch + tag pushed to sia only), on branch
+`feat/v1152-from-good`, config **par4** (`maya-v3q-q4-par4.json`),
+`MAYA_GLM_CPU_RETIME=0`, `MAYA_GLM_EXPERT_USED=7`, engine **built clean and verified
+serving** (boot plan `0 1 2 3 4 5 6 7 8`, retime announced `OFF`, n=4 smoke 4/4,
+real request 83 tokens coherent, loop_guard all zero).
+
+**Series identity:** 140 commits, `v1.1.52..c367e85`, **44 files, +6384/-325**, pared
+export `maya-patches/series-v1152/` (same 15 subsystem patches). Upstream `v1.1.50..v1.1.52`
+was 383 commits. Merge made **zero** textual conflicts across an 11-file collision
+surface (v1.1.52's CUDA-graph DSA feed-forward sits in regions ours does not touch).
+
+**Upstream features taken as-is:** DSA feed-forward graphs default-on
+(`STRATA_GLM_DSA_FFN_GRAPH` unset = on; their +8-9% decode claim inherited-unverified),
+IQ1_S vector rows, setup keeps host/key/CORS/MCP, MULTI_CKPTS (opt-in, off here),
+ROW_HALVES/DEFER_CPU (opt-in, off), watchdog fix. KDA graphs stay separately opt-in.
+`moe_route` dual params and the env print re-verified post-merge.
+
+**Repo hygiene found during this merge:** the repo is a **shallow clone** — series
+counts need `A..B` range syntax (`v1.1.52..c367e85` = 140); space-separated args count
+a union (read 523 for the same range). Recorded in `docs/FORK_LAYOUT.md`.

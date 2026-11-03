@@ -12,19 +12,26 @@ facts that `git branch -a` would have printed in one second.
 > their own branches" (false: 22 of them are, 7 pushed to Sia) and a bisect across a
 > rewritten lineage (the range was empty; `git merge-base --is-ancestor` would have said so).
 
-## Upstream base — CURRENT (2026-11-02): v1.1.49
+## Upstream base — CURRENT (2026-11-03): v1.1.52
 
-**Supersedes the `e16dec85a` / `cd52717` identity this section used to carry. Read only
+**Supersedes the `v1.1.49` / `v1.1.50` identities this section used to carry. Read only
 this one — a document with two bases is how a merge got started against the wrong tree.**
 
-Our tree is now **upstream `v1.1.49` (`26aacb6`)** with our work merged onto it, on branch
-**`feat/v1149-from-good`**. The merge base with upstream was `v1.1.42`; the merge commit is
-`6edde5d`; the built and deployed commit is `90cbc11` (`git describe --tags --match
-'v1.1.*'` → **`v1.1.49-127-g90cbc11`**), tagged
-**`deployed/v1.1.49-lane-plan-20261101-1954`**.
+Our tree is now **upstream `v1.1.52` (`3c935e4`)** with our work merged onto it, on branch
+**`feat/v1152-from-good`**. The merge commit is `c367e85` (parents `615e36b` +
+`3c935e4`); the built and deployed commit is `c367e85`
+(`git describe --tags --match 'v1.1.*'` → **`v1.1.52-140-gc367e85`**), tagged
+**`deployed/v1.1.52-lane-plan-20261103-1605`** (verified to resolve to that commit;
+branch and tag pushed to **sia only**).
 
-**"Our changes", as of this merge: 127 commits, `v1.1.49..90cbc11`, 42 files,
-+5925/-325.** That is the series the export is generated from and the number to quote.
+**"Our changes", as of this merge: 140 commits, `v1.1.52..c367e85`, 44 files,
++6384/-325.** That is the series the export is generated from and the number to quote.
+(Count with `A..B` range syntax: this repo is a **shallow clone**, and space-separated
+args count a union, which once read 523 for this same range.)
+
+The backup tag for this merge is `backup-pre-v1152-20261103` → `615e36b` (the deployed
+v1.1.50 tree plus docs). The running binary it preserves is kept at
+`build/rollback-maya-v1150.exe` until the new build verifies serving.
 
 ## The reference tree
 
@@ -345,3 +352,72 @@ retimes 0, faults 0**; real request served.
 (`StampedStdout` then `ServerLogTee`), **but no timestamps appear in our log** — so the
 "timestamps fix last night's blind spot" benefit is **not** delivered yet and must not be
 quoted. The log rotation did preserve the load-window log, so that evidence survived.
+
+## 2026-11-03 — v1.1.52 merged: eleven files collide, zero conflict
+
+**Branch `feat/v1152-from-good`.** Merge `c367e85` (parents `615e36b` +
+`3c935e4` = `v1.1.52`), built and deployed commit `c367e85`, tagged
+**`deployed/v1.1.52-lane-plan-20261103-1605`**, verified to resolve to that commit.
+Series: **140 commits, `v1.1.52..c367e85`, 44 files, +6384/-325.** Upstream
+`v1.1.50..v1.1.52` was **383 commits** (v1.1.51 mostly DeepSeek/dashboard, v1.1.52 mostly GLM).
+
+**Supersedes `v1.1.50` as the upstream base, and `615e36b` as the reference tree.** The
+backup tag for this merge is `backup-pre-v1152-20261103` -> `615e36b`.
+
+### Conflict surface, and why there were no textual conflicts
+
+11 of our files collide with upstream's 383-commit span (vs 6 last time). Every one
+auto-merged; the merge made no manual resolution at all:
+
+`glm_model.hpp`, `glm_fast.hpp`, `maya.py`, `serve/server.py`, `glm_fast_path.cu`,
+`glm_fast_state.hpp`, `glm_model.cu`, `glm_window.cu`, `glm_fast.cu`,
+`generate.cpp`, `CMakeLists.txt`
+
+Notably `glm_fast_path.cu` — where v1.1.52 lands its CUDA-graph DSA feed-forward —
+merged cleanly: upstream's graph code sits in regions ours does not touch. The general
+lesson from v1.1.49 holds (seam extraction over in-place edits), and `glm_rows.cu`,
+our largest change, collides with nothing for the third merge running.
+
+### Upstream's overlapping work, judged by what it does
+
+- **CUDA-graph DSA feed-forward, default ON** — `STRATA_GLM_DSA_FFN_GRAPH` unset means
+  on (`glm_fast_path.cu:6362`). Taken as-is. Upstream claims +8-9% decode with identical
+  greedy answers; on this build that rate is **inherited, not re-verified** (same honesty
+  rule as the lane plan). Our KDA graphs stay separately opt-in
+  (`STRATA_GLM_KDA_GRAPH`, still unset here).
+- **IQ1_S rows decode in vectors (#695)** — same-results per upstream; taken. No
+  interaction with our paths beyond sharing the file.
+- **`MAYA_GLM_ROW_HALVES=1`, `MAYA_GLM_DEFER_CPU=2`** — opt-in, off here. Untouched.
+- **Setup keeps host/key/CORS/MCP on re-setup (#720)** — taken; our `serve/server.py`
+  env print re-verified present after the merge.
+- **`MAYA_GLM_MULTI_CKPTS=1` (#714)** — opt-in per-conversation checkpoints; our
+  `--parallel 4` runs without it, unchanged.
+- **GLM engine watchdog fix** (short back-to-back requests no longer trip "no progress")
+  — taken; it guards the path our loop-guard watches, without touching it.
+- **AMD Windows fixes, DeepSeek/MiniMax/dashboards/i18n** — inert for this box.
+
+### Gates on the merged build
+
+`patch_invariants` **PASS 15/15** on the pre-merge tree *and* on the merged tree (a
+post-merge failure would have meant a loss, not a stale expectation); per-row audit
+across all 25 owned source files, **0 markers fell** (606 → 615, five patterns);
+`moe_route` dual params verified at the declaration (`int miss_to_cpu = 0, bool
+resident_ok = true`) *and* the single call site (`win_rows, miss_to_cpu(), il !=
+mtp_il_`); env print verified; build clean (`[152/152]`, warnings only); boot plan
+**`0 1 2 3 4 5 6 7 8`** (CPU takes experts 0–8); retime announced **OFF**;
+**n=4 smoke 4/4**; real request 83 tokens, coherent; serving verified; tag pushed sia
+only.
+
+### Honesty lines carried forward
+
+The +6.8 / +11.8 / +23.9% are now **three merges old**, still inherited. v1.1.52's +8–9%
+decode joins them as inherited-unverified. A paired re-measure is its own job and is
+owed for both.
+
+### Shallow-clone trap, found during this merge
+
+This repo is a **shallow clone** (`git rev-parse --is-shallow-repository` → true).
+`git rev-list --count A B` (space-separated) counts a **union**, which read 523 for a
+range whose true series is 140 — and shallow grafts break the set algebra that would
+have caught it. **Count series with `A..B` range syntax** (`v1.1.52..c367e85` = 140),
+and treat any space-separated count as suspect.
