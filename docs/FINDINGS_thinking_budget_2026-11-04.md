@@ -191,3 +191,26 @@ Honest state: token-only strictly removes one failure class (text false-close) a
 (model continues after a legitimate close).  `low` effort is clean; `high`/`max` under a cut budget
 is still unreliable.
 
+
+## REGRESSION (2026-11-05): the orphan hold broke TOOL CALLS
+
+The hold added for the orphan-tag shape withheld the first <=2048 chars of `content` while waiting for a
+close tag that, for a tool-calling turn, never comes.  `finish()` then flushed the raw markup as the
+ANSWER:
+
+    assistant text: "<tool_call>execute<arg_key>code</arg_key><arg_value>...</arg_value></tool_call>"
+    tools: []
+
+so the client ran nothing - every turn of a real session (ag-desktop, "Llama Server", glm-5.3-flash)
+reported `tools: []` and the user saw "tool calling issues".  The reasoning side was healthy
+(`budget=32768`, close at produced=11), which is what made it look like a model fault rather than ours.
+
+Fix: a buffer containing CALL_START is NEVER held - it falls through to the tool parser immediately.
+`finish()` flushing as content is only correct for text that is genuinely text.
+
+Pinned by `serve.test_orphan_think.OrphanThink.test_a_tool_call_is_never_held_by_the_orphan_rule`
+(the markup must not appear as content, and a tool call must be reported).  Verified live: a request
+with tools returns `finish=tool_calls`, one call parsed, content length 0.
+
+LESSON: a hold in a streaming parser is a behaviour change for EVERY shape that shares the state
+machine, not just the shape it was written for.  Test the other shapes before shipping the hold.

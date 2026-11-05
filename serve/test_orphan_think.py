@@ -71,6 +71,22 @@ class OrphanThink(unittest.TestCase):
         self.assertIn("scratchpad mentioning", joined(evs, "reasoning"), evs)
         self.assertTrue(joined(evs, "content").startswith("# A Title"), evs)
 
+    def test_a_tool_call_is_never_held_by_the_orphan_rule(self):
+        # REGRESSION: the hold waited for a close tag that never came, and finish() flushed the raw
+        # <tool_call> markup as the ANSWER - a real session ran no tool at all (tools=[] every turn).
+        tools = [{"type": "function",
+                  "function": {"name": "execute",
+                               "parameters": {"type": "object",
+                                              "properties": {"code": {"type": "string"}}}}}]
+        body = "<tool_call>execute<arg_key>code</arg_key><arg_value>x</arg_value></tool_call>"
+        p = OutputParser(thinking=False, tools=tools, orphan_think=True)
+        evs = list(p.feed(body[:20])) + list(p.feed(body[20:])) + list(p.finish())
+        kinds = [e.kind for e in evs]
+        self.assertTrue(any(k in ("tool_start", "tool_call") for k in kinds), kinds)
+        for e in evs:                       # the markup must never go out as the answer
+            if e.kind == "content" and e.text:
+                self.assertNotIn("<tool_call>", e.text, evs)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1509,11 +1509,17 @@ class OutputParser:
                 if self.orphan_think and not self.emitted_content:
                     i = self.buf.find(THINK_END)
                     if i < 0:
+                        # A TOOL CALL IS NOT A PREAMBLE.  It has to reach the tool parser NOW: holding it
+                        # meant finish() flushed the raw <tool_call> markup to the client as the answer,
+                        # and a real session showed exactly that - every turn with tools=[] and the markup
+                        # in the text, so nothing ever ran.
+                        if CALL_START in self.buf:
+                            pass            # fall through to the content/tool handling below
                         # the tag may still be arriving: hold a SHORT preamble rather than emit it as the
                         # answer and be unable to take it back.  Bounded, because a normal answer must not
                         # be held: past the cap the text is treated as the answer (vLLM notes the same
                         # limit - a streaming path cannot retroactively reclassify what already went out).
-                        if len(self.buf) <= 2048:
+                        elif len(self.buf) <= 2048:
                             return out
                     else:
                         if i > 0:
