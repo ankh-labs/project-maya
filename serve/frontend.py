@@ -1123,8 +1123,14 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False):
+                 token_only_end: bool = False, orphan_think: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # orphan_think: the template can leave the scratchpad INLINE with only its CLOSING tag and no opening
+        # tag (GLM-5.3 family - upstream vLLM #54744, ollama #18082; persistent on long cross-model histories,
+        # pi #9554).  A parser that starts in content then delivers the reasoning as the ANSWER.  See _feed.
+        self.orphan_think = orphan_think
+        self.emitted_reasoning = False
+        self.emitted_content = False
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
         # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
@@ -1389,6 +1395,17 @@ class OutputParser:
         return self._feed(delta)
 
     def _feed(self, delta: str) -> list[Event]:
+        out = self._feed_inner(delta)
+        for e in out:                  # what has actually gone out is what the orphan rule below consults
+            if not e.text:
+                continue
+            if e.kind == "reasoning":
+                self.emitted_reasoning = True
+            elif e.kind == "content":
+                self.emitted_content = True
+        return out
+
+    def _feed_inner(self, delta: str) -> list[Event]:
         if self.finished:
             return []
         self.buf += delta
@@ -1415,6 +1432,31 @@ class OutputParser:
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0
             elif self.state == "content":
+                # ORPHANED CLOSE TAG (GLM-5.3 family, and any template that spells the end of thinking as
+                # TEXT): the model can emit its scratchpad inline with only the CLOSING tag - no opening tag
+                # ever - so a parser that starts in content would hand the reasoning to the client as the
+                # ANSWER.  GLM-5.3 has no switch that suppresses thinking (vLLM #54744, ollama #18082) and
+                # long cross-model histories make it persistent (pi #9554).  Nothing has gone out as content
+                # yet, so everything before that tag is reasoning: report it as such, or DROP it when the
+                # same reasoning already went out on its own channel (the model sends both).
+                if self.orphan_think and not self.emitted_content:
+                    i = self.buf.find(THINK_END)
+                    if i < 0:
+                        # the tag may still be arriving: hold a SHORT preamble rather than emit it as the
+                        # answer and be unable to take it back.  Bounded, because a normal answer must not
+                        # be held: past the cap the text is treated as the answer (vLLM notes the same
+                        # limit - a streaming path cannot retroactively reclassify what already went out).
+                        if len(self.buf) <= 2048:
+                            return out
+                    else:
+                        if i > 0:
+                            # reasoning went out on its own channel already: the inline copy is a duplicate
+                            if not self.emitted_reasoning:
+                                out.append(Event("reasoning", self.buf[:i]))
+                        self.buf = self.buf[i + len(THINK_END):]
+                        self.lead = True
+                        self.fence, self.line, self.ticks = "", "", 0
+                        continue
                 if self.lead and self.dsml is None:              # legacy GLM/Qwen newline policy
                     stripped = self.buf.lstrip("\n")
                     if not stripped:
