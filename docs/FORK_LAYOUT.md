@@ -421,3 +421,32 @@ This repo is a **shallow clone** (`git rev-parse --is-shallow-repository` → tr
 range whose true series is 140 — and shallow grafts break the set algebra that would
 have caught it. **Count series with `A..B` range syntax** (`v1.1.52..c367e85` = 140),
 and treat any space-separated count as suspect.
+
+## 2026-11-05 - v1.1.53 merged, deployed and serving
+
+**Branch `feat/v1153-from-good`.** Merge commit **`d3ea1f3`** (parents = our `a06ad60` +
+`v1.1.53`). Upstream `v1.1.52..v1.1.53` is **65 commits, 108 files, +10,461/-579** - the largest
+release we have crossed, mostly new backends (`src/metal/`, `mm3` serve, DS4 tests, `tools/agent_bench.py`).
+
+### Gates, in the order the procedure requires them
+
+| gate | result |
+|---|---|
+| `tools/patch_invariants.py` **on OUR tree, before the merge** | **PASS 15/15** (so a post-merge failure is a loss, not a stale expectation) |
+| merge conflicts | **none** - upstream did not touch our lines |
+| `tools/patch_invariants.py` after the merge | **PASS 15/15** |
+| our additions present after the merge | `orphan_think` x9, budget WARNING, `STEP REFUSED`, `svc.cfg` |
+| per-row loss-shape audit (6 markers over src/include/serve) | **PASS** - none fell; `rows_` 946->987, `& 7` 80->82, `R(i)`/`per_row`/`rows_per_row_`/`row_base_` unchanged |
+| build | clean, `build\maya.exe` relinked |
+| boot | `MAYA_GLM_ORPHAN_THINK=1` live, CPU retime OFF as configured, `git describe` = `v1.1.53-146-gd3ea1f3` |
+| serving | real request -> `ready` |
+| n=4 smoke (4 rows, temp 1.0, 200 tokens) | **4/4 coherent, guard detected 0** |
+
+The merge was clean enough that no three-way judgement was needed; the only manual step was the
+documentation. Series: **211 commits `v1.1.52..HEAD`**.
+
+### What this release does not contain
+
+The `in_think` channel-tagging fix (the no-tag variant of the reasoning-leak, see
+`FINDINGS_thinking_budget_2026-11-04.md`). The parser-side orphan split is in, gated by
+`MAYA_GLM_ORPHAN_THINK=1`; the engine-side tag is still open.
