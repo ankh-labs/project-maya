@@ -3766,6 +3766,15 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                # inline scratchpad with an orphaned close tag: the config's
+                                # env STRATA_GLM_ORPHAN_THINK (either spelling - the engine rewrites
+                                # STRATA_* to MAYA_*; and the server does not inherit the config's env the
+                                # way the engine child does, so it is read from the config here)
+                                orphan_think=str((getattr(self, "cfg", {}) or {}).get("env", {}).get(
+                                    "STRATA_GLM_ORPHAN_THINK",
+                                    (getattr(self, "cfg", {}) or {}).get("env", {}).get(
+                                        "MAYA_GLM_ORPHAN_THINK",
+                                        os.environ.get("STRATA_GLM_ORPHAN_THINK", "0")))) not in ("", "0"),
                                 strict_tools=responses, single_tool=single_tool)
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
@@ -3873,6 +3882,17 @@ class Service:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
+                    # ... AND end it at a sentence or line end, exactly as a larger request does.  A short
+                    # request used to get a HARD cut mid-sentence, and that is what leaves the model still
+                    # reasoning: everything after the forced close is labelled the ANSWER, so the rest of
+                    # its thinking is delivered to the client as the reply (measured on the v3q pack:
+                    # max_tokens 500 -> budget 249, cut mid-thought, and that row never recovered while the
+                    # others did).  There is little room on a short request, so the grace is the same half
+                    # of what max_tokens leaves after the budget, capped at THINK_GRACE.
+                    room = (int(max_new) - think_budget - 1) // 2
+                    grace = max(0, min(THINK_GRACE, room))
+                    if grace > 0:
+                        soft, think_budget = think_budget, think_budget + grace
                 elif budgeted:
                     # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
                     # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
@@ -6566,6 +6586,7 @@ def main() -> int:
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
+    svc.cfg = cfg                                     # (the config, kept for the request-side switches below)
     svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
                            maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))

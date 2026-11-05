@@ -2883,6 +2883,28 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (g.in_think && (tok == g.think_end || g.produced >= g.think_budget || wrap_req.load())) {
+            // SAY WHY THE REASONING CLOSED.  The three arms are not equivalent: the model emitting think_end is
+            // its own choice, the budget is the config's, and WRAP is the engine's global stop flag - which every
+            // decoding request reads as its own.  Without this line a premature close is indistinguishable from
+            // a model that simply chose to answer, and the reasoning that follows the close is delivered to the
+            // client as the ANSWER (coherent deliberation, read as garbage).
+            {
+                // one line per request at most (in_think is cleared once), so this needs no cap.
+                // The arms are NOT equivalent, and only one is worth a warning: the model emitting
+                // think_end is its own choice; WRAP is the engine's global stop (shutdown only); THE
+                // BUDGET is a forced cut, and everything the model thinks afterwards is labelled the
+                // answer - so an answer that reads as deliberation is expected, not an arithmetic fault.
+                if (tok != g.think_end && g.produced >= g.think_budget)
+                    std::fprintf(stderr, "glm think: WARNING request %d hit its thinking budget (produced=%lld, "
+                                         "budget=%lld, active=%zu): the reasoning was cut, and whatever it thought "
+                                         "next is sent to the client as the ANSWER\n",
+                                 g.rid, (long long) g.produced, (long long) g.think_budget, gens.size());
+                else
+                    std::fprintf(stderr, "glm think: request %d closed its reasoning: %s (produced=%lld, budget=%lld, "
+                                         "active=%zu)\n",
+                                 g.rid, tok == g.think_end ? "the model emitted think_end" : "WRAP",
+                                 (long long) g.produced, (long long) g.think_budget, gens.size());
+            }
             if (tok != g.think_end) g.force = g.think_end;
             g.in_think = false;
             g.hist.clear();
