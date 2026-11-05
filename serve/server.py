@@ -4030,9 +4030,9 @@ class Service:
                 return True                                   # (its template guarantees the token)
             if _tok_only in ("0", "false", "off", "no"):
                 return False                                  # the text search, as before
-            if _tok_only:
-                return True                                   # explicit opt-in for another family
-            return bool(getattr(self.template, "glm_effort", False))   # DEFAULT: GLM-5.x
+            return bool(_tok_only)                            # opt-in only: CONTRIBUTING asks for today's
+                                                              # behaviour by default unless measured better,
+                                                              # and at max effort it is not
 
         def new_parser(in_thinking=None):
             # (in_thinking: the segment's prompt already closed the thinking - see keep, below - so its first token
@@ -4157,17 +4157,6 @@ class Service:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
-                    # ... AND end it at a sentence or line end, exactly as a larger request does.  A short
-                    # request used to get a HARD cut mid-sentence, and that is what leaves the model still
-                    # reasoning: everything after the forced close is labelled the ANSWER, so the rest of
-                    # its thinking is delivered to the client as the reply (measured on the v3q pack:
-                    # max_tokens 500 -> budget 249, cut mid-thought, and that row never recovered while the
-                    # others did).  There is little room on a short request, so the grace is the same half
-                    # of what max_tokens leaves after the budget, capped at THINK_GRACE.
-                    room = (int(max_new) - think_budget - 1) // 2
-                    grace = max(0, min(THINK_GRACE, room))
-                    if grace > 0:
-                        soft, think_budget = think_budget, think_budget + grace
                 elif budgeted:
                     # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
                     # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
