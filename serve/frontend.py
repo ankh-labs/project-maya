@@ -650,6 +650,13 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         messages.append(out)
     tools = stable_tool_order([t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
                                for t in req.get("tools") or []] or None)
+    # MEASUREMENT (temporary): does the CLIENT send prior reasoning back? Preserved thinking
+    # (clear_thinking false) only exists when the history carries reasoning_content - if clients
+    # never send it, that template default is inert for them and clearing it changes nothing.
+    if os.environ.get("MAYA_LOG_REASONING_REPLAY"):
+        with_rc = sum(1 for m in messages if m.get("reasoning_content"))
+        chars = sum(len(m.get("reasoning_content") or "") for m in messages)
+        print(f"[maya] history: {len(messages)} messages, {with_rc} carry reasoning_content ({chars} chars)", flush=True)
     tc = req.get("tool_choice")
     if tc == "none":   # the tools stay declared to the client, but none is offered to the model
         tools = None

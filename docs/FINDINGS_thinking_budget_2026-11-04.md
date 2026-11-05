@@ -214,3 +214,57 @@ with tools returns `finish=tool_calls`, one call parsed, content length 0.
 
 LESSON: a hold in a streaming parser is a behaviour change for EVERY shape that shares the state
 machine, not just the shape it was written for.  Test the other shapes before shipping the hold.
+
+## Production corroboration (2026-11-05): the Whiteout audit lane, and a scope correction
+
+The same mechanism, observed from a production consumer rather than a bench. An auditor (the
+`assist` "tool-use audit agent" in AI---Whiteout-Bot, task #5432) failed every turn with
+`Check... Check...` repetition, prose tool names ("Unknown tool 'Tree/list tool calls'") and
+`classifyVerdictFailure: unparseable-content`. Maya's own counters for that run: guard
+`detected 6 / penalised 5 / stopped 1`, and one turn with `produced=1471` followed by a run of
+`produced=1` - the model had stopped deliberating.
+
+**Cause: preserved thinking, not effort.** The auditor sends no `chat_template_kwargs`, so the
+template's `clear_thinking` default (`false`) applied and every turn of the tool loop re-sent all
+previous reasoning. `reasoning_effort` was ALREADY low: the server injects the config's default
+(`serve/server.py:3412`, `default_effort`, config + shared settings both `low`), so the auditor was
+never at Max. The tell is the prompt reads: ballooning before, `37 / 84 / 74 / 104` tokens
+incremental after.
+
+| signal | before | after `clear_thinking: true` |
+|---|---|---|
+| reasoning produced per turn | 1471, then a run of 1 | 5, 25, 16, 1, 88 (verdict turn 562) |
+| prompt reads | ballooning | 37, 84, 74, 104 tokens (incremental) |
+| tool calls / unknown-tool | 10 / 4 | 7 / 0 |
+| guard | detected 6, penalised 5, stopped 1 | 0 new |
+| outcome | repetition, no verdict | found `task-5404`, `login.go` 296 lines, full workability analysis |
+
+### Scope: where this fix belongs (I got this wrong twice)
+
+- **The fleet does NOT traverse Whiteout's `ai-pipeline`.** OpenCode points straight at Maya
+  (`baseURL: http://192.168.5.128:8080/v1`). So a gateway-wide key cannot affect the fleet - and
+  changing Maya's default WOULD, which is the opposite of what "fix it once for everyone" suggests.
+- **OpenCode DOES replay reasoning.** `anomalyco/opencode`, `dev`,
+  `packages/ai/src/protocols/openai-chat.ts:554-563`: an assistant message carrying reasoning parts
+  is sent with `reasoning_content`; the field is omitted only when there are no parts and the
+  provider does not require it. Preserved thinking is therefore live for any client that stores
+  reasoning - it is not inert.
+- **Therefore: keep `clear_thinking` false at the endpoint** (opt-in preserved thinking, as Z.AI's
+  standard API has it), and scope the auditor's clear to the auditor (`services/tool-use-agent.js`
+  builds its body at one place). A provider-entry default would also hit the fleet only if both
+  used the same gateway path - they do not.
+
+### Two corrections made in public, worth keeping
+
+1. I stated the auditor "renders Max". Wrong: that is the template in isolation; the server injects
+   its configured default (low) at render time. Verified by reading the code path and the config,
+   not by the prompt-size heuristic that had suggested it.
+2. I recommended moving the fix to the endpoint. Wrong scope: it would trade a behaviour the fleet
+   deliberately uses for a bug in one consumer.
+
+## Debug aid: MAYA_LOG_REASONING_REPLAY
+
+One line a request: `[maya] history: N messages, M carry reasoning_content (X chars)`. Preserved
+thinking only does anything when the client sends `reasoning_content` back, so this measures
+whether it applies at all. Off by default; env only (the server does not inherit the config's
+`env` block the way the engine child does).
