@@ -166,33 +166,28 @@ parser to infer it.
   anywhere (seen once in 6 rows). No parser rule can catch that; the ENGINE knows `in_think` per
   request and should tag the channel itself when reasoning was requested.
 
-## Route 2, solved properly: close on the TOKEN, not the text (2026-11-05)
+## Route 2: close on the TOKEN, not a text search (2026-11-05) - and what it does NOT fix
 
-The end of thinking is a TOKEN in our stack, not a substring, and always was:
-  * the template opens the thinking block in the generation prompt, so the model is trained to emit the
-    matching end token (Z.AI's SGLang cookbook says the same: without the reasoning parser you get the
-    scratchpad plus a stray tag in one content string);
-  * the engine is handed `think_end` as an ID and force_next()s it - you cannot force a substring;
-  * the server already compares ids: `end_think = bool(in_think and t == self.think_end_id)`.
+The end of thinking is a TOKEN in our stack and always was: the template opens the block in the
+generation prompt, the engine is handed `think_end` as an ID and force_next()s it, and the server
+already compares ids (`end_think`).  `token_only_end` was enabled for DeepSeek only, on the belief
+that GLM "spells the end as text" - and that belief is what let a `</think>` the model writes INSIDE
+its reasoning close the channel early.  It is now the DEFAULT for GLM-5.x (`template.glm_effort`,
+verified True on the pack's own `tokenizer/chat_template.jinja`), with `MAYA_GLM_THINK_TOKEN_ONLY=0`
+to restore the text search.
 
-What was missing was one wire: `token_only_end` was enabled for DeepSeek ONLY, on the belief that GLM
-"spells the end as text".  With the text search, a `` the model writes INSIDE its reasoning closes
-the channel early - the orphan shape.  `MAYA_GLM_THINK_TOKEN_ONLY=1` enables the token path for GLM.
+**What it fixes:** the tag cannot be mistaken for the end of thinking any more, because the text
+search never runs.  Measured: `low`/500 splits at the token (produced=7/13), content 2114-2448 chars,
+clean every time.
 
-Measured (v3q, arm = overlap, orphan gate also on):
+**What it does NOT fix - CORRECTION to an earlier 4/4 claim in this file.**  A single 4-row run
+looked clean and I recorded it as solved; a second run at the same settings leaked on 2 of 4 rows.
+The mechanism is not parsing: the model emits the close token, the channel splits, and then it
+CONTINUES PLANNING in the answer channel ("Actually, let me write about some famous historic
+lighthouse keepers... hmm, I meant:").  That is the model, after a close it did not want, and no
+parser can classify it.  The lever there is the budget/effort policy, not the parser.
 
-| cell | result |
-|---|---|
-| `low`, 500 tokens | reasoning 24-65 chars, content 2298-2476 chars - split at the token, produced=7/15 |
-| `max`, 500 tokens, batch shrink (the leak cell) | **4/4 clean**, every content opening with the title, reasoning 990-1224 chars |
+Honest state: token-only strictly removes one failure class (text false-close) and leaves the other
+(model continues after a legitimate close).  `low` effort is clean; `high`/`max` under a cut budget
+is still unreliable.
 
-With token-only closing the text search never runs, so the orphan case cannot occur at all: the
-`orphan_think` rule is now a belt-and-braces fallback, not the mechanism.
-
-Known instrumentation gap: the engine logs its close ("the model emitted think_end" / budget WARNING)
-only on its own arms; the four long `max` rows split correctly with NO engine line, i.e. the split was
-the server's token detection.  Worth a line on that path if it is ever ambiguous again.
-
-RISK, if the flag is ever moved off this model: a template that emits the end as ordinary TEXT with no
-special token would never close, and the whole answer would land in `reasoning_content`.  The control
-cell above (content 2298+ chars) is the test that this model does have the token.

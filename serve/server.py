@@ -4011,23 +4011,35 @@ class Service:
             sampling = {**defaults, **req_values}
         responses = (sampling or {}).get("_responses") is True
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
+        # The end of thinking is a TOKEN in this stack: the template opens the block in the generation prompt, the
+        # engine is handed think_end as an ID and force_next()s it, and the server compares ids (end_think).  The
+        # text search is only a FALLBACK - and it is what lets a "</think>" the model writes INSIDE its reasoning
+        # close the channel early, so the rest of its thinking is delivered to the client as the ANSWER.
+        # DEFAULT ON for GLM-5.x (template attribute glm_effort): measured on the v3q pack, low closes at
+        # produced=7/15 and max/500 splits 4/4 where the text search leaked in both rounds.
+        # MAYA_GLM_THINK_TOKEN_ONLY=0 restores the text search; =1 forces it on for any other family.
+        _pipe_env = (getattr(self, "cfg", {}) or {}).get("env", {}) or {}
+        _tok_only = str(_pipe_env.get("STRATA_GLM_THINK_TOKEN_ONLY",
+                                      _pipe_env.get("MAYA_GLM_THINK_TOKEN_ONLY",
+                                                    os.environ.get("STRATA_GLM_THINK_TOKEN_ONLY", ""))) or "").lower()
+
+        def _token_only_end() -> bool:
+            if self.think_end_id is None:
+                return False
+            if getattr(self.template, "deepseek", False):
+                return True                                   # (its template guarantees the token)
+            if _tok_only in ("0", "false", "off", "no"):
+                return False                                  # the text search, as before
+            if _tok_only:
+                return True                                   # explicit opt-in for another family
+            return bool(getattr(self.template, "glm_effort", False))   # DEFAULT: GLM-5.x
+
         def new_parser(in_thinking=None):
             # (in_thinking: the segment's prompt already closed the thinking - see keep, below - so its first token
             # is the answer's, not the reasoning's)
             return OutputParser(thinking=thinking if in_thinking is None else thinking and in_thinking, tools=tools,
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
-                                # DeepSeek's vocabulary has the end of thinking as a TOKEN.  So does GLM's: the engine
-                                # is handed think_end as an ID and force_next()s it, and the server already compares
-                                # token ids (end_think).  The text search is only a fallback - and it is what lets the
-                                # model's own "</think>" inside its reasoning close the channel early (the orphan
-                                # shape).  Off by default per model; MAYA_GLM_THINK_TOKEN_ONLY=1 turns it on for GLM.
-                                token_only_end=((getattr(self.template, "deepseek", False) and self.think_end_id is not None)
-                                                or (self.think_end_id is not None and str(
-                                                    (getattr(self, "cfg", {}) or {}).get("env", {}).get(
-                                                        "STRATA_GLM_THINK_TOKEN_ONLY",
-                                                        (getattr(self, "cfg", {}) or {}).get("env", {}).get(
-                                                            "MAYA_GLM_THINK_TOKEN_ONLY",
-                                                            os.environ.get("STRATA_GLM_THINK_TOKEN_ONLY", "0")))) not in ("", "0"))),
+                                token_only_end=_token_only_end(),
                                 minimax=getattr(self.template, "minimax", False),
                                 # inline scratchpad with an orphaned close tag: the config's
                                 # env STRATA_GLM_ORPHAN_THINK (either spelling - the engine rewrites
