@@ -60,3 +60,6 @@ build-vision.bat
 
 # watchdog crash dumps: binary noise in a branch that gets bisected
 *.dmp
+
+# runtime pipe-arm switch (read every 200 ms; never source)
+strata-pipe-arm.txt
