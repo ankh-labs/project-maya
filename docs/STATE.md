@@ -235,3 +235,22 @@ ROW_HALVES/DEFER_CPU (opt-in, off), watchdog fix. KDA graphs stay separately opt
 **Repo hygiene found during this merge:** the repo is a **shallow clone** — series
 counts need `A..B` range syntax (`v1.1.52..c367e85` = 140); space-separated args count
 a union (read 523 for the same range). Recorded in `docs/FORK_LAYOUT.md`.
+
+## 2026-11-05 - v1.1.53 MERGED, DEPLOYED AND SERVING
+
+**Live state:** Maya runs **v1.1.53 + our series** - `8a5ec13`, `git describe --tags --match
+'v1.1.*'` -> **`v1.1.53-146-gd3ea1f3`**, tagged **`deployed/v1.1.53-20261104-2304`** on
+`feat/v1153-from-good` (pushed to `sia`). This supersedes `deployed/v1.1.52-lane-plan-20261103-1605`.
+
+**Gates:** invariants 15/15 on OUR tree BEFORE the merge and 15/15 after; zero merge conflicts;
+per-row loss audit PASS (no marker fell); build clean; boot `MAYA_GLM_ORPHAN_THINK=1`, CPU retime
+OFF; serving `ready`; n=4 smoke 4/4. Upstream was 65 commits / 108 files / +10,461-579.
+Details in `FORK_LAYOUT.md`.
+
+**The "garbage output" banner (2026-11-04/05) is DIAGNOSED and documented** in
+`FINDINGS_thinking_budget_2026-11-04.md`: it was the model's own reasoning delivered in the
+CONTENT channel, not corrupted arithmetic (zero non-finite scores, every row ran every layer,
+guard silent). Two routes: a budget-forced close, and GLM-5.3's orphaned close tag written inside
+its own reasoning. Both are known ecosystem traits (vLLM #54744, ollama #18082, hermes #96735,
+pi #9554). The parser-side fix is in and gated; **the engine-side `in_think` channel tag is the
+one open item** - it is what closes the no-tag variant.
