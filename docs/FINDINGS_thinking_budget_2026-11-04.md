@@ -165,3 +165,34 @@ parser to infer it.
 - **The no-tag variant**: the model's planning notes delivered as content with NO close tag
   anywhere (seen once in 6 rows). No parser rule can catch that; the ENGINE knows `in_think` per
   request and should tag the channel itself when reasoning was requested.
+
+## Route 2, solved properly: close on the TOKEN, not the text (2026-11-05)
+
+The end of thinking is a TOKEN in our stack, not a substring, and always was:
+  * the template opens the thinking block in the generation prompt, so the model is trained to emit the
+    matching end token (Z.AI's SGLang cookbook says the same: without the reasoning parser you get the
+    scratchpad plus a stray tag in one content string);
+  * the engine is handed `think_end` as an ID and force_next()s it - you cannot force a substring;
+  * the server already compares ids: `end_think = bool(in_think and t == self.think_end_id)`.
+
+What was missing was one wire: `token_only_end` was enabled for DeepSeek ONLY, on the belief that GLM
+"spells the end as text".  With the text search, a `` the model writes INSIDE its reasoning closes
+the channel early - the orphan shape.  `MAYA_GLM_THINK_TOKEN_ONLY=1` enables the token path for GLM.
+
+Measured (v3q, arm = overlap, orphan gate also on):
+
+| cell | result |
+|---|---|
+| `low`, 500 tokens | reasoning 24-65 chars, content 2298-2476 chars - split at the token, produced=7/15 |
+| `max`, 500 tokens, batch shrink (the leak cell) | **4/4 clean**, every content opening with the title, reasoning 990-1224 chars |
+
+With token-only closing the text search never runs, so the orphan case cannot occur at all: the
+`orphan_think` rule is now a belt-and-braces fallback, not the mechanism.
+
+Known instrumentation gap: the engine logs its close ("the model emitted think_end" / budget WARNING)
+only on its own arms; the four long `max` rows split correctly with NO engine line, i.e. the split was
+the server's token detection.  Worth a line on that path if it is ever ambiguous again.
+
+RISK, if the flag is ever moved off this model: a template that emits the end as ordinary TEXT with no
+special token would never close, and the whole answer would land in `reasoning_content`.  The control
+cell above (content 2298+ chars) is the test that this model does have the token.

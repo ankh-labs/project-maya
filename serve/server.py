@@ -4016,7 +4016,18 @@ class Service:
             # is the answer's, not the reasoning's)
             return OutputParser(thinking=thinking if in_thinking is None else thinking and in_thinking, tools=tools,
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
-                                token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
+                                # DeepSeek's vocabulary has the end of thinking as a TOKEN.  So does GLM's: the engine
+                                # is handed think_end as an ID and force_next()s it, and the server already compares
+                                # token ids (end_think).  The text search is only a fallback - and it is what lets the
+                                # model's own "</think>" inside its reasoning close the channel early (the orphan
+                                # shape).  Off by default per model; MAYA_GLM_THINK_TOKEN_ONLY=1 turns it on for GLM.
+                                token_only_end=((getattr(self.template, "deepseek", False) and self.think_end_id is not None)
+                                                or (self.think_end_id is not None and str(
+                                                    (getattr(self, "cfg", {}) or {}).get("env", {}).get(
+                                                        "STRATA_GLM_THINK_TOKEN_ONLY",
+                                                        (getattr(self, "cfg", {}) or {}).get("env", {}).get(
+                                                            "MAYA_GLM_THINK_TOKEN_ONLY",
+                                                            os.environ.get("STRATA_GLM_THINK_TOKEN_ONLY", "0")))) not in ("", "0"))),
                                 minimax=getattr(self.template, "minimax", False),
                                 # inline scratchpad with an orphaned close tag: the config's
                                 # env STRATA_GLM_ORPHAN_THINK (either spelling - the engine rewrites
