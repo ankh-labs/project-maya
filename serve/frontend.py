@@ -573,8 +573,24 @@ def _json_format_note(req: dict, messages: list[dict]) -> list[dict]:
     return with_system_note(messages, json_instruction(schema if isinstance(schema, dict) else None))
 
 
+def _note_replay(tag: str, messages) -> None:
+    """Debug (MAYA_LOG_REASONING_REPLAY): how much of the client's own earlier thinking this request
+    replays. Preserved thinking (`clear_thinking` false) only does anything when the client sends
+    `reasoning_content` back, so this is the measurement that says whether it applies at all."""
+    if not os.environ.get("MAYA_LOG_REASONING_REPLAY"):
+        return
+    try:
+        msgs = [m for m in (messages or []) if isinstance(m, dict)]
+        with_rc = sum(1 for m in msgs if m.get("reasoning_content"))
+        chars = sum(len(m.get("reasoning_content") or "") for m in msgs)
+    except Exception:
+        return
+    print(f"[maya] history({tag}): {len(msgs)} messages, {with_rc} carry reasoning_content ({chars} chars)", flush=True)
+
+
 def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+    _note_replay("openai", req.get("messages"))
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -679,6 +695,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+    _note_replay("anthropic", req.get("messages"))
     """Anthropic Messages -> (template messages, template tools, template kwargs)."""
     messages = []
     system = req.get("system")

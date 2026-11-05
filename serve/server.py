@@ -5809,6 +5809,8 @@ def make_handler(svc: Service):
             if not self._authorized() or self._foreign_page():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if os.environ.get("MAYA_LOG_REASONING_REPLAY") and path.startswith("/v1/"):
+                print(f"[maya] POST {path}", flush=True)   # (which dialect a client actually uses)
             try:
                 if path in ("/models/load", "/models/unload"):
                     self._llamacpp_model(path.rsplit("/", 1)[1])
