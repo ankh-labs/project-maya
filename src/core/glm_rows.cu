@@ -1215,8 +1215,8 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         const int L = l1_ - l0_;
         // floor starts at the first layer and only moves forward; a slot may not run past floor + S.  The leader is
         // therefore throttled by construction - no pause logic, no condvar - and the straggler is the one to accelerate.
-        int floor = l0_;
-        const uint64_t expected0 = F->expected;
+        // (the floor itself is recomputed each round below; the copy that used to sit here was never read - it was
+        // shadowed by the round's own - and an unused F->expected snapshot was removed with it)
         // The embed, the bind and the boundary all ran on F->cs; row 1 computes on F->cs2, and on one stream that
         // ordering was implicit.  Without this the second row's first layer can read its x before the embed that writes
         // it has run - a sporadic non-finite score a layer or two in, i.e. arithmetic, not an index fault.
@@ -1363,6 +1363,35 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 S->cur[r].deferred = 0;
                 if (S->cur[r].il >= l1_) S->cur[r].done = true;
                 else all_done = false;
+            }
+        }
+        // FAIL CLOSED: EVERY ROW MUST HAVE RUN EVERY LAYER.  The round loop above can leave with all_done
+        // false - a row postponed past round_cap, or held back by the floor + pipe_lead throttle, exits
+        // with a HOLE in its stack while rows_head samples it anyway: finite, silent garbage (the 3->2
+        // reshape reproduced it deterministically, and it reads as a wrong context rather than a fault).
+        // Nothing asserted this before, so a short stack was a corruption nobody could see.  Refuse the
+        // step instead of sampling a row that never finished.
+        {
+            int starved = -1;
+            for (int q = 0; q < n; ++q)
+                if (!S->cur[q].done) { starved = q; break; }
+            if (starved >= 0) {
+                const int ran = S->cur[starved].il - l0_;
+                static std::atomic<uint64_t> refused{0};
+                // first few only: a persistent short step would otherwise flood the log
+                if (refused.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "glm pipe: CUDA%d STEP REFUSED: row %d ran %d of %d layers "
+                                         "(stopped at %d, n=%d, lead %d) - a short stack is not sampled\n",
+                                 dev_, starved, ran, l1_ - l0_, S->cur[starved].il, n, F->pipe_lead);
+                err = "glm rows: row " + std::to_string(starved) + " ran " + std::to_string(ran) + " of " +
+                      std::to_string(l1_ - l0_) + " layers (refused rather than sampled short)";
+                gf::moe_wait_fetch_set_rows(1);
+                row_base_ = 0;
+                rows_stream_ = nullptr;
+                rows_per_row_ = false;
+                if (F->pipe) F->pipe->watch_active.store(0, std::memory_order_release);
+                F->pipe_active.store(false, std::memory_order_release);
+                return false;
             }
         }
         {
