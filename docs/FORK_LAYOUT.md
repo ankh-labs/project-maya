@@ -485,3 +485,58 @@ branch, not our q4_0 branch; if that setting is ever removed, this is the paragr
 
 The rest of 1.1.54/1.1.55 is Qwen3.8 serve work (not our path), Codex/Responses API fixes, and
 default flips from their opt-in review (`MAYA_PROMPT_MEMO`, `DS4_AI_RUN`, `DS4_AR2`).
+
+## 2026-11-06 - v1.1.56 merged, deployed and serving
+
+**Branch `feat/v1156-from-good`.** Merge commit **`3342116`**. Upstream `v1.1.55..v1.1.56` is
+**36 commits, 56 files, +5,823/-442**, and it is a GLM release. Tag
+**`deployed/v1.1.56-20261106-1527`**, branch and tag pushed to `sia`.
+
+### Gates
+
+| gate | result |
+|---|---|
+| invariants on OUR tree **before** the merge | **PASS 15/15** |
+| merge conflicts | **NONE**, despite a **24-file overlap** (vs 9 for v1.1.55) |
+| invariants after the merge | **PASS 15/15** |
+| loss audit (6 markers) | **PASS** - `rows_` 987 -> 995 (upstream added rows code), `& 7` 82 -> 83, the rest unchanged |
+| our additions | `orphan_think` x9, budget WARNING, `STEP REFUSED`, `_note_replay` x3 |
+| build | clean |
+| boot | settings line unchanged; `CPU lane retime OFF (STRATA_GLM_CPU_RETIME=0)` still prints |
+| serving | `ready` |
+| n=4 smoke | **4/4 coherent, guard 0** |
+
+The 24 overlapping files included our hot path - `glm_fast_path.cu`, `glm_fast_state.hpp`,
+`glm_model.cu`, `glm_prefill.cu`, `glm_window.cu`, `kernels/cuda/glm_fast.cu`, `generate.cpp`,
+`serve/server.py` - and every one auto-merged.
+
+### What is in it, and what touches us
+
+- **#860 speculative decode**: a draft with no finite logit counts as a valid token on every
+  drafting path; a two-GPU split's spec decode is back to v1.1.51's behaviour; and
+  `MAYA_GLM_NO_SPEC`/`NO_MTP`/`NO_PREFILL` now treat `0`, `false`, `off`, `no`, `nothing` as OFF.
+  The last one matters generally: a plain `getenv() != nullptr` took `NO_SPEC=0` to mean "no
+  drafting". We set none of those flags, and `CPU_RETIME=0` still reads OFF.
+- **#845 no seed draws a new seed** (it was always seed 0). **This is a behavioural change for us** -
+  see the determinism note below.
+- **#840 GLM slots: try the next slot and the checkpoint when a parked conversation fails to load** -
+  aimed straight at the "refused ... foreign identity, incomplete, or its checksum failed" lines
+  this box was logging after the v1.1.55 upgrade.
+- **#861 iq_pack keeps the GLM5-next selection bias `exp_probs_b.bias` F32** instead of rounding it
+  to BF16 - pack tooling, not serving.
+- The rest is DeepSeek EXL3/Pascal/AMD work and file attachments in the web chat (PDF/DOCX/XLSX...).
+
+### Determinism after #845 - do not compare past no-seed runs with these
+
+Measured on this box (temperature 1.0, no seed, then `seed=1234`):
+
+```
+no seed:      varies between runs   (intended: #845 draws a new seed)
+seed=1234:    identical in 3 of 4 pairs; one pair differed (red, blue, green / Red, green, blue)
+```
+
+So an explicit seed is **mostly** but not fully reproducible at temperature > 0 with speculative
+decoding on - the draft-acceptance path consumes RNG state differently. **`temperature: 0` remains
+the exact mode** and is what the fork's own harnesses use. Any benchmark or eval that sent no seed
+at temperature > 0 is *not* reproducible against this build, and that is upstream's change, not the
+fork's.

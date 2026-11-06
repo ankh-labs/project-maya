@@ -270,3 +270,23 @@ default is inert here (verified in the boot line, not assumed). Details in `FORK
 **Carried open items** (none introduced by the merge): the audit lane's abandon-on-HEAD behaviour;
 a verdict accepted from a self-stopped run; the counting-loop degeneration the loop guard cannot
 match; and the reasoning-return change whose benefit is still unmeasured.
+
+## 2026-11-06 - v1.1.56 MERGED, DEPLOYED AND SERVING (supersedes v1.1.55)
+
+**Live state:** Maya runs **v1.1.56 + our series** - `3342116`, tagged
+**`deployed/v1.1.56-20261106-1527`** on `feat/v1156-from-good` (pushed to `sia`). This supersedes
+`deployed/v1.1.55-20261106-0015`.
+
+**Gates:** invariants 15/15 before and after; **zero conflicts across a 24-file overlap**; loss audit
+PASS; build clean; `ready`; n=4 smoke 4/4 with guard 0. Upstream was 36 commits / 56 files /
++5,823-442, GLM-focused.
+
+**Two things to carry forward:**
+- **#840 (slot fallback)** should stop the `refused ... foreign identity` lines we saw after the
+  v1.1.55 upgrade - watch the next boot rather than assume.
+- **#845 makes no-seed requests non-deterministic** (they were pinned to seed 0). Fixed seeds are
+  mostly reproducible at temperature > 0 with spec decode on, not exactly; `temperature: 0` stays
+  exact. Past no-seed runs at temperature > 0 are not comparable with this build.
+
+Everything else in the release (DeepSeek EXL3/Pascal, AMD, web-chat attachments) does not touch our
+GLM path. Details in `FORK_LAYOUT.md`.
