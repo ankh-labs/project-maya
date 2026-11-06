@@ -450,3 +450,38 @@ documentation. Series: **211 commits `v1.1.52..HEAD`**.
 The `in_think` channel-tagging fix (the no-tag variant of the reasoning-leak, see
 `FINDINGS_thinking_budget_2026-11-04.md`). The parser-side orphan split is in, gated by
 `MAYA_GLM_ORPHAN_THINK=1`; the engine-side tag is still open.
+
+## 2026-11-06 - v1.1.55 merged, deployed and serving
+
+**Branch `feat/v1155-from-good`.** Merge commit **`d8e5fbc`**. Upstream `v1.1.53..v1.1.55` (two
+releases: 1.1.54 and 1.1.55) is **52 commits, 69 files, +3,201/-601**. Series `v1.1.53..HEAD`: **207
+commits**. Tag **`deployed/v1.1.55-20261106-0015`**, branch and tag pushed to `sia`.
+
+### Gates, in the procedure's order
+
+| gate | result |
+|---|---|
+| `tools/patch_invariants.py` on OUR tree **before** the merge | **PASS 15/15** |
+| merge conflicts | **none** |
+| invariants after the merge | **PASS 15/15** |
+| our additions present | `orphan_think` x9, budget WARNING, `STEP REFUSED`, `_note_replay` x3, `MAYA_LOG_REASONING_REPLAY` x4 |
+| loss audit (6 markers over src/include/serve) | **PASS** - none fell (`rows_` 987, `& 7` 82, `R(i)` 76, `per_row` 165, `rows_per_row_` 21, `row_base_` 31 all unchanged) |
+| build | clean, `maya.exe` relinked |
+| boot | listener in 85 s, settings line unchanged |
+| serving | real request -> `ready` |
+| n=4 smoke (4 rows, 200 tokens, low effort) | **4/4 coherent, guard detected 0** |
+
+**Overlap surface was 9 files** (`.gitignore`, `CMakeLists.txt`, `docs/SETTINGS.md`, `maya.py`,
+`serve/frontend.py`, `serve/server.py`, `src/kernels/cuda/glm_batch.cu`, `glm_fast.cu`,
+`src/program/generate.cpp`). Every one auto-merged; no three-way judgement was needed this time.
+
+### Upstream's INT8 latent-cache default does NOT apply here
+
+v1.1.55 makes "the INT8 latent cache" the default ("quality within FP16's spread, no loops"). This
+pack runs **`--kv q4_0`** from its own config - our prompt-cache work - and the boot line confirms
+both the mode and the layout (`--kv q4_0: the cache records q4_0 of the ROTATED rows`; `latent cache
+q4_0 (288 bytes a position and layer)`). The merge did not change it. Their claim covers their INT8
+branch, not our q4_0 branch; if that setting is ever removed, this is the paragraph to revisit.
+
+The rest of 1.1.54/1.1.55 is Qwen3.8 serve work (not our path), Codex/Responses API fixes, and
+default flips from their opt-in review (`MAYA_PROMPT_MEMO`, `DS4_AI_RUN`, `DS4_AR2`).

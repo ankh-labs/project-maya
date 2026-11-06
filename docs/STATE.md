@@ -254,3 +254,19 @@ guard silent). Two routes: a budget-forced close, and GLM-5.3's orphaned close t
 its own reasoning. Both are known ecosystem traits (vLLM #54744, ollama #18082, hermes #96735,
 pi #9554). The parser-side fix is in and gated; **the engine-side `in_think` channel tag is the
 one open item** - it is what closes the no-tag variant.
+
+## 2026-11-06 - v1.1.55 MERGED, DEPLOYED AND SERVING
+
+**Live state:** Maya runs **v1.1.55 + our series** - `d8e5fbc`, tagged
+**`deployed/v1.1.55-20261106-0015`** on `feat/v1155-from-good` (pushed to `sia`). This supersedes
+`deployed/v1.1.53-20261105-0033`.
+
+**Gates:** invariants 15/15 before and after; zero conflicts; loss audit PASS; build clean; real
+request `ready`; n=4 smoke 4/4 with guard 0. Upstream was 52 commits / 69 files / +3,201-601.
+
+**Unchanged and worth knowing:** this pack runs `--kv q4_0`, so upstream's new INT8 latent-cache
+default is inert here (verified in the boot line, not assumed). Details in `FORK_LAYOUT.md`.
+
+**Carried open items** (none introduced by the merge): the audit lane's abandon-on-HEAD behaviour;
+a verdict accepted from a self-stopped run; the counting-loop degeneration the loop guard cannot
+match; and the reasoning-return change whose benefit is still unmeasured.
