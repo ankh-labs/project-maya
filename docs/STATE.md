@@ -290,3 +290,26 @@ PASS; build clean; `ready`; n=4 smoke 4/4 with guard 0. Upstream was 36 commits 
 
 Everything else in the release (DeepSeek EXL3/Pascal, AMD, web-chat attachments) does not touch our
 GLM path. Details in `FORK_LAYOUT.md`.
+
+## 2026-11-10 - v1.1.57 MERGED, DEPLOYED AND SERVING (supersedes v1.1.56)
+
+**Live state:** Maya runs **v1.1.57 + our series** - `2e00a26`, tagged
+**`deployed/v1.1.57-20261110-0809`** on `feat/v1157-from-good` (pushed to `sia`). This supersedes
+`deployed/v1.1.56-20261106-1527`.
+
+**Gates:** invariants 15/15 before and after; 8 files / 16 hunks resolved by intent; loss audit PASS;
+build clean; `ready`; n=4 smoke 4/4 with guard 0. Upstream: 8 commits but 456 files / +76,605-1,166
+(GLM-5.3 744B support, state-layout refactor, setup/API work).
+
+**The q4_0 latent cache is RETIRED.** v1.1.57's state layout has no q4_0 mode, so per the user's
+decision we adopted upstream's INT8: `--kv int8` in the config, latent 288 -> **544 B** a position,
+pinned RAM 1.66 -> **3.14 GB**, VRAM streaming 0.10 -> 0.20 GB (measured). Revisit other KV quants
+later.
+
+**Two fork bridges are load-bearing** and must survive future merges: (1) the BF16 shared-expert down
+on glm5-next has no glm-dsa ext, so it dequantises q8_1 into `F->hq` and runs via `gf::mv`; without it
+*every* request fails `shared expert down`. (2) `slot_load`'s blob path builds an istringstream for the
+NextN trailer. Details and the per-file resolution table are in `FORK_LAYOUT.md`.
+
+**Carried open items** (unchanged): the audit lane's abandon-on-HEAD behaviour; a verdict accepted
+from a self-stopped run; the counting-loop degeneration the guard cannot match.

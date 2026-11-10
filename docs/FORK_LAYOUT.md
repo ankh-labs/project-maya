@@ -540,3 +540,74 @@ decoding on - the draft-acceptance path consumes RNG state differently. **`tempe
 the exact mode** and is what the fork's own harnesses use. Any benchmark or eval that sent no seed
 at temperature > 0 is *not* reproducible against this build, and that is upstream's change, not the
 fork's.
+
+## 2026-11-10 - v1.1.57 merged, deployed and serving (the q4_0 decision)
+
+**Branch `feat/v1157-from-good`.** Merge commit **`2e00a26`**. Upstream `v1.1.56..v1.1.57` is 8
+commits but **456 files, +76,605/-1,166** - it adds **GLM-5.3 (744B) on the GLM engine** (`glm_dsa`),
+replaces state allocation with `glm_state_carve`/`GlmStateLayout`, and reworks setup/API/docs. Tag
+**`deployed/v1.1.57-20261110-0809`**, branch and tag pushed to `sia`.
+
+### Gates
+
+| gate | result |
+|---|---|
+| invariants on OUR tree **before** the merge | **PASS 15/15** |
+| files upstream touched / ours / **overlap** | 456 / 140 / **42** |
+| **conflicts** | **8 files, 16 hunks** - all resolved by intent, none by taking a side wholesale |
+| invariants after the merge | **PASS 15/15** |
+| loss audit (6 markers) | **PASS** - none fell |
+| build | clean |
+| boot + serving | listener 75 s, `ready` |
+| n=4 smoke | **4/4 coherent, guard 0** |
+
+### q4_0 latent cache RETIRED - upstream's INT8 adopted
+
+v1.1.57's `GlmStateMode` is **`SlowF32` / `Fp16` / `Int8` only** - there is no q4_0, and the callers
+already thread the new layout (`m->lay_`, `c.kda_S = L.kda_S`). Keeping our tri-state carve would
+have meant re-implementing it inside a brand-new upstream module. **Decision (user, 2026-11-10): adopt
+upstream's INT8 and revisit other KV quants later.**
+
+Measured after the build, not assumed:
+
+| | q4_0 (v1.1.56) | INT8 (v1.1.57) |
+|---|---|---|
+| latent record | 288 B a position and layer | **544 B** |
+| latent pinned RAM | 1.66 GB | **3.14 GB** |
+| KV streaming in VRAM | 0.10 GB | **0.20 GB** |
+
+The config's `--kv q4_0` was changed to `--kv int8`. Our stage-A/B q4_0 kernels remain in the tree as
+dead code; nothing selects them.
+
+### Two bridges the merge needed (both are OURS, both documented in the code)
+
+1. **A BF16/F32 shared-expert down on glm5-next.** Upstream's fused launch refuses those types
+   (`ext_shared_down_ok` in `glmd_mv_ext.cuh`: they read a FLOAT input and the fused path only has the
+   q8_1 activation), and serves them through `glmdsa::mv`'s fallback - which needs the glm-dsa ext.
+   This build's glm5-next path has **no ext** (`FastState::dsa` unset), so every request failed with
+   `glm fast: shared expert down` until bridged. Our pack stores the shared down as **BF16 (type 30)**,
+   so this was not an edge case - it was all traffic. Bridge: dequantise the q8_1 activation once into
+   `F->hq` (float, large enough; the fused gate/up overwrites it after this down on the same stream)
+   and run the down through `gf::mv`. Uses upstream's own `glmdsa::q8_1_to_f32`.
+2. **`slot_load`'s blob path.** After the merge it carried the *file-handle* form of the NextN trailer
+   call (`mtp_slot_get(f, ...)`) inside the function that reads the slot into a blob - `f` undefined.
+   It now builds an `istringstream` over the blob, matching upstream's own blob path.
+
+Our **warm-up batch clamp** (clamp the batch to `F->stage.size()`, else a fixed batch of 8 reads
+`stage[7]` past the end when `MAYA_GLM_EXPERT_USED` is below 8) was re-applied over upstream's new
+file-order warm-up loop, with `max(1, ...)` so an empty stage cannot spin.
+
+### Conflict resolutions, by file
+
+| file | hunks | resolution |
+|---|---|---|
+| `serve/frontend.py` | 3 | both: our `_note_replay` + their `_clear_thinking`; signature takes `deepseek` and `glm_dsa`; parser takes `orphan_think` **and** `unions` |
+| `serve/server.py` | 1 | both: our `orphan_think` gate + their `unions=` |
+| `include/strata/kernels/glm_fast.hpp` | 3 | our `int ch` kept with their `x[kMaxEmbd]`; both comments blocks; `moe_route` takes `miss_to_cpu` **and** `norm_mode` |
+| `src/kernels/cuda/glm_fast.cu` | 2 | their guard + signature union; both assignments (`miss_to_cpu`, `norm_mode`, `rand_seed`) |
+| `src/core/glm_fast_path.cu` | 4 | theirs for the layout/route work, plus the two bridges above |
+| `src/core/glm_model.cu`, `glm_multi.cu`, `glm_prefill.cu` | 1 each | theirs (the layout refactor; q4_0 retired) |
+
+**The lesson worth carrying:** the hard conflicts were not textual, they were *assumption* conflicts -
+upstream's new code presumes a dsa ext exists and that packs store the shared down as a quant type.
+Neither held here. A merge that only resolves markers would have built and then failed every request.
