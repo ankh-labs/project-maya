@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | 日本語 | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) を自分の GPU で</b><br>
@@ -38,6 +40,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 セットアップはどのモデルを使うかを尋ね、ダウンロードし、すべてを一度ビルドして、**モデルを起動します**。その後 `http://127.0.0.1:8080` を開いてください。Windows では `./setup.sh` の代わりに `START-MAYA.bat` を使います。詳しくは[インストール](#install)を参照してください。
 
+すべてのドキュメント: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>モデルを選ぶ
 
 Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L。エキスパートが何ビットを保つかで分かれます) が付いた名前です。セットアップが PC に合ったものを勧めます。自分で選ぶ場合は、セットアップ ID を指定します: `./setup.sh --model glm-maya-s24`。
@@ -50,10 +54,13 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向けにキャリブレーション |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | [Blackfrost_AI](https://x.com/Blackfrost_AI) による重み編集で、一律の拒否を減らした Maya-M; 実験的 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大クラスのメモリ; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (デフォルト) · `deepseek-maya-s` | 340 GB | メモリ量を問わず: VRAM と RAM に収まらない分は SSD から読み込む |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
+
+**どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
 いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
@@ -200,6 +207,8 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **思考:** Off、Low、High (デフォルト)、Max を、設定またはリクエストごとに指定できます。さらに**思考予算**の欄で、モデルが回答の前に思考に使えるトークン数を設定できます。
 - **ループガード:** デフォルトで有効です。同じツール呼び出しを同じ結果で繰り返すエージェントを、その繰り返しから外へ誘導します。
 - **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。すべてのモデルが画像を読めます (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
+- **MCP ツール:** 設定に MCP サーバーを書くと (`"mcp_servers"`。Claude Desktop の `mcpServers` ブロックはそのまま使えます)、Web チャットのモデルがそのツールを呼び出せます。チャットの **+** メニューのスイッチでオン・オフできます。動作の詳細: [serve/mcp.py](serve/mcp.py)。
+- **Docker:** 公式イメージはありません。[docs/DOCKER.md](docs/DOCKER.md) は、リリースからイメージをビルドするための手順です。
 - **ほかのデバイスから:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
 - **チューニング:** `./maya.sh --calibrate` が 10-15 分でエンジンをお使いのハードウェアに合わせます。すべての設定: [docs/SETTINGS.md](docs/SETTINGS.md)。
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**各モデル固有のオプション** - GLM-5.3-Flash の複数リクエスト同時処理 (`--parallel`)、長いコンテキスト、DFlash2 ドラフター; DeepSeek の会話の保持、エキスパートの読み込み、Engram の先読み; MiniMax の思考レベル: [docs/MODELS.md](docs/MODELS.md)。

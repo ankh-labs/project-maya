@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | Português</p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
@@ -36,6 +38,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 A instalação pergunta qual modelo você quer, baixa, compila tudo uma vez e **inicia o modelo**. Depois abra `http://127.0.0.1:8080`. No Windows, use `START-MAYA.bat` em vez de `./setup.sh`. Mais em [Instalação](#install).
 
+Toda a documentação: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Escolha seu modelo
 
 Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou L, conforme quantos bits seus especialistas mantêm. A instalação recomenda uma para o seu PC; para escolher uma você mesmo, informe o id dela: `./setup.sh --model glm-maya-s24`.
@@ -48,10 +52,13 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; calibrado para chamadas de ferramentas e código de front-end |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M com uma edição de pesos de [Blackfrost_AI](https://x.com/Blackfrost_AI) que reduz as recusas generalizadas; experimental |
 | | Maya-L · `glm-maya-l` | 156,3 GB | os maiores pools de memória; o mais próximo do original |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [licença própria](https://huggingface.co/zai-org/GLM-5.3) · 744 B, 40 B ativos · até 1M de contexto · só texto</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238,6 GB | os maiores pools de memória; NVIDIA a partir da V100 e AMD ([detalhes](docs/GLM53.md)) |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (padrão) · `deepseek-maya-s` | 340 GB | qualquer quantidade de memória: o que a VRAM e a RAM não comportam é lido do SSD |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
+
+**Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
 Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
@@ -198,6 +205,8 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 - **Raciocínio:** Off, Low, High (o padrão) ou Max, em Settings ou por requisição, e um campo de **orçamento de raciocínio** que define quantos tokens o modelo pode usar pensando antes de responder.
 - **Guarda contra loops:** ligada por padrão - um agente que repete a mesma chamada de ferramenta com o mesmo resultado é conduzido para fora disso.
 - **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
+- **Ferramentas MCP:** liste servidores MCP na configuração (`"mcp_servers"`; o bloco `mcpServers` do Claude Desktop funciona como está) e o modelo do chat na web pode chamar as ferramentas deles. Um interruptor no menu **+** do chat liga e desliga. O que ele faz: [serve/mcp.py](serve/mcp.py).
+- **Docker:** não há imagem oficial. [docs/DOCKER.md](docs/DOCKER.md) é uma receita para montar uma a partir de uma versão.
 - **De outro dispositivo:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Sempre defina uma chave.
 - **Ajuste fino:** `./maya.sh --calibrate` ajusta o motor ao seu hardware em 10-15 minutos. Todas as configurações: [docs/SETTINGS.md](docs/SETTINGS.md).
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**As opções próprias de cada modelo** - várias requisições ao mesmo tempo no GLM-5.3-Flash (`--parallel`), contextos longos e o drafter DFlash2; as conversas mantidas, o carregamento de especialistas e a leitura antecipada do Engram no DeepSeek; os níveis de raciocínio do MiniMax: [docs/MODELS.md](docs/MODELS.md).

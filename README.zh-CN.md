@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | 简体中文 | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>在你自己的 GPU 上运行 GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
@@ -36,6 +38,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 安装程序会询问你想用哪个模型，下载它，一次性构建所有内容，并**启动模型**。然后打开 `http://127.0.0.1:8080`。Windows 请用 `START-MAYA.bat` 代替 `./setup.sh`。详见[安装](#install)。
 
+全部文档：[docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>选择你的模型
 
 每个 Maya 量化版本都以模型名加档位命名：XS、S、M 或 L，按专家保留的位数划分。安装程序会为你的电脑推荐一个；想自己选，请给出它的安装 ID：`./setup.sh --model glm-maya-s24`。
@@ -48,10 +52,13 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；针对工具调用和前端代码做了校准 |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | 经 [Blackfrost_AI](https://x.com/Blackfrost_AI) 修改权重、减少一刀切拒绝的 Maya-M；实验性 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大的内存池；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (默认) · `deepseek-maya-s` | 340 GB | 任意内存大小：显存和内存放不下的部分从固态硬盘读取 |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
+
+**哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
 它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
@@ -198,6 +205,8 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
 - **图片：** 在聊天中附加，或通过任一 API 发送图片内容。每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
+- **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。
 - **调优：** `./maya.sh --calibrate` 用 10-15 分钟让引擎适配你的硬件。全部设置：[docs/SETTINGS.md](docs/SETTINGS.md)。
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**各模型自己的选项** - GLM-5.3-Flash 的同时多请求 (`--parallel`)、长上下文和 DFlash2 草稿模型；DeepSeek 的会话保留、专家加载和 Engram 预读；MiniMax 的思考级别：[docs/MODELS.md](docs/MODELS.md)。
