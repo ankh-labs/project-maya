@@ -313,3 +313,33 @@ NextN trailer. Details and the per-file resolution table are in `FORK_LAYOUT.md`
 
 **Carried open items** (unchanged): the audit lane's abandon-on-HEAD behaviour; a verdict accepted
 from a self-stopped run; the counting-loop degeneration the guard cannot match.
+
+## 2026-11-11 - v1.1.59 MERGED, DEPLOYED, REFUSAL ABLATION ENABLED (supersedes v1.1.57)
+
+**Live state:** Maya runs **v1.1.59 + our series** - `5becfc2`, tagged
+**`deployed/v1.1.59-20261111-1118`** on `feat/v1159-from-good` (pushed to `sia`). This supersedes
+`deployed/v1.1.57-20261110-0809`. The engine was **down** before this (no NSSM autostart; the machine
+rebooted overnight) and was started by hand after the merge.
+
+**Gates:** invariants 15/15 before and after; 10 files / 20 hunks resolved by intent; loss audit
+PASS; build clean; `ready`; n=4 smoke 4/4 with guard 0 (ablation off AND on). Upstream: 5 commits,
+413 files, +7,419-3,013.
+
+**Refusal ablation is ON** (`ablate.default: true`): GLM-5.3-Flash's direction file at
+`G:\AI\maya-eval\models\refusal-directions\GLM-5.3-Flash-refusal-direction.gguf` (layer 31,
+scale 1), loaded via `--ablate` in the config's args. Per-request `"ablate": false` turns it off; the
+Models page's switch is the default. Note: a hand-edited config needs the args itself - only the
+Models page's save applies them.
+
+**Three merge hazards worth remembering** (all fixed, all documented in FORK_LAYOUT):
+1. `glm_rows.cu`'s loop bounds - upstream's `l0_..l1_` would run all 45 layers per per-row call.
+2. The `STRATA_*` -> `MAYA_*` rename - the code reads `MAYA_*`; `env_alias.hpp` only maps the old
+   names at start, so a `STRATA_`-only reader silently ignores a `MAYA_` setting.
+3. Header/definition drift on `lat8_rec_bytes`, `mla_attend*` (`int` vs `bool lat_q8`) and `mla_out`
+   (parameter removed) - these linked/compiled wrong before being aligned.
+
+**Not enabled:** `MAYA_FAIR_SLICE_S` (new: a long answer yields the engine to a waiting request) and
+`MAYA_GLM_PREFILL_INTERLEAVE`/`_GAPS` (prefill-time). They are complementary phases, both default off.
+
+**Carried open items:** the audit lane's abandon-on-HEAD behaviour; a verdict accepted from a
+self-stopped run; the counting-loop degeneration the guard cannot match.

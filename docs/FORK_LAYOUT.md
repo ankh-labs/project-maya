@@ -611,3 +611,80 @@ file-order warm-up loop, with `max(1, ...)` so an empty stage cannot spin.
 **The lesson worth carrying:** the hard conflicts were not textual, they were *assumption* conflicts -
 upstream's new code presumes a dsa ext exists and that packs store the shared down as a quant type.
 Neither held here. A merge that only resolves markers would have built and then failed every request.
+
+## 2026-11-11 - v1.1.59 merged, deployed, ablation enabled
+
+**Branch `feat/v1159-from-good`.** Merge commit **`5becfc2`**. Upstream `v1.1.57..v1.1.59` is
+5 commits but **413 files, +7,419/-3,013**: GLM-5.3-Maya-XS (the 744B quant), **refusal ablation for
+GLM-5.3-Flash**, **fair slices under `--parallel`**, and a repo-wide **`STRATA_*` -> `MAYA_*` rename**.
+Tag **`deployed/v1.1.59-20261111-1118`**, branch and tag pushed to `sia`.
+
+### Gates
+
+| gate | result |
+|---|---|
+| invariants before / after | **PASS 15/15 / 15/15** |
+| conflicts | **10 files, 20 hunks** - resolved by intent |
+| loss audit | **PASS** |
+| build | clean |
+| boot + serving | `ready` |
+| n=4 smoke, ablation **off** | **4/4**, guard 0 |
+| n=4 smoke, ablation **on** | **4/4**, guard 0 |
+
+### The rotor's first real conflict - and the one that mattered
+
+`glm_rows.cu` conflicted for the first time (4 hunks). One was silent and serious: upstream's loop
+header is `for (int il = l0_; il < l1_; ++il)` where ours is `for (int il = ilf; il < ilt; ++il)`.
+The rotor calls `rows_layers()` for **one layer at a time** (`il, il + 1`); taking upstream's bounds
+would have run all 45 layers on every per-row call. Restored `ilf/ilt` with a comment naming why.
+
+### The `MAYA_` rename (a real correctness point, not cosmetics)
+
+Upstream renamed every setting `STRATA_*` -> `MAYA_*`. `include/strata/platform/env_alias.hpp` maps
+any `STRATA_X` with no `MAYA_X` to `MAYA_X` **at process start**, and the code reads `MAYA_X`. Our
+conflict blocks had restored the old names, so each affected file was renamed here - a
+`STRATA_`-only reader would have silently ignored a `MAYA_` setting.
+
+### Duplicated and drifted symbols the merge produced
+
+- `lat8_rec_bytes` was defined in **both** `glm_lat_types.hpp` (new, upstream) and `glm_fast.hpp`
+  (ours) -> linker error; `glm_lat_types.hpp` is the single definition now.
+- `mla_attend` / `mla_attend_rows` / `mla_attend_batch` had a **header saying `int lat_q8` and a
+  definition saying `bool`** -> unresolved externals; both sides now `bool`, matching upstream.
+- `mla_out` kept our `int lat_q8` parameter and its q4_0 rotation branch in the definition while the
+  header had already dropped the parameter -> removed, matching upstream (q4_0 retired in v1.1.57).
+- `model.kv_name()` (our tri-state helper) no longer exists; `generate.cpp` now uses upstream's
+  `model.kv_int8() ? "int8" : "fp16"`.
+
+### Refusal ablation - ENABLED (user request)
+
+- File: **`G:\AI\maya-eval\models\refusal-directions\GLM-5.3-Flash-refusal-direction.gguf`**
+  (16.5 KB; `maya.ablate.model = GLM-5.3-Flash`, `fit_layer = 31`, `scale = 1`), from
+  `peasantsmith/GLM-5.3-Flash-Maya-GGUF`.
+- Config: `"ablate": {"file": ..., "default": true}` **and** the engine args
+  `--ablate <file> --ablate-default off`. Both are needed: the engine loads the direction once
+  (`--ablate`), keeps it off (`--ablate-default off`), and the **server** decides per request from the
+  request's `ablate` field or `cfg["ablate"]["default"]`.
+- A hand-written config does NOT get the flags automatically - `models.apply()` (the Models page's
+  save path) is what adds them, so a config edited by hand needs them in `args`.
+- Verified: the engine logs `glm: abliteration: ... direction.1, scale 1, projected out of every
+  layer's attention and FFN writes`; the server reports `settings.ablate: true`; requests omitting
+  `ablate`, `ablate: true` and `ablate: false` all answer; and the 4-row smoke is clean with the
+  projection on (the rotor's per-conversation runs go through `abl_seqs`).
+- Per-request off remains available always: `"ablate": false` on any API.
+
+### `MAYA_FAIR_SLICE_S` (new in 1.1.59) - and how it relates to our earlier work
+
+From `serve/server.py`: *"a request that has been answering this long while others wait gives the
+engine to the next one and queues again behind them (0, the default: it keeps the engine to the end)"*.
+v1.1.59 also fixes it so one waiter pauses **one** running answer, not every one.
+
+**It does not replace what we were doing - it is a different phase.**
+- `MAYA_GLM_PREFILL_INTERLEAVE` / `PREFILL_GAPS` (our earlier work): other requests **decode while a
+  prompt is being read** - prefill-time fairness, so one long prompt does not stall everyone.
+- `MAYA_FAIR_SLICE_S`: a **long answer** yields the engine to a waiting request after N seconds -
+  decode-time fairness, so one long generation does not starve everyone.
+- The rotor makes two rows run **at the same time** at all; the lane plan prices where their experts
+  run. Neither of those is a fairness knob.
+
+Both fairness settings default to 0/off, so nothing changed by this merge.
