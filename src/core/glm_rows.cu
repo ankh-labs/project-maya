@@ -8,7 +8,7 @@
 // (mHC), the KDA recurrence, the DSA indexer and attention against that conversation's caches, and the routed
 // experts (the tiers serve the n routes one after another, as they serve the layers of a token).  So each row's
 // token is the one the token path gives that conversation alone - as long as the tiers hold the same experts
-// (greedy with the CPU lane off: the multi bench compares them).  STRATA_GLM_GROUP_EXPERTS=1 instead routes every row of
+// (greedy with the CPU lane off: the multi bench compares them).  MAYA_GLM_GROUP_EXPERTS=1 instead routes every row of
 // the step first and runs each distinct routed expert once for all the rows that chose it (rows_moe_grouped, the verify
 // window's batched MoE) - each row's output bit for bit the per-row kernels' for it.
 //
@@ -16,12 +16,12 @@
 // card); the per-row scratch the token path's kernels use in between (the conv outputs, the gates, the DSA scores and
 // cells, the experts' h) is the token path's own, used by one row after the other on that part's stream.
 //
-// STRATA_GLM_ROWS_BATCH=1: the residual mixing (mHC) and the KDA recurrence of all the rows in one launch each instead
+// MAYA_GLM_ROWS_BATCH=1: the residual mixing (mHC) and the KDA recurrence of all the rows in one launch each instead
 // of one a row (gf::hc_rows, gf::kda_layers over the rows) - each row with its own scratch (rows_alloc) and the same
 // device functions as the per-row kernels, so its arithmetic is meant to be theirs (glm_rows_kernels_test compares
 // them bitwise).
 //
-// STRATA_GLM_ROWS_ATTN=1: a DSA layer's absorbed attention of all the rows in one launch instead of one a row: wk_b . q
+// MAYA_GLM_ROWS_ATTN=1: a DSA layer's absorbed attention of all the rows in one launch instead of one a row: wk_b . q
 // for every row at once (gf::mla_q_abs), each row's selection (and, streamed, its slot cells) into its own buffers, the
 // split attention of all the rows over their own caches in one launch (gf::mla_attend_rows: a row's blocks on
 // blockIdx.z, so its 64 blocks no longer leave half the card idle), then wv_b . ctx for every row at once
@@ -49,39 +49,39 @@ using glmrows::up256;
 using glmrows::row_at;
 using glmrows::rowq_at;
 using glmrows::image_row_in;
-bool rows_batch_on() {   // STRATA_GLM_ROWS_BATCH=1 (off by default)
+bool rows_batch_on() {   // MAYA_GLM_ROWS_BATCH=1 (off by default)
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_BATCH");
+        const char* v = getenv("MAYA_GLM_ROWS_BATCH");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-bool rows_small_on() {   // STRATA_GLM_ROWS_SMALL=1 (off by default)
+bool rows_small_on() {   // MAYA_GLM_ROWS_SMALL=1 (off by default)
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_SMALL");
+        const char* v = getenv("MAYA_GLM_ROWS_SMALL");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-bool rows_attn_on() {   // STRATA_GLM_ROWS_ATTN=1 (off by default)
+bool rows_attn_on() {   // MAYA_GLM_ROWS_ATTN=1 (off by default)
     // NOT made to follow the rotation: this flag is consulted OUTSIDE the rotor too (prefill and the fused path pick
     // per-row DSA buffers from it), and turning it on globally crashed those with illegal accesses in dsa_prep /
     // mla_q_abs / dsa_select_all / kv_q4 - while allocating the buffers and leaving the flag off crashed the same
     // kernels the other way.  Opening the gate needs the per-row DSA path to be the default EVERYWHERE, which is a
     // larger change than the rotor's own gate.
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_ATTN");
+        const char* v = getenv("MAYA_GLM_ROWS_ATTN");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
 }  // namespace
 
-// 8 rows (one a conversation); with STRATA_GLM_MULTI_MTP a group's verify windows, multi_mtp_cap() rows
+// 8 rows (one a conversation); with MAYA_GLM_MULTI_MTP a group's verify windows, multi_mtp_cap() rows
 int Glm5Model::rows_max() { return multi_mtp_setting() > 0 ? multi_mtp_cap() : 8; }
 
 int Glm5Model::split_rows_setting() {
-    const char* v = getenv("STRATA_GLM_SPLIT_ROWS");
+    const char* v = getenv("MAYA_GLM_SPLIT_ROWS");
     return v != nullptr ? std::clamp((int) std::atof(v), 0, rows_max()) : 0;
 }
 
@@ -105,7 +105,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
     };
     cudaSetDevice(dev_);   // (mla_rows_ok asks the current device)
     // the rotation runs two rows on two streams, which needs the per-row score/selection buffers even when
-    // STRATA_GLM_ROWS_ATTN is unset - otherwise the rotor declines for want of them and the default carries nothing
+    // MAYA_GLM_ROWS_ATTN is unset - otherwise the rotor declines for want of them and the default carries nothing
     const bool attn = rows_attn_on() && gf::mla_rows_ok(g.kv_lora);
     const int attn_tokens = (int) std::min<size_t>(R, (size_t) gf::kMlaTokMax);
     int64_t attn_ctx = max_ctx_;   // (the longest context a sequence has: its completed pools' scores)
@@ -161,7 +161,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
         S->hc_part = f32(S->hc_part_n);
         S->hc_ctr = take(64);
-        if (attn) {   // (STRATA_GLM_ROWS_ATTN's buffers: none with the setting off)
+        if (attn) {   // (MAYA_GLM_ROWS_ATTN's buffers: none with the setting off)
             S->aq = f32((int64_t) g.n_head * g.kv_lora);
             S->actx = f32((int64_t) g.n_head * g.kv_lora);
             S->acells = (int*) take((size_t) g.n_sel_max() * sizeof(int));
@@ -372,7 +372,11 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
     // path's single set (docs/LAYER_PIPELINE.md)
     const bool per_row_bufs = batch || rows_per_row_;
     gf::HcArgs hb[gf::kMaxMvNt];
-    for (int il = ilf; il < ilt; ++il) {
+    // --ablate: each row's writes by its own conversation's setting (the runs of rows that project, a launch a run)
+    int abl_seqs[gf::kMaxMvNt];
+    for (int i = 0; i < n && i < gf::kMaxMvNt; ++i) abl_seqs[i] = rw[i].seq;
+    for (int il = ilf; il < ilt; ++il) {   // OUR BOUNDS (v1.1.59 merge): the rotor calls rows_layers for ONE layer;
+                                           // l0_..l1_ here ran all 45 of them per call
         const auto& Ly = F->L[(size_t) il];
         gf::HcArgs h;
         h.norm_eps = g.norm_eps;
@@ -407,6 +411,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.w_scale = Ly.hc_attn_scale;
         h.w_base = Ly.hc_attn_base;
         h.norm_w = Ly.attn_norm;
+        if (il != l0_) ablate_runs(S->ffn, abl_seqs, n, s);
         for (int i = 0; i < n; ++i) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, R(i)));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
@@ -423,7 +428,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
             j[4] = {Ly.g_a, nullptr, rows(S->x, E, rb), rows(S->ga, g.kda_head_dim, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, rows(S->x, E, rb), rows(S->beta, g.n_head, rb), nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
-            if (keep_in) {   // (STRATA_GLM_MULTI_MTP: the window rows' inputs, for the commit's replay)
+            if (keep_in) {   // (MAYA_GLM_MULTI_MTP: the window rows' inputs, for the commit's replay)
                 gf::KdaGatherArgs ga;
                 ga.src[0] = S->proj[0];
                 ga.src[1] = S->proj[1];
@@ -500,6 +505,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         h.w_scale = Ly.hc_ffn_scale;
         h.w_base = Ly.hc_ffn_base;
         h.norm_w = Ly.ffn_norm;
+        ablate_runs(S->mixer, abl_seqs, n, s);
         for (int i = 0; i < n; ++i) {
             hc_row(i, rows(S->mixer, E, R(i)));
             std::swap(rw[i].Rc, rw[i].Ro);
@@ -528,6 +534,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err, int il_from, in
         if (rows_per_row_) gf::pipe_probe(rows(S->ffn, E, R(0)), (int) E, rb * 2048 + il * 4 + 2, s);
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
+    ablate_runs(S->ffn, abl_seqs, n, s);
     for (int i = 0; i < n; ++i) {
         gf::hc_post(rows(S->ffn, E, R(i)), rw[i].Rc, rows(S->post, 8, R(i)), rows(S->comb, 16, R(i)), E, rw[i].Ro, s);
         if (rw[i].Ro != rw[i].res)
@@ -601,7 +608,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 : gf::MvJob{Ly.idx_q_b, nullptr, rows(S->qr, g.q_lora, rb), rows(S->iq, g.idx_heads * (int64_t) g.idx_key, rb), nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!mv(j2, 2, "dsa q")) return false;
-    // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
+    // MAYA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
     // verify window's rows of one conversation (consecutive rows) on a streamed layer share its slot pool: one resolve
     // over all their selections then (a resolve never evicts a block it names), not one a row - a row's resolve could
     // evict a block the row before it still has to read.  Rows of one conversation that are not consecutive: one by one
@@ -629,7 +636,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq + rb * ad, ad, s);
     gf::DsaSelectRows sr;   // (with the rows' attention: the rows' selections in one launch, then each one resolved)
     int n_sr = 0;
-    const bool small = attn && rows_small_on();   // (STRATA_GLM_ROWS_SMALL: the rows' scores in one launch too)
+    const bool small = attn && rows_small_on();   // (MAYA_GLM_ROWS_SMALL: the rows' scores in one launch too)
     gf::DsaScoreRows sc;
     int n_sc = 0;
     for (int i = 0; i < n; ++i) {
@@ -679,7 +686,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         if (n_sc > 0) gf::dsa_score_rows(sc, n_sc, g.idx_key, g.idx_heads, s);
         gf::dsa_select_rows(sr, n_sr, g.idx_kpool, s);
         // KV streaming: each run's blocks resident, its rows' selections in slot rows (resident: the cells themselves);
-        // STRATA_GLM_ROWS_SMALL: the runs' resolves in one launch (each run its own sequence's map)
+        // MAYA_GLM_ROWS_SMALL: the runs' resolves in one launch (each run its own sequence's map)
         gf::KvResolveRows kr;
         int n_kr = 0, kr_row = 0, kr_page = 0;
         for (int i = 0; i < n;) {
@@ -715,7 +722,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         }
         gf::mla_out(S->actx + rb * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n,
                     rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, rb),
-                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s, lat_q8_);
+                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s);
     }
     gf::MvJob o = {Ly.out.q, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, rb), nullptr, rows(S->mixer, E, rb), nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
                    E};
@@ -846,7 +853,7 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     return true;
 }
 
-// STRATA_GLM_GROUP_EXPERTS=1: the n rows' routed experts as the verify window's batched MoE takes a window's tokens
+// MAYA_GLM_GROUP_EXPERTS=1: the n rows' routed experts as the verify window's batched MoE takes a window's tokens
 // (fast_moe_window).  Every row is routed first - into its own plan, fetch sources, disk answer, CPU-lane answer slot
 // (the window's route state, its rows the window's tokens) and its own 8 scratch slots (rows_scr), each row's wait and
 // fetch before the next row's route (the host's answer to a disk miss is one buffer) - then each distinct expert runs
@@ -876,8 +883,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     // n == 1 IS a pipeline row when the rotor drives one row per call (rows_per_row_) - including row 0, whose INDEX is
     // 0.  `row_base_ == 0` cannot tell "the lone token call" from "row 0", so row 0 was refused the per-row MoeDev and
     // fell back to the GLOBAL F->md: one plan, one fetch_src, one wait channel for both rows.  Fourth time on this branch
-    // that an index carried a boolean.  STRATA_GLM_PIPE_ROW0_FALLBACK=1 restores the old refusal so it can be COUNTED.
-    static const bool admit_row0 = getenv("STRATA_GLM_PIPE_ROW0_FALLBACK") == nullptr;
+    // that an index carried a boolean.  MAYA_GLM_PIPE_ROW0_FALLBACK=1 restores the old refusal so it can be COUNTED.
+    static const bool admit_row0 = getenv("MAYA_GLM_PIPE_ROW0_FALLBACK") == nullptr;
     if (n < 2 && row_base_ == 0 && !(rows_per_row_ && admit_row0)) {
         if (rows_per_row_) {   // a per-row call reaching the global MoeDev is the bug, not a mode
             F->md_fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -886,7 +893,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         }
         return false;
     }
-    const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (STRATA_GLM_MULTI_MTP)
+    const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (MAYA_GLM_MULTI_MTP)
     if ((n > F->rows_group && !wide) || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
         (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
         static std::atomic<bool> told{false};   // (a run with the setting on that never groups should say so; both
@@ -1533,12 +1540,12 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         for (int il = l0_; il < l1_; ++il)
             if (!rows_layers(rw, n, err, il, il + 1)) return false;
     } else if (pipe_mode >= 2) {
-        // the per-row DSA score/selection buffers only exist with STRATA_GLM_ROWS_ATTN=1; without them the rows would
+        // the per-row DSA score/selection buffers only exist with MAYA_GLM_ROWS_ATTN=1; without them the rows would
         // share F->score / F->cells, so the pipeline refuses rather than corrupting (said once)
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
             // NAME EVERY DECLINED CONDITION.  This message used to report only the aq case, so a null cs2 or a wrong
-            // row count read as 'set STRATA_GLM_ROWS_ATTN=1' - the same one-message-for-two-faults error that cost a
+            // row count read as 'set MAYA_GLM_ROWS_ATTN=1' - the same one-message-for-two-faults error that cost a
             // day on the router, in the gate rather than the kernel.
             std::fprintf(stderr, "glm rows: CUDA%d the rotation declined (n=%d, cs2=%s, aq=%s) - running the layers one "
                                  "at a time\n",

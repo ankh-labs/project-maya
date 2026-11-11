@@ -245,8 +245,69 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------ refusal ablation (an optional direction file)
+# The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
+# maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
+# (CYBER-FROST) has none; without a direction file the dashboard shows no switch.
+ABLATE_FAMILIES = ("deepseek", "minimax", "glm")
+# a model repo's direction file (phase 2: fitted and shipped by us): <Model>-refusal-direction.gguf - a control vector
+# GGUF (general.architecture "controlvector", direction.1 F32 [n_embd]) with maya.ablate.scale / .fit_layer / .model
+# / .fitted_on / .version metadata; the setup downloads it with the model and records it as cfg["ablate"]["file"]
+ABLATE_SUFFIX = "-refusal-direction.gguf"
+
+
+def ablate_file(cfg: dict) -> Path | None:
+    """The config's direction file (cfg["ablate"]["file"], else an --ablate FILE in its args) when it is on disk."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    f = a.get("file") or flag(cfg.get("args") or [], "--ablate")
+    p = Path(str(f)).expanduser() if f else None
+    return p if p is not None and p.is_file() else None
+
+
+def ablate_choice(cfg: dict) -> dict:
+    """{"available": bool, "why": the reason when not} - the Models page's and the Chat's switch (hidden without)."""
+    fam = family(cfg)
+    if fam not in ABLATE_FAMILIES or (fam == "glm" and cfg.get("backend") == "metal"):
+        return {"available": False, "why": "not available for this model"}
+    if ablate_file(cfg) is None:
+        return {"available": False, "why": "no refusal direction file for this model (its repo ships none yet)"}
+    if fam == "minimax" and (_int(flag(cfg.get("args") or [], "--tp"), 0) or 0) > 0:
+        return {"available": False, "why": "not with the tensor-parallel split (Tensor parallel: 0 offers it)"}
+    return {"available": True, "why": ""}
+
+
+def ablate_default(cfg: dict) -> bool:
+    """The Models page's default for requests that leave `ablate` out: cfg["ablate"]["default"] (off unless set), or
+    the config's sampling.ablate."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    return a.get("default") is True or (cfg.get("sampling") or {}).get("ablate") is True
+
+
+def ablate_args(cfg: dict, args: list) -> list:
+    """args with the direction loaded, off by default (--ablate FILE --ablate-default off), where it can be; without
+    a direction file (or on an engine without the projection) none of the three flags - the command as before."""
+    for f in ("--ablate", "--ablate-default", "--ablate-layer", "--ablate-scale"):
+        args = drop_flag(args, f)
+    p = ablate_file(cfg)
+    if p is None or family(cfg) not in ABLATE_FAMILIES or (family(cfg) == "glm" and cfg.get("backend") == "metal"):
+        return args
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    args = set_flag(args, "--ablate", str(p))
+    args = set_flag(args, "--ablate-default", "off")
+    if a.get("scale") is not None:   # (the file's own maya.ablate.scale otherwise)
+        args = set_flag(args, "--ablate-scale", a["scale"])
+    return args
+
+
 def choices(cfg: dict) -> dict:
-    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC."""
+    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC, and the
+    refusal-ablation switch (ablate_choice)."""
+    out = _choices(cfg)
+    out["ablate"] = ablate_choice(cfg)
+    return out
+
+
+def _choices(cfg: dict) -> dict:
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -270,7 +331,9 @@ def choices(cfg: dict) -> dict:
 def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env}
+    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env,
+           # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
+           "ablate": ablate_default(cfg)}
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
@@ -371,13 +434,26 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS) + ("ablate",)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
     s = {**settings_of(cfg), **settings}
     can = choices(cfg)
     out = copy.deepcopy(cfg)
+    # refusal ablation's default (cfg["ablate"]["default"]: requests without `ablate` take it; not an engine setting -
+    # no restart, the direction stays loaded and each request asks); on only where the switch is (ablate_choice)
+    if not isinstance(s.get("ablate"), bool):
+        raise ValueError("Refusal ablation: on or off")
+    if s["ablate"] and settings.get("ablate") is True and not can["ablate"]["available"]:
+        raise ValueError("Refusal ablation: " + can["ablate"]["why"])
+    if isinstance(out.get("ablate"), dict):
+        if s["ablate"]:
+            out["ablate"]["default"] = True
+        else:
+            out["ablate"].pop("default", None)
+    if not s["ablate"] and isinstance(out.get("sampling"), dict):
+        out["sampling"].pop("ablate", None)
     args = [str(a) for a in out.get("args") or []]
     args = set_flag(args, "--max-context", _num(s, "context", 1024, 1048576, "Context size", none_ok=False))
 
@@ -568,6 +644,8 @@ def apply(cfg: dict, settings: dict) -> dict:
             kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
             args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
                 drop_flag(args, "--kv-resident")
+    if isinstance(out.get("ablate"), dict):   # (a direction the setup recorded: loaded, off by default)
+        args = ablate_args(out, args)
     out["args"] = args
     return out
 
@@ -787,6 +865,12 @@ TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is 
 # of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
 TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
              "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
+# GLM-5.3 (744B, glm-dsa) has its own: TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers.  Measured on
+# GLM-5.3 Maya-XS (greedy, 512 tokens): MAYA_GLM_ROUTE_AFFINITY (added to a VRAM-resident expert's selection score, so
+# more of a token's experts are ones VRAM holds) at 0.2 decodes 22-25% faster, KL 0.20 against the exact route, the loop
+# test and a 20K-token document question as without it; 0.5 and up drifted into echoing the prompt, and
+# MAYA_GLM_RESIDENT_TOPK 6 to 4 broke the code answers (not used).
+TURBO_ENV_G53 = {"MAYA_GLM_ROUTE_AFFINITY": "0.2"}
 # the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
 # setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
 TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
@@ -822,7 +906,7 @@ def turbo_patch(cfg: dict) -> dict:
         patch["dspark_conf"] = TURBO_DSPARK_CONF
     if fam == "deepseek" and cur.get("prompt_lookup") is False:
         patch["prompt_lookup"] = True
-    env = TURBO_ENV.get(fam)
+    env = TURBO_ENV_G53 if G53.config_is_glm_dsa(cfg) else TURBO_ENV.get(fam)
     if env and turbo_smallest_quant(cfg):              # (no expert cap on the 1-2 bit quants: see TURBO_NO_TOPK)
         env = {k: v for k, v in env.items() if not k.endswith("_RESIDENT_TOPK")}
     if env and any(cur["env"].get(k) != v for k, v in env.items()):
@@ -834,19 +918,11 @@ def turbo_on(cfg: dict) -> bool:
     return isinstance(cfg.get("turbo"), dict)
 
 
-def turbo_hidden(cfg: dict) -> bool:
-    """Turbo is not offered for GLM-5.3 (744B, glm-dsa) until its own values are measured on it (the owner,
-    2026-11-06): TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers."""
-    return G53.config_is_glm_dsa(cfg)
-
-
 def turbo_info(cfg: dict) -> dict:
     """What the page needs: whether Turbo is on, and what switching it on would change (before -> after)."""
     cur = settings_of(cfg)
     if turbo_on(cfg):
         return {"on": True, "family": family(cfg), "since": cfg["turbo"].get("since"), "plan": {}}
-    if turbo_hidden(cfg):                              # (the page shows no Turbo button)
-        return {"on": False, "family": family(cfg), "plan": {}, "env": {}, "hidden": True}
     patch = turbo_patch(cfg)
     return {"on": False, "family": family(cfg),
             "plan": {k: {"from": cur.get(k), "to": v} for k, v in patch.items() if k != "env"},
@@ -861,8 +937,6 @@ def turbo_enable(path: Path) -> dict:
         raise ValueError(f"{Path(path).name}: not a config Maya can read")
     if turbo_on(cfg):
         raise ValueError("Turbo is already on")
-    if turbo_hidden(cfg):
-        raise ValueError("Turbo is not offered for GLM-5.3 yet: its settings are measured on GLM-5.3-Flash")
     cur, patch = settings_of(cfg), turbo_patch(cfg)
     new = apply(cfg, patch)
     new["turbo"] = {"since": time.strftime("%Y-%m-%d %H:%M:%S"),

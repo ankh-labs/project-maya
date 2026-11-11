@@ -5,6 +5,7 @@ GLM-5.3 runs on the same engine, server and dashboard as GLM-5.3-Flash under May
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -12,7 +13,7 @@ ARCH = "glm-dsa"                        # its general.architecture (llama.cpp's 
 MODEL_NAME = "glm-5.3"                  # its API name (a config's model_name)
 SHOWN = "GLM-5.3"
 LABEL = "GLM-5.3 (744B)"                # on the dashboard, before the quant: "GLM-5.3 (744B) · UD-IQ2_M" (the owner,
-#                                         2026-11-06) - GLM-5.3-Flash keeps "GLM-5.3 · Maya-S24"
+#                                         2026-11-06) - GLM-5.3-Flash keeps "GLM-5.3-Flash · Maya-S24"
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "data" / "glm-dsa" / "templates" / "glm-5.3.official.jinja"   # Z.ai's chat template, byte for byte
 # GLM-5.3's own expert usage profile (tools/strata/glm_dsa_profile.py, made on a GPU day; 79 layers x 256 experts):
@@ -38,7 +39,7 @@ MEMORY_GB = 245
 # the dense weights (DENSE_GB: 4.90 + 4.83 + 4.64 GB measured on 3x V100 with UD-IQ2_M, GPU day 1) and on each GPU its
 # working memory (GPU_WORK_GB: activations, MTP, scratch, the prompt path ~0.7-0.9 GB) and the VRAM the engine leaves
 # free beside the expert pool (the reserve: --vram-reserve-mib, RESERVE_MIB by default; the HIP setup's
-# STRATA_GLM_RESERVE_MB) must leave a tenth of the VRAM to the experts
+# MAYA_GLM_RESERVE_MB) must leave a tenth of the VRAM to the experts
 GEOMETRY = {"trunk": 78, "mtp": True, "full": 21, "kv_lora": 512, "kv_row": 576, "idx_key": 128}   # (geometry()'s)
 KV_BYTES = 64352
 DENSE_GB = 14.5
@@ -111,7 +112,7 @@ def kv_bytes_per_token(pack, int8: bool = True, idx_fp16: bool = False) -> int |
     """What one context position of a glm-dsa model takes in its caches, as the engine lays them out
     (src/core/glm_state_layout.cpp): every layer and the NextN block its latent - INT8 (the default: kv_lora codes and
     an FP16 scale per 32) or FP16 - and its rope part k_pe (FP16); every full-indexer layer and the NextN block its index
-    key (FP32; FP16 with STRATA_GLM_IDX_FP16=1).  GLM-5.3: 79 x 672 + 22 x 512 = 64,352 bytes (FP16 latent: 102,272).
+    key (FP32; FP16 with MAYA_GLM_IDX_FP16=1).  GLM-5.3: 79 x 672 + 22 x 512 = 64,352 bytes (FP16 latent: 102,272).
     None for any other pack."""
     g = geometry(pack)
     return None if g is None else kv_bytes_of(g, int8, idx_fp16)
@@ -122,3 +123,73 @@ def kv_bytes_of(g: dict, int8: bool = True, idx_fp16: bool = False) -> int:
     lat = g["kv_lora"] + g["kv_lora"] // 16 if int8 else 2 * g["kv_lora"]
     layers, full = g["trunk"] + g["mtp"], g["full"] + g["mtp"]
     return layers * (lat + 2 * (g["kv_row"] - g["kv_lora"])) + full * g["idx_key"] * (2 if idx_fp16 else 4)
+
+
+def pack_headwise_q8(pack) -> bool | None:
+    """Whether a glm-dsa pack serves the GGUF's Q8_0 attn_k_b / attn_v_b as they are (True: its index serves them
+    from the model files, ggml type 8), or upcast them to BF16 (False: its compat-bf16.json lists them converted from
+    Q8_0); None when it says neither (the GGUF has no Q8_0 ones, or no such pack)."""
+    try:
+        conv = json.loads((Path(pack) / "compat-bf16.json").read_text(encoding="utf-8")).get("tensors") or []
+    except (OSError, ValueError, AttributeError):
+        conv = []
+    if any(isinstance(t, dict) and str(t.get("name", "")).endswith(("attn_k_b.weight", "attn_v_b.weight")) and
+           t.get("source_type") == "Q8_0" for t in conv):
+        return False
+    try:
+        with open(Path(pack) / "index.txt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                p = line.split()
+                if len(p) > 9 and p[0].endswith(("attn_k_b.weight", "attn_v_b.weight")):
+                    if p[2] == "0" and p[9] == "8":
+                        return True
+    except OSError:
+        pass
+    return None
+
+
+# One-GPU drafting (MAYA_GLM_MTP_DECODE=1: the NextN block drafts, one verify pass checks the drafts - the same
+# tokens) pays off when the routed experts nearly all sit in GPU memory, and costs when many come from RAM: the
+# setup's speed calibration measures it on the PC (drafting on vs off, the faster kept).  Until it has, or when it is
+# skipped, the setup writes drafting on when at most DRAFT_OUTSIDE_MAX of the trunk's routed experts would stay
+# outside GPU memory (drafting_estimate), off otherwise.  NEXTN_GB: the NextN block's own weights in GPU memory.
+DRAFT_OUTSIDE_MAX = 0.10
+NEXTN_GB = 0.3
+
+
+def pack_bytes(pack) -> dict | None:
+    """A glm-dsa pack's model in bytes: {"trunk": the routed experts of the trunk's layers, "nextn": those of the
+    NextN block, "files": its model files together (sources.json's sizes)} - None when the pack does not say."""
+    try:
+        with open(Path(pack) / "native_experts.txt", encoding="utf-8") as f:
+            head = f.readline()
+            m = re.search(r"\(n_expert (\d+)", head)
+            if not m:
+                return None
+            n, trunk, nextn = int(m.group(1)), 0, 0
+            for line in f:
+                p = line.split()
+                if line.startswith("#") or len(p) < 5:
+                    continue
+                b = int(p[4]) * n
+                if int(p[0]) >= GEOMETRY["trunk"]:
+                    nextn += b
+                else:
+                    trunk += b
+        files = json.loads((Path(pack) / "sources.json").read_text(encoding="utf-8")).get("files") or []
+        total = sum(int(r.get("size") or 0) for r in files if isinstance(r, dict))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return {"trunk": trunk, "nextn": nextn, "files": total} if trunk and total > trunk + nextn else None
+
+
+def drafting_estimate(gpu_gb: float, sizes: dict, kv_gb: float, reserve_gb: float) -> tuple[bool, float]:
+    """(drafting on, the share of the trunk's routed experts outside GPU memory) for one GPU with `gpu_gb` (GiB) that
+    holds the dense weights (the model files less the routed experts: a little over, the head and embeddings in), the
+    cache (`kv_gb`), the working memory, the reserve and the NextN block - the experts get the rest."""
+    gib = 2 ** 30
+    dense = (sizes["files"] - sizes["trunk"] - sizes["nextn"]) / gib
+    room = gpu_gb - dense - kv_gb - GPU_WORK_GB - reserve_gb - NEXTN_GB
+    trunk = sizes["trunk"] / gib
+    out = min(1.0, max(0.0, (trunk - max(0.0, room)) / trunk))
+    return out <= DRAFT_OUTSIDE_MAX, round(out, 4)

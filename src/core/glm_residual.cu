@@ -5,7 +5,7 @@
 //   res_read(R, previous FFN out, attn_norm) -> the mixer (fast_dsa) -> res_read(R, mixer, ffn_norm) -> the FFN
 // and once at the end of the part res_close(R, last FFN out), so the residual at state_ is complete for the hop or the
 // head (the same convention as the mHC path: "the residual lives at state_").  R is updated in place (no ping-pong).
-// glm-dsa B10.1: with STRATA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
+// glm-dsa B10.1: with MAYA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
 // per token (glmdsa::graph_prepare / graph_run, src/core/glm_dsa_mixer.cu); the MoE CPU-lane waits stay device spins
 // inside it, as Maya's KDA layer graphs keep them.
 #include "glm_residual.hpp"
@@ -104,6 +104,7 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         if (!glmdsa::graph_prepare(*F->dsa, lay_, l0_, l1_, p, F->cpu_plan, R, state_, host_off, requests, s, pg, err,
                                    seq_count()))
             return false;
+        pg.key.abl = ablating();   // (--ablate: a projecting conversation's part is another graph)
     }
     if (F->prof_on) F->mark("start");
     const auto body = [&]() -> bool {
@@ -114,6 +115,7 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
             return false;
         }
         // ---- the attention-side read (fused with the previous FFN's residual add)
+        if (il != l0_) ablate(F->ffn, 1, s);   // (--ablate: the previous FFN's write loses the direction)
         glmres::res_read(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_attn");
         if (dumps) {
@@ -125,6 +127,7 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         if (!fast_dsa(il, p, err)) return false;
 
         // ---- the FFN-side read (fused with the mixer's residual add)
+        ablate(F->mixer, 1, s);   // (--ablate: the mixer's write)
         glmres::res_read(R, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_ffn");
         if (dumps) {
@@ -154,6 +157,7 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
     }
     // the part's last FFN output closes the residual (the hop and the head read R complete)
     if (l1_ > l0_) {
+        ablate(F->ffn, 1, s);
         glmres::res_close(R, F->ffn, E, s);
         if (F->prof_on) F->mark("res_close");
         if (dumps) plain_dump(s, "l_out-" + std::to_string(l1_ - 1), R, E);
@@ -193,7 +197,7 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
         if (err.empty()) err = "glm window: the glm-dsa mixer is not set up on this part";
         return false;
     }
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
@@ -207,12 +211,14 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     // up to its routes (moe part 1), or all of it (part 0 / a dense FFN); the second half (part 2): the experts
     const auto pre = [&](int il, int t0, int n, int moe_part, int gid) -> bool {
         const auto& Ly = F->L[(size_t) il];
+        if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);   // (--ablate: the window's rows, the bound conversation's)
         for (int t = t0; t < t0 + n; ++t)
             glmres::res_read(R + (size_t) t * E, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps,
                              E, W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
         mark("res_attn");
         if (!fast_dsa_glm_window(il, p0, t0, n, W.x, W.xq, W.xq_s, W.mixer, err)) return false;
         mark("dsa");
+        ablate(W.mixer + (size_t) t0 * E, n, s);
         for (int t = t0; t < t0 + n; ++t)
             glmres::res_read(R + (size_t) t * E, W.mixer + (size_t) t * E, Ly.ffn_norm, g.norm_eps, E,
                              W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
@@ -257,10 +263,10 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     mark("start");
     // (fast_window_layers' staggered row groups and their switches)
     static const bool stagger_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_STAGGER");
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    static const bool batch_env = glmfast::off_by_default_on_amd("STRATA_GLM_WIN_BATCH");
+    static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");
     const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
     if (stagger) {
         const int ka = (T + 1) / 2, kb = T - ka;
@@ -276,6 +282,7 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
             if (!pre(il, 0, T, 0, 0)) return false;
     }
     // each row's last FFN output closes its residual (the hop and the head read the rows complete)
+    ablate(W.ffn, T, s);
     for (int t = 0; t < T; ++t) glmres::res_close(R + (size_t) t * E, W.ffn + (size_t) t * E, E, s);
     W.out = 0;
     const cudaError_t e = cudaGetLastError();

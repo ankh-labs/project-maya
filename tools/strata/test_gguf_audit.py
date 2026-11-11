@@ -23,7 +23,7 @@ sys.path.insert(0, str(HERE.parent))
 import gguf_audit as ga  # noqa: E402
 
 try:
-    import _paths  # noqa: E402  (tools/_paths.py: STRATA_GGUF_PY, third_party/llama.cpp/gguf-py)
+    import _paths  # noqa: E402  (tools/_paths.py: MAYA_GGUF_PY, third_party/llama.cpp/gguf-py)
     with contextlib.suppress(SystemExit):
         _paths.add_gguf_py()
     import numpy as np
@@ -299,9 +299,10 @@ class AuditTest(unittest.TestCase):
         self.assertOnly(self.build(f), {"A3": "WARN", "A11": "WARN"})
 
     # ---------------------------------------------------------------- A4, A5, A13
-    def test_a4_iq1_m_experts_fail_a5_only(self):
+    def test_a4_iq1_m_experts_warn_a5_only(self):
+        # (no MMQ instance: the prompt path multiplies those matrices in FP16 and stays batched - a warning, not a fail)
         a = self.build(self.mut_types(lambda n: n.endswith(("gate_exps.weight", "up_exps.weight")), T["IQ1_M"]))
-        self.assertOnly(a, {"A5": "FAIL", "A11": "WARN"})
+        self.assertOnly(a, {"A5": "WARN", "A11": "WARN"})
 
     def test_a4_iq4_nl_experts_fail(self):
         a = self.build(self.mut_types(lambda n: n == "blk.10.ffn_down_exps.weight", T["IQ4_NL"]))
@@ -373,7 +374,7 @@ class AuditTest(unittest.TestCase):
         txt = "\n".join(a9.notes)
         self.assertIn("experts: IQ2_XXS 2.06 bpw, IQ3_XXS 3.06 bpw", txt)
         self.assertIn("nextn: Q8_0 8.50 bpw", txt)
-        self.assertIn("STRATA_GLM_MTP_GGUF", txt)
+        self.assertIn("MAYA_GLM_MTP_GGUF", txt)
         self.assertIn("extract_mtp_block.py", txt)
         # a Q4_K-or-better block (the remedy's donor) passes A9
         good = self.build(self.mut_types(lambda n: n.startswith("blk.78.") and n.endswith("_exps.weight"), T["Q4_K"]))

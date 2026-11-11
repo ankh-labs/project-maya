@@ -2,7 +2,7 @@
 // decode mixer write and read the SAME caches.
 //
 // On a synthetic pack (PACK9: 12 layers + NextN, real MLA head geometry, top-k 2048), two models load the same pack on
-// one GPU with the NextN block (STRATA_GLM_MTP=1):
+// one GPU with the NextN block (MAYA_GLM_MTP=1):
 //   A  the batched prompt: prefill(prompt[:-1], next = prompt.back()) (glm_prefill_dsa.cu, including the NextN cache
 //      fill mtp_fill), then forward(prompt.back());
 //   B  the token path: forward(t) for every prompt token, each followed by mtp_draft(next) - the NextN block at that
@@ -14,9 +14,9 @@
 //     written at a wrong position, in a wrong dtype or by one path only fails here exactly; and the written rows agree
 //     in value (rel L2 per layer and component < 5e-2: the prompt's FP16 GEMMs vs the token path's q8_1 GEMVs);
 //   * logits: per step rel L2 < 0.15 and top-1 agreement >= 90% over the decode steps; NextN drafts agree >= 80%.
-// Variants (ctest): the default; STRATA_GLM_IDX_FP16=1 (FP16 index keys end to end, B10.8); every Volta switch forced
-// with decode graphs (STRATA_GLMD_FUSED_MLA / IDX_WMMA / TOPK_MB = 1, STRATA_GLM_DSA_GRAPHS=1, B10.1-B10.4); and
-// --native32: the pack keeps attn_k_b / attn_v_b native Q8_0 (STRATA_PACK_NATIVE32=1, B10.7).
+// Variants (ctest): the default; MAYA_GLM_IDX_FP16=1 (FP16 index keys end to end, B10.8); every Volta switch forced
+// with decode graphs (MAYA_GLMD_FUSED_MLA / IDX_WMMA / TOPK_MB = 1, MAYA_GLM_DSA_GRAPHS=1, B10.1-B10.4); and
+// --native32: the pack keeps attn_k_b / attn_v_b native Q8_0 (MAYA_PACK_NATIVE32=1, B10.7).
 // Without a device or the fixture tools: exit 77.
 #include "strata/core/glm_arch.hpp"
 #include "strata/core/glm_model.hpp"
@@ -76,7 +76,7 @@ float half_f(uint16_t h) {
     return f;
 }
 
-/// <stem>.n32.pack: the pack with STRATA_PACK_NATIVE32=1 (native Q8_0 W_kb / W_vb).
+/// <stem>.n32.pack: the pack with MAYA_PACK_NATIVE32=1 (native Q8_0 W_kb / W_vb).
 fs::path pack_native32(const fs::path& gguf, std::string& why) {
     const fs::path out = gguf.parent_path() / (gguf.stem().string() + ".n32.pack"), log = gguf.parent_path() / "fixtures.log";
     const fs::path mark = out / ".from";
@@ -91,18 +91,18 @@ fs::path pack_native32(const fs::path& gguf, std::string& why) {
     fs::remove_all(out, ec);
 #ifdef _WIN32
     // (cmd.exe has no VAR=value command prefix: the tool inherits the switch from this process instead)
-    setenv("STRATA_PACK_NATIVE32", "1", 1);
+    setenv("MAYA_PACK_NATIVE32", "1", 1);
     const bool packed = glmfx::run(glmfx::python() + " " + glmfx::q(glmfx::src_dir() / "tools" / "iq_pack.py") +
                                        " --gguf " + glmfx::q(gguf) + " --out " + glmfx::q(out),
                                    log);
-    unsetenv("STRATA_PACK_NATIVE32");
+    unsetenv("MAYA_PACK_NATIVE32");
     if (!packed) {
 #else
-    if (!glmfx::run("STRATA_PACK_NATIVE32=1 " + glmfx::python() + " " + glmfx::q(glmfx::src_dir() / "tools" / "iq_pack.py") +
+    if (!glmfx::run("MAYA_PACK_NATIVE32=1 " + glmfx::python() + " " + glmfx::q(glmfx::src_dir() / "tools" / "iq_pack.py") +
                         " --gguf " + glmfx::q(gguf) + " --out " + glmfx::q(out),
                     log)) {
 #endif
-        why = "tools/iq_pack.py (STRATA_PACK_NATIVE32=1) failed (see " + log.string() + ")";
+        why = "tools/iq_pack.py (MAYA_PACK_NATIVE32=1) failed (see " + log.string() + ")";
         return {};
     }
     std::ofstream(mark) << gguf.string() << "\n";
@@ -161,8 +161,8 @@ bool row_written(const std::vector<float>& st, int64_t off_floats, int64_t pp_fl
 
 bool run_model(const fs::path& pack, bool batched, const std::vector<int32_t>& prompt, const std::vector<int>* forced,
                Run& out, strata::core::GlmStateLayout& lay, int64_t& pos_end) {
-    if (batched) unsetenv("STRATA_GLM_NO_PREFILL");
-    else setenv("STRATA_GLM_NO_PREFILL", "1", 1);
+    if (batched) unsetenv("MAYA_GLM_NO_PREFILL");
+    else setenv("MAYA_GLM_NO_PREFILL", "1", 1);
     auto m = std::make_unique<strata::core::Glm5Model>();
     std::string& err = out.err;
     if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast()) {
@@ -170,7 +170,7 @@ bool run_model(const fs::path& pack, bool batched, const std::vector<int32_t>& p
         return false;
     }
     if (!m->has_mtp()) {
-        err = "no NextN block (STRATA_GLM_MTP=1)";
+        err = "no NextN block (MAYA_GLM_MTP=1)";
         return false;
     }
     m->reset();
@@ -217,10 +217,13 @@ bool run_model(const fs::path& pack, bool batched, const std::vector<int32_t>& p
 
 int main(int argc, char** argv) {
     const bool native32 = argc > 1 && std::string(argv[1]) == "--native32";
+    // --iq1m: PFIQ1M, a geometry the batched prompt path covers (PACK9's 4 heads run it token by token) with IQ1_M
+    // experts in gate/up, in down and in both - the matrices MMQ has no instance for take the FP16 expert products
+    const bool iq1m = argc > 1 && std::string(argv[1]) == "--iq1m";
     std::printf("glm_dsa_prefill_decode_test: the batched prompt vs the token path, then decode%s\n",
-                native32 ? " (native Q8_0 W_kb / W_vb pack)" : "");
+                native32 ? " (native Q8_0 W_kb / W_vb pack)" : iq1m ? " (IQ1_M experts, the batched geometry)" : "");
     std::string why, err;
-    const fs::path gguf = glmfx::synth("PACK9", why);
+    const fs::path gguf = glmfx::synth(iq1m ? "PFIQ1M" : "PACK9", why);
     fs::path pack = gguf.empty() ? fs::path() : (native32 ? pack_native32(gguf, why) : glmfx::pack(gguf, why));
     if (pack.empty()) {
         return glmfx::fixture_missing("glm_dsa_prefill_decode_test", why);
@@ -235,13 +238,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "glm_dsa_prefill_decode_test: %s: %s\n", pack.string().c_str(), err.c_str());
         return 1;
     }
-    unsetenv("STRATA_GLM_SLOW");
-    unsetenv("STRATA_GLM_DSA_DENSE");
-    setenv("STRATA_GLM_SPLIT", "0", 1);
-    setenv("STRATA_GLM_MTP", "1", 1);
-    setenv("STRATA_GLM_PREFILL_MIN", "1", 1);
-    for (const char* v : {"STRATA_GLM_IDX_FP16", "STRATA_GLMD_FUSED_MLA", "STRATA_GLMD_IDX_WMMA", "STRATA_GLMD_TOPK_MB",
-                          "STRATA_GLM_DSA_GRAPHS"})
+    unsetenv("MAYA_GLM_SLOW");
+    unsetenv("MAYA_GLM_DSA_DENSE");
+    setenv("MAYA_GLM_SPLIT", "0", 1);
+    setenv("MAYA_GLM_MTP", "1", 1);
+    setenv("MAYA_GLM_PREFILL_MIN", "1", 1);
+    // (PFIQ1M's pool holds every expert, so it lends the prompt path nothing by itself: a fixed 512 MB, two chunks)
+    if (iq1m) setenv("MAYA_GLM_PREFILL_MB", "512", 0);
+    for (const char* v : {"MAYA_GLM_IDX_FP16", "MAYA_GLMD_FUSED_MLA", "MAYA_GLMD_IDX_WMMA", "MAYA_GLMD_TOPK_MB",
+                          "MAYA_GLM_DSA_GRAPHS", "MAYA_GLM_PREFILL_F16_ROWS"})
         if (const char* x = getenv(v)) std::printf("  (%s=%s)\n", v, x);
     // a prompt past top_k: the decode selects among keys the prompt path wrote
     const int L = std::min<int>((int) kCtx - kDecode - 8, g.idx_top_k + 64);
@@ -318,6 +323,12 @@ int main(int argc, char** argv) {
     check(max_rel < 0.15 && top1 * 10 >= (int) A.logits.size() * 9, buf);
     std::snprintf(buf, sizeof buf, "NextN drafts agree %d / %zu", drafts, A.drafts.size());
     check(drafts * 10 >= (int) A.drafts.size() * 8, buf);
+    if (iq1m) {   // the token path again would give the same logits bit for bit (prefill_tokens_dsa's fallback)
+        const double e = rel_l2(B.logits[0], A.logits[0]);
+        std::snprintf(buf, sizeof buf, "the batched prompt path ran (logits after the prompt differ from the token "
+                                       "path's: rel L2 %.2e > 0)", e);
+        check(e > 0, buf);
+    }
     if (g_fail) {
         std::printf("glm_dsa_prefill_decode_test: %d FAILED\n", g_fail);
         return 1;

@@ -68,6 +68,9 @@ UPCAST_BF16 = {F16, 2, 3, 6, 7, 20}
 # strata_mmq template instances in CMakeLists.txt (read from the file when found, see mmq_types())
 MMQ_FALLBACK = {"q2_0", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq4_nl", "iq4_xs", "q8_0", "iq1_s",
                 "q2_k", "q3_k", "q4_k", "q5_k", "q6_k"}
+# routed types without an MMQ instance that the prompt path multiplies in FP16 instead (dequantized by llama.cpp's
+# convert.cu, cuBLAS / hipBLAS; src/core/glm_prefill.cu expert_f16): only those matrices, the prompt stays batched
+F16_EXPERT = {"IQ1_M", "Q4_0", "Q4_1", "Q5_0", "Q5_1"}
 
 # section 3.2 A2: glm-dsa geometry (key suffix after "glm-dsa.")
 GEOMETRY = [
@@ -104,7 +107,7 @@ MTP_GROUPS = [
     ("shared expert", ["ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"]),
 ]
 MTP_REMEDY = ("the NextN draft head is IQ2/IQ3-class: expect low MTP acceptance (M4 needs 0.6). Remedy: "
-              "STRATA_GLM_MTP_GGUF=<a GGUF holding a Q4_K-or-better blk.%d>; cut one from a larger community quant with "
+              "MAYA_GLM_MTP_GGUF=<a GGUF holding a Q4_K-or-better blk.%d>; cut one from a larger community quant with "
               "tools/strata/extract_mtp_block.py (local shards, or --remote REPO 'Q4_K_M/*.gguf' to range-read only the "
               "block's bytes), then check it with tools/glm_dsa_mtp_probe.py --agree (docs/strata/volta3/mtp.md)")
 
@@ -586,7 +589,7 @@ class Audit:
                 c.fail("blk.%d gate %s != up %s (iq_pack requires equal gate/up types)" % (i, g["gate"].tname, g["up"].tname))
         c.info("types (tensor count): " + ", ".join("%s %d" % kv for kv in sorted(hist.items())))
         if "IQ1_M" in hist:
-            c.info("IQ1_M experts decode, but have no MMQ instance (see A5)")
+            c.info("IQ1_M experts decode; the prompt path multiplies them in FP16 (no MMQ instance, see A5)")
         return c
 
     def a5(self) -> Check:
@@ -598,8 +601,12 @@ class Audit:
                 if t is not None and t.type not in mmq:
                     bad.setdefault(t.tname, []).append(i)
         for tn, layers in sorted(bad.items()):
-            c.fail("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: whole prompt token by token"
-                   % (tn, len(set(layers)), layers[0]))
+            if tn in F16_EXPERT:
+                c.warn("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: those matrices take the FP16 "
+                       "products (slower than MMQ), the prompt stays batched" % (tn, len(set(layers)), layers[0]))
+            else:
+                c.fail("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: whole prompt token by token"
+                       % (tn, len(set(layers)), layers[0]))
         c.info("strata_mmq types: " + ", ".join(sorted(type_name(x) for x in mmq)))
         return c
 
@@ -663,7 +670,7 @@ class Audit:
     def a9(self) -> Check:
         c = Check("A9", "MTP block (blk.78)")
         if not self.has_mtp:
-            c.warn("no MTP block: M4 needs STRATA_GLM_MTP_GGUF with another file's blk.78 "
+            c.warn("no MTP block: M4 needs MAYA_GLM_MTP_GGUF with another file's blk.78 "
                    "(tools/strata/extract_mtp_block.py cuts one out of a larger community quant)")
             return c
         i = self.n_blocks - 1

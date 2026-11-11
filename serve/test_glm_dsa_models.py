@@ -103,24 +103,30 @@ class CacheBytes(Base):
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, env={"MAYA_GLM_KV_INT8": "0"})), fp16)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, args=cfg["args"] + ["--kv", "fp16"])), fp16)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, args=cfg["args"] + ["--kv", "fp16"],
-                                               env={"STRATA_GLM_KV_INT8": "1"})), 64352)   # (the environment wins)
+                                               env={"MAYA_GLM_KV_INT8": "1"})), 64352)   # (the environment wins)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, env={"MAYA_GLM_IDX_FP16": "1"})), 79 * 672 + 22 * 256)
         self.assertIsNone(M.glm53_kv_bytes(M.read(self.flash)))
 
 
+NO_ABLATE = {"available": False, "why": "no refusal direction file for this model (its repo ships none yet)"}
+
+
 class Page(Base):
-    """b) c) What the Models page gets for GLM-5.3, and GLM-5.3-Flash's answer as it was."""
+    """b) c) What the Models page gets for GLM-5.3, and GLM-5.3-Flash's answer as it was (plus v1.1.58's refusal
+    ablation switch, off without a direction file)."""
 
     def test_choices(self):
         self.assertEqual(M.choices(M.read(self.g53)),
                          {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
-                          "kv_streaming": False, "batched": False})
-        self.assertEqual(M.choices(M.read(self.flash)), {"draft": ["mtp"], "images": True})   # (as before)
+                          "kv_streaming": False, "batched": False, "ablate": NO_ABLATE})
+        self.assertEqual(M.choices(M.read(self.flash)), {"draft": ["mtp"], "images": True,   # (as before)
+                                                         "ablate": NO_ABLATE})
         drafter = self.d / "GLM-5.3-Flash-DFlash2" / "drafter.gguf"                         # (a Flash drafter here:
         drafter.parent.mkdir()                                                              #  Flash's choice only)
         drafter.write_bytes(b"x")
         self.assertEqual(M.choices(M.read(self.g53))["draft"], ["mtp"])
-        self.assertEqual(M.choices(M.read(self.flash)), {"draft": ["mtp", "dflash2"], "images": True})
+        self.assertEqual(M.choices(M.read(self.flash)), {"draft": ["mtp", "dflash2"], "images": True,
+                                                         "ablate": NO_ABLATE})
 
     def test_settings(self):
         older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))   # (a setup before this one: "on")
@@ -130,7 +136,7 @@ class Page(Base):
         self.assertEqual(M.settings_of(M.read(self.flash)),
                          {"context": 131072, "gpus": [0, 1], "env": {"MAYA_GLM_RAM_HEADROOM_GB": "4"}, "images": True,
                           "reserve_mib": None, "parallel": 1, "draft": "mtp", "expert_cache": None, "prefill": None,
-                          "kv_streaming": True, "kv_resident": None})
+                          "kv_streaming": True, "kv_resident": None, "ablate": False})
 
     def test_describe(self):
         g = M.describe(self.g53, None)
@@ -141,7 +147,8 @@ class Page(Base):
                                    "port", "script", "folder", "size", "ok", "missing", "settings", "setup", "choices",
                                    "command", "contexts", "context_range"])                 # (no new keys, same order)
         self.assertEqual((f["quant"], f["model"], f["ok"], f["choices"]), ("Maya-M", "glm-5.3-flash", True,
-                                                                           {"draft": ["mtp"], "images": True}))
+                                                                           {"draft": ["mtp"], "images": True,
+                                                                            "ablate": NO_ABLATE}))
 
     def test_startable_as_released(self):
         self.assertIsNone(M.missing(M.read(self.flash)))
@@ -149,7 +156,7 @@ class Page(Base):
 
     def test_labels(self):
         self.assertEqual(Q.config_label(M.read(self.g53)), "GLM-5.3 (744B) · UD-IQ2_M")
-        self.assertEqual(Q.config_label(M.read(self.flash)), "GLM-5.3 · Maya-M")              # (as before)
+        self.assertEqual(Q.config_label(M.read(self.flash)), "GLM-5.3-Flash · Maya-M")              # (as before)
         self.assertEqual(Q.glm53_quant("GLM-5.3-UD-IQ2_M"), "UD-IQ2_M")
         self.assertEqual(Q.glm53_quant("GLM-5.3-ewaste-edition-Q2_K_XL"), "ewaste-edition-Q2_K_XL")
         self.assertEqual(Q.glm53_quant("mine"), "mine")
@@ -199,14 +206,25 @@ class Apply(Base):
 
 
 class Turbo(Base):
-    """e) Turbo: hidden for GLM-5.3 until its own values are measured on it; GLM-5.3-Flash's as before."""
+    """e) Turbo: GLM-5.3 its own values (TURBO_ENV_G53: the route affinity measured on it, none of Flash's skips);
+    GLM-5.3-Flash's as before."""
 
-    def test_hidden_and_refused(self):
-        self.assertEqual(M.turbo_info(M.read(self.g53)),
-                         {"on": False, "family": "glm", "plan": {}, "env": {}, "hidden": True})
-        with self.assertRaisesRegex(ValueError, "not offered for GLM-5.3"):
-            M.turbo_enable(self.g53)
-        self.assertEqual(M.read(self.g53)["args"][-2:], ["--kv-streaming", "off"])      # (nothing written)
+    def test_g53_own_values(self):
+        info = M.turbo_info(M.read(self.g53))
+        self.assertEqual(info, {"on": False, "family": "glm",
+                                "plan": {"context": {"from": 65536, "to": 32768}},
+                                "env": {"MAYA_GLM_ROUTE_AFFINITY": "0.2"}})
+        self.assertNotIn("hidden", info)
+        before = M.read(self.g53)
+        out = M.turbo_enable(self.g53)
+        self.assertTrue(out["changed"])
+        on = M.read(self.g53)
+        self.assertTrue(M.turbo_on(on))
+        self.assertEqual(on["env"], {"MAYA_GLM_ROUTE_AFFINITY": "0.2"})                 # (no MISS_SKIP / RESIDENT_TOPK)
+        M.turbo_disable(self.g53)
+        off = M.read(self.g53)
+        self.assertFalse(M.turbo_on(off))
+        self.assertEqual((off["args"], off.get("env")), (before["args"], before.get("env")))   # (restored exactly)
 
     def test_flash_as_before(self):
         info = M.turbo_info(M.read(self.flash))
@@ -264,14 +282,19 @@ class Catalog(unittest.TestCase):
 
     def test_listed(self):
         on = self.ids()
-        self.assertEqual([k for k, m in on.items() if "744B" in m["name"]], ["glm-5.3-ud-iq2_m"])
+        self.assertEqual([k for k, m in on.items() if "744B" in m["name"]], ["glm-5.3-maya-xs", "glm-5.3-ud-iq2_m"])
         self.assertEqual(on["glm-5.3-ud-iq2_m"], {"id": "glm-5.3-ud-iq2_m", "family": "glm",
                                                   "name": "GLM-5.3 (744B) · UD-IQ2_M", "group": "other",
                                                   "by": "unsloth", "note": "text only", "installed": False,
                                                   "size_gb": 238.6})
+        self.assertEqual(on["glm-5.3-maya-xs"], {"id": "glm-5.3-maya-xs", "family": "glm",   # (Maya's own: among Maya's)
+                                                 "name": "GLM-5.3 (744B) · Maya-XS", "group": "maya",
+                                                 "by": "Maya", "note": "text only", "installed": False,
+                                                 "size_gb": 170.0})
         for backend, ccs, listed in (("cuda", (70,), True), ("cuda", (61,), False), ("cuda", (), True),
                                      ("hip", (), True), ("metal", (), False)):
             self.assertEqual("glm-5.3-ud-iq2_m" in self.ids(backend, ccs), listed, (backend, ccs))
+            self.assertEqual("glm-5.3-maya-xs" in self.ids(backend, ccs), listed, (backend, ccs))
 
     def test_the_setup_takes_its_command(self):
         cmd = self.P.setup_command("glm-5.3-ud-iq2_m", {"installer": {"models_dir": "/m"}})
@@ -282,6 +305,11 @@ class Catalog(unittest.TestCase):
         a = SimpleNamespace(model="glm-5.3-ud-iq2_m", mm3_quant=None)
         self.assertIsNone(maya.model_option(a))
         self.assertEqual(a.model, "GLM-5.3-UD-IQ2_M")
+        cmd = self.P.setup_command("glm-5.3-maya-xs", {"installer": {"models_dir": "/m"}})
+        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "glm-5.3-maya-xs"])
+        a = SimpleNamespace(model="glm-5.3-maya-xs", mm3_quant=None)
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual(a.model, "GLM-5.3-Maya-XS")
 
 
 # the page's own modules in Node: models.js' engine fields (fieldsOf, exported in a temporary copy - the page does not

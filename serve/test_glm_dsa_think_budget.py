@@ -176,7 +176,7 @@ class _Server(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        env_patch = mock.patch.dict(os.environ, {"STRATA_GPU_RELEASE_S": "0"})
+        env_patch = mock.patch.dict(os.environ, {"MAYA_GPU_RELEASE_S": "0"})
         env_patch.start()
         cls.addClassCleanup(env_patch.stop)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=WIN)
@@ -577,7 +577,7 @@ class WebChat(unittest.TestCase):
 
     def test_the_request_says_so(self):
         g53 = {"model": "glm-5.3", "model_label": "GLM-5.3 (744B)", "thinking_budget_max": AT_MAX}
-        flash = {"model": "glm-5.3-flash", "model_label": "GLM-5.3 · Maya-S24"}
+        flash = {"model": "glm-5.3-flash", "model_label": "GLM-5.3-Flash · Maya-S24"}
         left = self.run_page(g53, CHATS_SEND_JS)
         self.assertEqual(len(left), 1)
         self.assertEqual((left[0]["reasoning_effort"], left[0]["strata_level_default"]), ("max", True))
@@ -599,7 +599,7 @@ class WebChat(unittest.TestCase):
         self.assertEqual(out["settings_max"], {"level": "max", "picked": True, "left": False})  # (Settings' own Max)
 
     def test_every_other_model_and_a_users_own_budget_never(self):
-        for health in ({"model": "glm-5.3-flash", "model_label": "GLM-5.3 · Maya-S24"},
+        for health in ({"model": "glm-5.3-flash", "model_label": "GLM-5.3-Flash · Maya-S24"},
                        {"model": "glm-5.3", "model_label": "GLM-5.3 (744B)"}):    # (no long budget: the user's own)
             out = self.run_page(health)
             self.assertEqual({k: v["left"] for k, v in out.items()}, {k: False for k in out}, health)
@@ -624,7 +624,7 @@ class MainStart(unittest.TestCase):
         cfg["args"] = [str(CONTEXT) if a == "65536" else a for a in cfg["args"]]
         cfg.update(exe=fake_exe(d), tokenizer=str(tok_dir), cwd=str(d), log=str(d / "engine.log"), reasoning_effort="max",
                    model_name="glm-5.3" if glm_dsa else "glm-5.3-flash")
-        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), STRATA_GPU_RELEASE_S="0",
+        cfg["env"] = dict(cfg["env"], FAKE_ENGINE_DIR=str(d), MAYA_GPU_RELEASE_S="0",
                           FAKE_ENGINE_GEN_LOG=str(d / "gen.txt"),
                           FAKE_ENGINE_IDS=",".join(map(str, tok.encode("Some thought.</think>Hello."))))
         cfg_edit(cfg)
