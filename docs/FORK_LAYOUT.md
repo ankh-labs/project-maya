@@ -688,3 +688,51 @@ v1.1.59 also fixes it so one waiter pauses **one** running answer, not every one
   run. Neither of those is a fairness knob.
 
 Both fairness settings default to 0/off, so nothing changed by this merge.
+
+## 2026-11-11 - the prompt path was gated off for GLM-5.3-Flash i-quants (cold prompts 44 tok/s)
+
+**Symptom.** A cold 82,305-token prompt was read at **24 tok/s** (and 14k prompts at **44-48 tok/s**),
+while the same box had done **2,370 tok/s** on 2026-11-10 07:54.  Warm conversations hid it: with a
+slot hit only the new tokens are read, so every long conversation that was already cached felt fine.
+
+**What it was NOT** (each ruled out by measurement, not argument):
+- **Not the KV latent type.** `--kv int8` 44 tok/s, `--kv q4_0` 48 tok/s, `--kv fp16` no prompt path
+  either.  Restoring q4_0 (dropped in v1.1.59) would not have helped.
+- **Not the new fairness knobs.** With `MAYA_GLM_PREFILL_INTERLEAVE` and ablation both off, a cold
+  13,910-token read was still 44 tok/s.  (`PREFILL_INTERLEAVE` is inert without a prompt path.)
+- **Not the repack on its own.**  The repack is a necessary ingredient but the refusal was a policy
+  gate, not a missing tensor.
+- **Not `deq_ok`'s empty-slot test.**  Patching it to accept `f32`-stored weights changed nothing
+  (reverted).
+
+**What it was.** `f16_covers()` in `src/core/glm_prefill_dsa.cu`:
+
+```cpp
+if (!dsa) return false;                      // Flash: Maya's set, unchanged (no i-quant)
+if (type == 16 || 17 || 18 || 21 || 22 || 29) return true;   // glm-dsa only
+```
+
+GLM-5.3-Flash (arch != GlmDsa) therefore treated **any i-quant dense weight** as uncovered.  The
+v3q repack is built from `GLM-5.3-Flash-UD-IQ3_XXS`, so a handful of layers carry **IQ4_XS (type 21)**
+attention/shared-expert tensors - and `prompt path: has no prompt path (not covered: blk.17.attn_k
+(type 21) ...)` disabled the batched read for the whole model.  The older `pack` dequantised those
+tensors to BF16, so it never hit the gate (that is why the pre-repack logs show
+`chunks of 65536 tokens` and 2,370 tok/s).
+
+**The change** (`glm_prefill_dsa.cu`, +4/-2): the i-quant list is honoured before the `dsa` gate.
+`dequant_f16` already routes i-quants to `iq_dequant_f16`; the gate was a policy, not a capability.
+
+**Measured after** (v1.1.59, int8, ablation on, interleave on):
+
+| | before | after |
+|---|---|---|
+| cold 14k prompt | 44 tok/s (314 s) | **1,822-1,964 tok/s (~7 s)** |
+| cold 82k prompt | 24 tok/s (~57 min) | not re-run (see below) |
+
+**Correctness** (the reason this could not be judged on speed alone - the last fast pack was the
+KNOWN-BAD one): needle-in-a-haystack 11,837-token prompt retrieved `ZQ-4471`; third-largest planet
+`Uranus`; Great Red Spot `Jupiter`; 17x23 = `391`; n=4 concurrent smoke 4/4, guard 0.
+
+**Worth telling upstream:** the gate reads as deliberate ("Flash: Maya's set, unchanged"), so this is
+a local divergence - but a pack that is otherwise stock-validated silently loses ~50x on cold prompts.
+Either the gate should be a setting or Flash should get the same i-quant coverage glm-dsa has.

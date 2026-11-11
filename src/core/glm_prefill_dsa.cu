@@ -65,9 +65,11 @@ namespace gf = strata::kernels::glmf;
 bool f16_covers(int type, bool dsa) {
     // Maya v1.1.3's prefill_setup set: BF16 and the dequant_bf16 table
     if (type == gf::kTypeBF16 || strata::kernels::dequant_bf16_supported(type)) return true;
-    if (!dsa) return false;                              // Flash: Maya's set, unchanged (no i-quant)
-    // dequant_f16 (dequant_bf16.cu) also sends the i-quants to iq_dequant_f16: glm-dsa only
+    // dequant_f16 (dequant_bf16.cu) also sends the i-quants to iq_dequant_f16.  That route is not
+    // dsa-only in the code; the gate below kept GLM-5.3-Flash on the token-by-token path for any
+    // i-quant dense weight, which cost a v3q pack 2,370 -> 44 tok/s on a cold prompt (2026-11-11).
     if (type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29) return true;
+    if (!dsa) return false;                              // Flash: Maya's set, unchanged (no i-quant)
     if (built() && ext_f16_type(type)) return true;      // glm-dsa's extra types (glm_prefill_types.hpp)
     static bool told[256] = {};
     if (type >= 0 && type < 256 && !told[type]) {

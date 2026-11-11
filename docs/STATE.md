@@ -406,3 +406,27 @@ request alongside a 900-token one, with the long one still at 21.6 tok/s).
   SIGINT/SIGTERM/SIGBREAK as Ctrl+C, and `AppStopMethodConsole 25000` gives it room); start returns to
   serving.
 - **n=4 smoke through the service**: 4/4 survivors, guard 0.
+
+## 2026-11-11 (later still) - cold-prompt prefill restored: 44 -> ~1,900 tok/s
+
+**Live state:** v1.1.59 + our series **+ one local patch**, running as the `Maya-8080` NSSM service.
+Cold prompt reads are ~**1,900 tok/s** again; `glm prefill: CUDA0 chunks of 65536 tokens` is the
+line to look for (its absence means the prompt path is off).
+
+**The patch:** `src/core/glm_prefill_dsa.cu` - `f16_covers()` now honours the i-quant list (16/17/18/
+21/22/29) **before** the `if (!dsa) return false` gate, so GLM-5.3-Flash can batch-read prompts from
+an i-quant (UD-IQ3_XXS-derived) pack.  `dequant_f16` already handled those types; the gate was policy.
+
+**Why it looked like a mystery:** a cold read of an 82k prompt was 24 tok/s while normal use felt fine,
+because the slot cache serves whole conversations - only the uncached tail is ever read.  The
+`has no prompt path` message was present in logs *before* anyone noticed, including all of yesterday's
+v1.1.57 serving (tail rate measured at 24 tok/s across 222 reads).
+
+**Ruled out by measurement:** `--kv` int8 vs q4_0 vs fp16 (44/48/no-path), the fairness knobs
+(interleave `2048,2` + ablation off still 44 tok/s), the repack alone, and `deq_ok`'s empty-slot test.
+
+**Verified after:** cold 14k prompts 1,822-1,964 tok/s; needle-in-haystack over 11.8k tokens found;
+facts and arithmetic correct; n=4 concurrent smoke 4/4 with guard 0.
+
+**Open:** whether upstream wants this as a setting (the gate is documented as deliberate for Flash).
+The pack is unchanged - no repack was needed.
