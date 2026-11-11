@@ -343,3 +343,66 @@ Models page's save applies them.
 
 **Carried open items:** the audit lane's abandon-on-HEAD behaviour; a verdict accepted from a
 self-stopped run; the counting-loop degeneration the guard cannot match.
+
+## 2026-11-11 (later) - Maya runs as the NSSM service **Maya-8080**; fairness knobs ON
+
+The engine had been started by hand every time (it was down after the 2026-11-11 reboot). It is now a
+Windows service and survives a reboot.
+
+| | |
+|---|---|
+| service | **`Maya-8080`**, `AUTO_START`, runs as **LocalSystem** |
+| application | `G:\AI\maya-eval\project-maya\.venv\Scripts\python.exe` |
+| parameters | `maya.py --config maya-v3q-q4-par4.json --port 8080 --host 0.0.0.0` |
+| directory | `G:\AI\maya-eval\project-maya` |
+| logs | `logs\maya-8080.out.log` / `.err.log` (rotating, 10 MB) |
+| installer | **`tools/install_maya_service.ps1`** - idempotent; stops a hand-started instance, reinstalls, starts, waits for the port |
+| `llama-server8080` | left **`DEMAND_START`** (the llama.cpp fork's fallback); it does not race for 8080 at boot |
+
+Elevation: `sc`/`nssm` need admin, which the tool shell does not have - `ssh agips@localhost` does get
+an admin token (verified by creating and deleting a probe service). Example:
+
+```powershell
+ssh agips@localhost "powershell -NoProfile -ExecutionPolicy Bypass -File G:\AI\maya-eval\project-maya\tools\install_maya_service.ps1"
+```
+
+### The trap that costs an hour if it is met cold
+
+The engine loads **`cublas64_13.dll` from `CUDA\v13.4\bin\x64`**, which is *not* on a LocalSystem
+service's `PATH` (a user shell has it, which is why running `maya.py` by hand always worked). Without
+it the engine exits before serving. The service's `AppEnvironmentExtra` therefore carries `PATH`
+(found by the installer, not hardcoded) plus `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HOME`/`TEMP`, so
+calibration and caches resolve exactly as they did from a shell.
+
+### Fairness - enabled and measured
+
+| knob | where | value |
+|---|---|---|
+| `MAYA_FAIR_SLICE_S` | **service environment** (the *server* reads it; the config's `env` reaches only the engine child) | **20** |
+| `MAYA_GLM_PREFILL_INTERLEAVE` | config `env` (engine) | **2048,2** |
+| `MAYA_GLM_PREFILL_GAPS` | - | **not applicable**: needs `MAYA_GLM_SPLIT_ROWS`, and this is one GPU |
+
+**Measured, saturated** (4 rows busy, a 16-token request arriving at t=6 s):
+
+```
+short   17.0s  tokens=11      <- admitted at the 20 s slice boundary
+long0   87.8s  tokens=700
+long1   87.4s  long2 87.4s  long3 87.4s
+```
+
+So the queued request finished in **17 s instead of waiting ~81 s**, and the four long answers still
+completed. Under *light* load there is nothing to slice: `--parallel 4` plus the rotor decodes two
+answers in the same pass, so a second request is served concurrently (measured 2.5 s for a short
+request alongside a 900-token one, with the long one still at 21.6 tok/s).
+
+### Verified end to end
+
+- service `RUNNING`, listening after ~65 s (the usual engine start), engine is a descendant of the
+  service's python (`sc start` -> python -> maya.py -> server -> maya.exe).
+- real request answered; `/api/models` reports `settings.ablate: true`.
+- engine log: `MAYA_GLM_PREFILL_INTERLEAVE=2048,2` in its settings line; `[engine env]` line shows
+  `MAYA_FAIR_SLICE_S=20`; abliteration line present.
+- **stop/start**: stop leaves **0** `maya.exe`, 0 server processes, port free in ~5 s (maya.py treats
+  SIGINT/SIGTERM/SIGBREAK as Ctrl+C, and `AppStopMethodConsole 25000` gives it room); start returns to
+  serving.
+- **n=4 smoke through the service**: 4/4 survivors, guard 0.
