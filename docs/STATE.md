@@ -430,3 +430,37 @@ facts and arithmetic correct; n=4 concurrent smoke 4/4 with guard 0.
 
 **Open:** whether upstream wants this as a setting (the gate is documented as deliberate for Flash).
 The pack is unchanged - no repack was needed.
+
+## 2026-11-11 - HOLDING at v1.1.59 + the prompt-path patch (do not "just update" past it)
+
+Decision: stay on **v1.1.59-164-g1ab407a** (`deployed/v1.1.59-promptpath-20261111-1702`) and wait for
+upstream to fix the i-quant gate rather than carry a divergence into the next release.
+
+**Why not v1.1.60:** its headline fix ("GLM-5.3-Flash decodes faster again ... back to v1.1.56's
+speed") is the **HIP routing-ring size** (`glm_fast_path.cu` + `glm_fast.hpp`, `#if STRATA_USE_HIP`) -
+a ~0.8% *decode* change on AMD APUs, a no-op on this NVIDIA box.  `src/core/glm_prefill_dsa.cu` is
+**untouched** in v1.1.60, so the gate is still there:
+
+```
+v1.1.60:src/core/glm_prefill_dsa.cu:68   if (!dsa) return false;   // Flash: Maya's set, unchanged (no i-quant)
+```
+
+**Upgrading blindly loses ~50x on cold prompts** (44 tok/s instead of ~1,900).  When a new tag appears,
+check this first, before merging:
+
+```powershell
+git fetch origin --tags
+git show "v1.1.61:src/core/glm_prefill_dsa.cu" | Select-String 'if \(!dsa\) return false'
+```
+
+- **Gate gone, or the i-quant list moved above it** -> upstream fixed it: merge, drop our 4-line patch,
+  and confirm `glm prefill: CUDA0 chunks of 65536 tokens` in the startup log plus a cold read ~1,900 tok/s.
+- **Gate still present** -> keep the patch through the merge (it is 4 lines in `f16_covers()`; the
+  conflict, if any, is trivial).
+
+**The tell, always:** `chunks of N tokens (--prefill ...)` = batched prompt path live.
+`has no prompt path (not covered: ...)` = every prompt is being read token by token, and the slot
+cache will hide it until a conversation is cold.
+
+**Live config:** `--kv int8`, `ablate.default true`, `MAYA_GLM_PREFILL_INTERLEAVE=2048,2`,
+`MAYA_FAIR_SLICE_S=20` (service env), service `Maya-8080`.
