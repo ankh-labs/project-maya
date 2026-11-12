@@ -464,3 +464,10 @@ cache will hide it until a conversation is cold.
 
 **Live config:** `--kv int8`, `ablate.default true`, `MAYA_GLM_PREFILL_INTERLEAVE=2048,2`,
 `MAYA_FAIR_SLICE_S=20` (service env), service `Maya-8080`.
+
+### Tag watch log (append a line per release; the check is \git show "<tag>:src/core/glm_prefill_dsa.cu" | Select-String 'if \(!dsa\) return false'\)
+
+| tag | date | touches GLM? | gate at line 68 | verdict |
+|---|---|---|---|---|
+| v1.1.60 | 2026-11-11 | no (HIP routing-ring size only, #if STRATA_USE_HIP) | present | hold |
+| v1.1.61 | 2026-11-12 | **none** (30 files, zero glm*) | present | hold - DeepSeek/AMD/MiniMax only; \ast_prefill\ is \DS4_KEYS\-only (\DS4_YOCO_CONE\) |
