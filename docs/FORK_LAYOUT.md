@@ -736,3 +736,47 @@ KNOWN-BAD one): needle-in-a-haystack 11,837-token prompt retrieved `ZQ-4471`; th
 **Worth telling upstream:** the gate reads as deliberate ("Flash: Maya's set, unchanged"), so this is
 a local divergence - but a pack that is otherwise stock-validated silently loses ~50x on cold prompts.
 Either the gate should be a setting or Flash should get the same i-quant coverage glm-dsa has.
+
+## 2026-11-15 - v1.1.64 merged; upstream still gates Flash's i-quants, so our 4-line patch stays
+
+**Branch `feat/v1164-from-good`**, merge commit **`17bdbc8`**, VERSION 1.1.64. Upstream 61->64 is the
+AMD Strix/Gorgon Halo APU + NVIDIA **helper-GPU pairing** (a new `glm_helper_link.cpp` /
+`glm_helper_server.cpp`), EXL3 on the pair, and DeepSeek fixes.
+
+### Reviewed for our v3q issue first - not fixed
+
+`v1.1.64:src/core/glm_prefill_dsa.cu:68` still reads
+`if (!dsa) return false;  // Flash: Maya's set, unchanged (no i-quant)`.  The release notes' "GLM-5.3-Flash
+prefills up to 3x faster" is the APU+helper pair, not the i-quant prompt path.  Our `f16_covers()` change
+survived the auto-merge (the i-quant list sits above the gate); the gate itself is what upstream has yet
+to lift.
+
+### Conflicts: 4 files, 5 hunks - every one "both sides matter"
+
+| hunk | resolution |
+|---|---|
+| `.gitignore` | both: our watchdog dumps + pipe-arm file, their `/data/glm-link-cpu-cal.txt` |
+| `include/strata/kernels/glm_fast.hpp` | both: our `need_seq` + `hseq` (host-ordered routes) **and** their `ring_n`/`ring_stride` |
+| `serve/server.py` | their `fast_prefill` -> `DS4_YOCO_CONE` **first**, then our `[engine env]` print, so the print includes the new key |
+| `src/kernels/cuda/glm_fast.cu` x2 | **our host-ordered seq INSIDE their `ring_entry()`** |
+
+The `glm_fast.cu` pair is the one that would have been silently wrong: ours indexed with
+`(hseq ? hseq : *a.d.seq + 1) % kRingSize`, theirs uses `ring_entry(..., ring_n, ring_stride)`, which masks
+with `seq & (n - 1)`.  Keeping either side alone loses something - `% kRingSize` is wrong when the ring is
+smaller than kRingSize (the APU pair), and dropping `hseq` reintroduces the shared-counter race the rotor
+fixed (2026-10-30).  Resolution keeps the host seq **and** routes the index through `ring_entry`.
+
+### Gates
+
+| gate | result |
+|---|---|
+| invariants before / after | **PASS 15/15 / 15/15** |
+| conflicts | 4 files, 5 hunks, resolved by intent |
+| build | clean |
+| prompt path | **on** - `chunks of 65536 tokens` |
+| cold 14k prompt | **1,859 tok/s** (was 44 without the patch) |
+| correctness | needle `ZQ-4471` in 11.8k, Uranus/Jupiter/hexagon/391 |
+| n=4 concurrent smoke | **4/4**, guard 0 |
+| ablation | `settings.ablate: true` |
+
+Divergences re-checked present after the merge: `admit_row0`, `pipe_scratch`, `hseq`, `MAYA_GLM_LAYER_PIPE`.

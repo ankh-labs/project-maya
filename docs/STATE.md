@@ -471,3 +471,23 @@ cache will hide it until a conversation is cold.
 |---|---|---|---|---|
 | v1.1.60 | 2026-11-11 | no (HIP routing-ring size only, #if STRATA_USE_HIP) | present | hold |
 | v1.1.61 | 2026-11-12 | **none** (30 files, zero glm*) | present | hold - DeepSeek/AMD/MiniMax only; \ast_prefill\ is \DS4_KEYS\-only (\DS4_YOCO_CONE\) |
+
+## 2026-11-15 - v1.1.64 MERGED AND DEPLOYED (i-quant patch still required)
+
+**Live:** v1.1.64 + our series, merge `17bdbc8` on `feat/v1164-from-good`, tag
+`deployed/v1.1.64-20261115-20261115-1253`.  Service `Maya-8080`, `--kv int8`, ablation on,
+`PREFILL_INTERLEAVE=2048,2`, `FAIR_SLICE_S=20`.
+
+**The v3q question:** v1.1.62/63/64 do **not** lift the i-quant gate
+(`glm_prefill_dsa.cu:68` `if (!dsa) return false`).  Their prefill speed-ups are the APU + NVIDIA
+helper pairing.  Our 4-line `f16_covers()` patch is still needed and still in place; cold 14k prompts are
+**1,859 tok/s** (vs 44 without it).
+
+**Merge hazards worth remembering:** the `glm_fast.cu` hunks had to keep *both* our host-ordered `seq`
+(`hseq`) and upstream's `ring_entry(ring, seq, ring_n, ring_stride)` - the mask must come from `ring_n`,
+because the ring is smaller than `kRingSize` on the APU pair, and dropping `hseq` would bring back the
+shared-counter race.  `server.py` needed upstream's `fast_prefill` applied *before* our `[engine env]`
+print, or the print would omit a key it claims to show.
+
+**Gates:** invariants 15/15 before and after; build clean; prompt path on; needle/facts/arithmetic correct;
+n=4 4/4 with guard 0.
