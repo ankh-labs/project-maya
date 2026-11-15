@@ -12,6 +12,7 @@
 // parameters are F32.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "strata/kernels/glm_lat_types.hpp"   // record types + byte counts (shared with the model)
@@ -333,6 +334,9 @@ struct MoeDev {
     // the service consumes strictly in seq order - a device spinning for a later answer and a service waiting for an
     // earlier entry that was queued behind that spinner.  Host order == the order the service consumes, by construction.
     unsigned int hseq = 0;
+    // the routing ring's shape (ring_entry below): ring_n entries (a power of two) of ring_stride bytes; 0, 0: kRingSize
+    // entries of sizeof(MoeRequest)
+    unsigned int ring_n = 0, ring_stride = 0;
 };
 /// The widest residual the host-mapped routing structs below carry (glm5-next 4096, glm-dsa 6144).
 constexpr int kMaxEmbd = 8192;
@@ -382,6 +386,27 @@ struct MoeRequest {
                                  //     offsetof(x) must stay 8-aligned - so ch lives HERE, not before x)
     float x[kMaxEmbd];               // the FFN input, written only when cpu_mask != 0
 };
+/// A ring sized from the model (fast_setup on HIP): each entry MoeRequest's fields + n_embd floats of x (rounded up to
+/// its alignment), as many entries as a decode round routes (every layer once + a verify window's drafts) as a power of
+/// two, kRingMinEntries (v1.1.56's 64) .. kRingSize.  The device writes every route's x to its entry: on the gfx1151
+/// APU the full 256 x 8192-float ring (8.4 MB host-mapped) made GLM-5.3-Flash's drafting decode ~0.8 % slower than
+/// its own 64 x 4096 floats (1 MB).
+constexpr unsigned int kRingMinEntries = 64;
+constexpr unsigned int ring_stride_for(int n_embd) {
+    return (unsigned int) ((offsetof(MoeRequest, x) + (size_t) n_embd * sizeof(float) + alignof(MoeRequest) - 1) /
+                           alignof(MoeRequest) * alignof(MoeRequest));
+}
+constexpr unsigned int ring_entries_for(int routes) {
+    unsigned int n = kRingMinEntries;
+    while (n < (unsigned int) routes && n < (unsigned int) kRingSize) n *= 2u;
+    return n;
+}
+/// Ring entry `seq`: n entries (a power of two) of `stride` bytes (0, 0: kRingSize entries of sizeof(MoeRequest)).
+__host__ __device__ inline MoeRequest* ring_entry(void* ring, unsigned int seq, unsigned int n, unsigned int stride) {
+    if (n == 0u) n = (unsigned int) kRingSize;
+    if (stride == 0u) stride = (unsigned int) sizeof(MoeRequest);
+    return (MoeRequest*) ((char*) ring + (size_t) (seq & (n - 1u)) * stride);
+}
 /// The host's answer to a request with misses.
 struct MoeResponse {
     volatile unsigned int seq;

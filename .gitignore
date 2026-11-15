@@ -64,3 +64,4 @@ build-vision.bat
 
 # runtime pipe-arm switch (read every 200 ms; never source)
 strata-pipe-arm.txt
+/data/glm-link-cpu-cal.txt

@@ -700,6 +700,9 @@ public:
     // a batched verify window's layer on both window lanes, each distinct expert read once (glm_fast_path.cu)
     void win_cpu_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
                         strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
+    // ... the same window on a linked helper (MAYA_GLM_LINK_WIN): one call for its helper experts (glm_fast_path.cu)
+    void win_helper_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
+                           strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half
     int mtp_src_ = -1;                                     // the shard of MAYA_GLM_MTP_GGUF's block, -1: the model's
@@ -1076,6 +1079,13 @@ public:
     bool dflash_load(const std::string& path, int dev, std::string& err);
     bool dflash_bind(std::string& err);                    // after the parts loaded: the captures wired
     void dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s);
+    /// a layer of this part is one the drafter reads (its token pass then copies rows out: no replayed graph)
+    bool dflash_captures_here() const {
+        if (cap_d_ == nullptr) return false;
+        for (int il = l0_; il < l1_ && il < (int) cap_k_.size(); ++il)
+            if (cap_k_[(size_t) il] >= 0) return true;
+        return false;
+    }
     bool dflash_ready() const;
     void dflash_reset();
     /// The DFlash decode (Strata's serial speculative loop with a block drafter): each round the drafter's block for
