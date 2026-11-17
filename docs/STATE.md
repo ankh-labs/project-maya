@@ -491,3 +491,26 @@ print, or the print would omit a key it claims to show.
 
 **Gates:** invariants 15/15 before and after; build clean; prompt path on; needle/facts/arithmetic correct;
 n=4 4/4 with guard 0.
+
+## 2026-11-17 - v1.1.66 MERGED AND DEPLOYED (i-quant patch still required)
+
+**Live:** v1.1.66 + our series, merge `1560010` on `feat/v1166-from-good`, tag
+`deployed/v1.1.66-20261117-1439`.  Service `Maya-8080`, `--kv int8`, ablation on,
+`PREFILL_INTERLEAVE=2048,2`, `FAIR_SLICE_S=20`.
+
+**v1.1.65/66 do not lift the gate** (`glm_prefill_dsa.cu:68` unchanged).  Cold 14k prompts: **1,906 tok/s**;
+needle/facts/arithmetic correct; n=4 4/4 with no engine errors.
+
+**Merge hazard worth remembering (new):** upstream's `F->md.resp = dp;` in the `wait_diag` hunk must
+**not** be taken as-is - in our allocation order `dp` is the channel-seq buffer at that point, so it would
+point the routing response at the wrong memory.  Our `need_seq` stays, their `wait_diag` is added without
+that line.
+
+**Open items this release does not fix:**
+- `glm router: layer 12 decode NON-FINITE SCORE (arithmetic)` - two requests, 2026-11-16 12:06, ~2.1k-token
+  prompts with thinking.  Not reproduced since; candidates are the known upstream #267/#860 class or the
+  i-quant prompt path our patch enables.  v1.1.66's GLM additions (`MAYA_GLM_PREFILL_CHECK`,
+  `MAYA_GLM_STALL_S`) are diagnostics that would help localise it next time.
+- **CT 118 (`llama-server-3090`)** still runs its own build (v1.1.61-era) of the hand-built DavidAU Qwen
+  pack; it is a `nohup` process with no unit, and its engine keeps self-stopping on
+  `no progress for 60 s during a request (reading the prompt)` - raise `MAYA_WATCHDOG_S` there.

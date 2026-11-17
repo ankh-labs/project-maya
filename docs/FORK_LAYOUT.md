@@ -780,3 +780,43 @@ fixed (2026-10-30).  Resolution keeps the host seq **and** routes the index thro
 | ablation | `settings.ablate: true` |
 
 Divergences re-checked present after the merge: `admit_row0`, `pipe_scratch`, `hseq`, `MAYA_GLM_LAYER_PIPE`.
+
+## 2026-11-17 - v1.1.65 + v1.1.66 merged; the i-quant gate is still upstream's
+
+**Branch `feat/v1166-from-good`**, merge **`1560010`**, VERSION 1.1.66.  v1.1.65 was a stability release
+(AMD/Windows startup, clearer engine-failure errors, a `MAYA_GLM_STALL_S` stall report); v1.1.66 adds
+~19% GLM decode on the APU+NVIDIA pair, DeepSeek side-by-side sizes, and the idle-sleep settings.
+
+### Checked first, as usual
+
+- `v1.1.66:src/core/glm_prefill_dsa.cu:68` still reads `if (!dsa) return false;  // Flash: Maya's set,
+  unchanged (no i-quant)` - **our 4-line patch is still required**, and again survived the auto-merge.
+- The two new GLM items are **diagnostics**, not fixes: `MAYA_GLM_PREFILL_CHECK=1` (names the GPU and
+  layer of a prompt fault) and `MAYA_GLM_STALL_S` (reports where a drafting step is stuck).  Neither
+  addresses the `glm router: layer 12 decode NON-FINITE SCORE` seen on ag-desktop on 2026-11-16.
+
+### Conflicts: 2 files, 3 hunks - two traps
+
+| hunk | resolution |
+|---|---|
+| `glm_fast_path.cu` alloc | ours (`F->md.need_seq`) **plus** their `wait_diag` pinned buffer - but **without** their `F->md.resp = dp;` |
+| `glm_fast_path.cu` free | ours (`need_seq_h`, `route_err_d`) **plus** their `wait_diag_h`; their own `route_err_d` free is a duplicate and was dropped |
+| `glm_fast.cu` wait loop | our host-ordered predicate `while (*moe_wseq(d) == s_need)` **with** their `wait_gave_up(d.wait_diag, 5u, s_need, 0u)` on the give-up branch |
+
+**The `resp` trap:** at that point in *our* ordering `dp` has been reassigned to the 64-byte channel-seq
+buffer (`hp`), because the response buffer (`resp8`) is allocated earlier and `F->md.resp` already set
+from it.  Taking their `F->md.resp = dp;` verbatim would point the routing response at the seq words -
+a silent corruption of every routed answer.  This is the kind of hunk that compiles and runs.
+
+### Gates
+
+| gate | result |
+|---|---|
+| invariants before / after | **PASS 15/15 / 15/15** |
+| conflicts | 2 files, 3 hunks, resolved by intent |
+| build | clean |
+| prompt path | **on** - `chunks of 65536 tokens` |
+| cold 14k prompt | **1,906 tok/s** |
+| correctness | needle `ZQ-4471` in 11.9k, Uranus/Jupiter/hexagon/391 |
+| n=4 concurrent smoke | **4/4**, no engine errors, no router non-finite |
+| ablation | `settings.ablate: true` |
