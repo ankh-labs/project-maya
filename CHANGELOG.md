@@ -4,6 +4,44 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.66 - 2026-11-17
+
+GLM decodes about 19% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
+
+- **Faster GLM decode on the AMD APU + NVIDIA GPU pair:** about +19% decode with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S). The NVIDIA card reads each weight once per layer instead of twice while it checks drafted tokens, and the pair exchanges a whole layer of that check in one call instead of one call per token. Maya times both ways on your PC during the first answers and keeps the faster one, and it only makes that choice where both ways give the same answers (every expert in VRAM or on the helper GPU); everywhere else it keeps the order used so far. Every answer is bit for bit the same as before.
+- **Fix: two DeepSeek sizes side by side:** setting up a second DeepSeek size (for example Maya-S beside Maya-XS) replaced the first one's config, so the Models page showed only one of them and listed the other's files under "Files no model uses". Each size now gets its own config and both stay on the Models page. If you already hit this: after updating, click Download once on the missing size - Maya finds its files complete, downloads nothing again and only writes its config.
+- **DeepSeek: the drafter's experts count in the expert profile (#501, @noonghunna):** experts used by DeepSeek's drafter were never counted, so they were placed wherever room was left, and VRAM could stay unused on a second GPU. They are now counted like all the others. The profile fills in as you use the model: once a start uses the new profile, which experts sit in VRAM can change, and with that DeepSeek's answers can differ slightly from v1.1.65.
+- **Idle CPU use: the idle sleeps are settings (#951, @vbooka1):** how long an idle engine sleeps between looks for work can now be set at run time: `MAYA_GLM_SERVICE_NAP_US` and `MAYA_GLM_SERVICE_SLEEP_MS` for GLM, `MAYA_DS4_SERVICE_NAP_US` and `MAYA_DS4_SERVICE_SLEEP_MS` for DeepSeek. Longer sleeps lower the CPU use of a waiting server; the first token after a pause can wait up to one sleep. The defaults are the lengths used so far, so nothing changes unless you set one (docs/SETTINGS.md).
+- **Finding a GLM prompt fault on many GPUs (#1004, @GravelRashNZ):** when a GPU fault stops GLM while it reads a prompt, the error now names the GPU and the layer. `MAYA_GLM_PREFILL_CHECK=1` (off by default, a diagnostic that slows prompts down) also names the step that failed. It only reports.
+- **Community fixes:**
+  - Web chat: Enter that confirms a Japanese or Chinese input conversion in Safari no longer sends the message (#927, @takahiro-blab).
+  - Setup: the vision files of a DeepSeek GGUF placed directly in the models folder stay inside that folder (#973, fixes #972, @mercant1982).
+  - Setup: AMD cards count in the model recommendation, and a card reporting 19.98 GB is treated as a 20 GB card (#923, @Mqrius).
+  - DeepSeek: stopping an answer during a shared start no longer disturbs the next request (#906, @markrussi).
+  - Server: `MAYA_PAR_MAX` caps a config's `--parallel` before the engine starts, opt-in (#880, @pietroMastro92).
+  - DeepSeek EXL3: `tools/ds4/reorder.py` reorders third-party shards into the order Maya reads fastest (#929, @gopinath87607).
+  - Docs: uneven GGUF splitting over PCIe can make prompt reading much slower (#940, @mercant1982).
+  - Tests: one test no longer leaves a global setting changed (#982, @mercant1982).
+- **README:** new speed rows from community reports (#938 @oscarlius, #978 @wairentiun, #997 @atollerus-tm, #999 @kai-r, #1005 @Andrey0710) and bench results for `--parallel` on three V100s (#989, @noahark), in all four languages.
+
+## v1.1.65 - 2026-11-16
+
+A stability release: fixes for start-up and loading failures on AMD and Windows, a steadier AMD + NVIDIA pairing, clearer errors when the engine fails, and a test suite where a red test always means something.
+
+- **Fix: GLM on two 16 GB AMD cards found no room for the experts (#899, @bob-u):** on Linux with AMD GPUs, the free VRAM read right after Maya's budget check could still count the checked memory as used, so the expert pool got 0 slots and the engine stopped at start. Maya now waits until the freed memory reads as free again (`MAYA_GLM_POOL_CHECK_WAIT_MS`, Linux HIP only). The automatic layer split works again; the manual split is no longer needed.
+- **Fix: DeepSeek on Windows with several NVIDIA GPUs failed with "0 MiB free" (#794, @wolfwoof88, @benjaminfphillips and @KuroNekoMaid):** pinning the RAM copy of the experts could leave every GPU without usable VRAM on Windows. Maya now reads each GPU's free VRAM before and after the pin, and undoes the pin by itself when it leaves a GPU nearly empty, so `DS4_COPY_PIN=0` is no longer needed. When the free VRAM cannot be read, the load line now says why instead of "0 MiB free".
+- **Steadier AMD + NVIDIA pairing:** the APU side now imports the shared expert memory in a way the AMD driver does not track, so Linux moving memory around no longer pauses it for seconds at a time. GLM-5.3 (744B) still starts on the APU alone unless you use `--mixed-gpus on`.
+- **The same answers on every install of the AMD + NVIDIA pairing:** how the pair splits prompt work between the CPU and the GPUs no longer depends on a few percent of difference in each build's measured CPU timing, so two installs of the same model on the same GPUs give the same answers (`MAYA_GLM_LANE_STEPS=0` restores the old behaviour). EXL3 answers on the pair can differ slightly from v1.1.64.
+- **Clearer errors when the engine fails (#827, @anbow1):** an answer the engine stops because of a GPU fault is now reported as an error, not as "length". Streamed answers keep the text already sent and end with the API's own error event; other requests get HTTP 422 with type `engine_error` (not retried automatically by the OpenAI and Anthropic SDKs), the reason, the position and the partial text. The console line now names the failed step, the position and the context size.
+- **Finding a GLM drafting stall (#860, @githug2024):** if one drafting step takes longer than 20 s, the log now prints a `glm stall:` line saying where each GPU is stuck (`MAYA_GLM_STALL_S`). It only reports.
+- **Smaller fixes:**
+  - The "use a smaller `--vram-reserve-mib`" hint now only appears when it can help, and says that setting the reserve by hand turns off its automatic shrinking.
+  - The help says which flags a start of an existing config ignores.
+  - A speed calibration you ask for by name now runs when a GPU only holds a display's memory, with a warning; it still refuses while another Maya model is loaded.
+  - AMD install docs: what to do when Ubuntu's rocWMMA package lacks headers.
+  - `strata-device` accepts GPUs from compute capability 6.0, like the rest of Maya.
+- **Tests:** every known failing or flaky test now has its cause fixed: tests that need model files skip with the reason instead of failing, slow GPU tests are 5-8 times faster, tests that clashed in parallel runs no longer do, and the Windows and `nohup` runs pass.
+
 ## v1.1.64 - 2026-11-15
 
 EXL3 models now pair an AMD Strix Halo or Gorgon Halo APU with an NVIDIA GPU too, GLM-5.3-Flash EXL3 prefills up to 2.5 times faster on the pair, and DeepSeek on several GPUs decodes as fast as before v1.1.58 again.
