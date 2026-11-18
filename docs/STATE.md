@@ -514,3 +514,32 @@ that line.
 - **CT 118 (`llama-server-3090`)** still runs its own build (v1.1.61-era) of the hand-built DavidAU Qwen
   pack; it is a `nohup` process with no unit, and its engine keeps self-stopping on
   `no progress for 60 s during a request (reading the prompt)` - raise `MAYA_WATCHDOG_S` there.
+
+## 2026-11-17 - MCP tools on ag-desktop: DuckDuckGo search + the official fetch server
+
+**Config** (`maya-v3q-q4-par4.json`, gitignored - this note is the record):
+
+```json
+"mcp_servers": {
+  "search": { "command": "C:\\\\Users\\\\agips\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\uvx.exe",
+              "args": ["duckduckgo-mcp-server"] },
+  "fetch":  { "command": "C:\\\\Users\\\\agips\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\uvx.exe",
+              "args": ["mcp-server-fetch"] }
+},
+"mcp": { "start_timeout_s": 90, "timeout_s": 60, "max_rounds": 6 }
+```
+
+- **Absolute `uvx.exe` is required**: the service runs as LocalSystem with a PATH of CUDA + Windows
+  dirs only, so a bare `uvx` is not found.  `npx` is a `.ps1` shim here and cannot be exec'd by the
+  stdio transport either - use `uvx` (a real exe) for Python servers.
+- **Enable per request**, not in the config: `"strata_mcp": true` in the chat body (the page's
+  "Let the model use MCP tools" toggle).  `serve/mcp.py`'s `use_mcp` is that flag plus a configured hub.
+- **Cost**: 4 tool schemas ~= **2,007 prompt tokens** on a 40-token question (8 tools were 4,152).
+  `max_result_chars` truncates tool output (a DDG search returned 4,273 chars).
+- **Above DDG**: Exa (`https://mcp.exa.ai/mcp`) and Context7 (`https://mcp.context7.com/mcp`) both work
+  **without an API key** (verified with `python -m serve.mcp` - 2 tools each), but were trimmed: with all
+  four configured the model chose `search__search` (DDG) anyway, so Exa was dead weight.
+- **Test recipe**: `python -m serve.mcp <cfg.json>` lists each server's status, protocol and tools; a
+  non-streaming request with `strata_mcp: true` exercises the whole loop.
+- **Restarting the service**: `sc stop` then **wait for STATE STOPPED** before `sc start` - issuing the
+  start during STOP_PENDING silently leaves it stopped (it cost a serving outage on 2026-11-17).
