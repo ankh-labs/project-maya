@@ -543,3 +543,26 @@ that line.
   non-streaming request with `strata_mcp: true` exercises the whole loop.
 - **Restarting the service**: `sc stop` then **wait for STATE STOPPED** before `sc start` - issuing the
   start during STOP_PENDING silently leaves it stopped (it cost a serving outage on 2026-11-17).
+
+## 2026-11-19 - docs/UPGRADE_PLAYBOOK.md: the per-upgrade relearning, written down
+
+Created **`docs/UPGRADE_PLAYBOOK.md`** because every release costs the same session again. It holds:
+the patch table (what each of our 8 patches buys, how to verify it survived, and the symptom when it
+does not), the KV-mode trap, the known upstream bugs, the ordered upgrade procedure with measured
+expected numbers, and the recurring conflict patterns with their resolutions.
+
+**The finding that should stop the repeat cycle:** `--kv q4_0` on GLM is **silently fp16**.
+`generate.cpp:5433` sets `qsa_set_kv_q4` for the Qwen path only; `glm_model.cu:3563` chooses the
+latent from `MAYA_GLM_KV_INT8` alone, so GLM has int8 or fp16 and nothing else.  Our stage-B q4_0
+code is still in the tree (`LatType::q4_0`, `glm_lat4.cuh`, `fwht512`, `lat4_rec_bytes`) but
+nothing selects it - which is why "q4_0 works great once patched" has not been true since v1.1.57.
+
+**Measured on v1.1.66, 8 short requests each:** int8 **0/8 failures** with the prompt path at
+**1,841 tok/s**; fp16 **5/8 failures** with the prompt path off (non-finite decode at random layers).
+So fp16 is not a candidate and the fp16 "fix" for long prompts was a false dawn.
+
+**Also recorded:** a cold benchmark straight after a restart reads ~390 tok/s because the expert cache
+is empty - run it twice before believing a prefill regression. And `pkill -f "maya.py --config ..."`
+matches the SSH command line itself; put it in a script.
+
+Upstream is now at **v1.1.67 / v1.1.68**; the tree is on v1.1.66 + our series.
