@@ -6946,7 +6946,7 @@ void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_hea
 }
 
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
+                int kv_lora, float* ctx, cudaStream_t s, int lat_q8) {
     if (kv_lora % 32 != 0 || getenv("MAYA_GLM_MLA1") != nullptr) return false;
     return mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
 }
@@ -7001,7 +7001,7 @@ static bool mla_mma_on(int dev) {
 
 bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                      cudaStream_t s, bool lat_q8) {
+                      cudaStream_t s, int lat_q8) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 16 || kv_lora != MLA_KV || T < 1 || getenv("MAYA_GLM_MLA1") != nullptr ||
@@ -7035,7 +7035,7 @@ bool mla_rows_ok(int kv_lora) {
 
 bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                     float* part, int part_tokens, cudaStream_t s, bool lat_q8) {
+                     float* part, int part_tokens, cudaStream_t s, int lat_q8) {
     if (T < 1 || part == nullptr || part_tokens < 1 || !mla_rows_ok(kv_lora)) return false;
     if (lat_q8 == 2) {   // the latents are stored rotated (glm_lat4.cuh): rotate the absorbed queries the same
                          // way, in place - token i's q_abs sits at q_abs + i * q_stride (dense n_head rows within)

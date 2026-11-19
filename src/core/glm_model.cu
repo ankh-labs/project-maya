@@ -914,7 +914,8 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
     if (ls.empty()) return nullptr;
     auto* K = new KvStream();
     K->page = g_.idx_kpool;
-    K->row_bytes = lat_q8_ ? strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
+    K->row_bytes = lat_q8_ == 2 ? strata::kernels::glmf::lat4_rec_bytes(g_.kv_lora)
+                    : lat_q8_ == 1 ? strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
     K->slots = cells / K->page;
     K->n_blocks = (ctx + K->page - 1) / K->page;
     const auto fail = [&](const std::string& e) {
@@ -3560,23 +3561,32 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const int64_t max_pools = max_ctx / g_.idx_kpool;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (MAYA_GLM_SLOW) keeps F32
-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("MAYA_GLM_KV_INT8") != nullptr &&
-              std::atoi(getenv("MAYA_GLM_KV_INT8")) != 0;
+    // (0 fp16 / 1 int8 / 2 q4_0): --kv q4_0 sets MAYA_GLM_KV_Q4 (our stage B; generate.cpp sets both names),
+    // and q4_0 wins over int8 when both are present.
+    const bool kv_ok = fast_mode_ && g_.kv_lora % 32 == 0;
+    const char* kv_q4_env = std::getenv("MAYA_GLM_KV_Q4");
+    const char* kv_int_env = std::getenv("MAYA_GLM_KV_INT8");
+    const bool want_q4 = kv_ok && kv_q4_env != nullptr && std::atoi(kv_q4_env) != 0;
+    const bool want_int8 = kv_ok && kv_int_env != nullptr && std::atoi(kv_int_env) != 0;
+    lat_q8_ = want_q4 ? 2 : want_int8 ? 1 : 0;
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
     const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
-    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
-                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
-                                            : (int64_t) g_.kv_lora * lat_rows;
-    if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
+    const int64_t lat_floats = lat_q8_ == 2  ? (int64_t) strata::kernels::glmf::lat4_rec_bytes(g_.kv_lora) / 4 * lat_rows
+                               : lat_q8_ == 1 ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
+                               : fast_mode_   ? (int64_t) g_.kv_lora * lat_rows / 2
+                               : (int64_t) g_.kv_lora * lat_rows;
+    if (lat_q8_ == 2) std::fprintf(stderr, "glm pack: CUDA%d latent cache q4_0 (%d bytes a position and layer)\n", dev_,
+                              strata::kernels::glmf::lat4_rec_bytes(g_.kv_lora));
+    else if (lat_q8_ == 1) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it, placed first)
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position).  glm-dsa B4.1: the
     // layout descriptor carves it (glm-dsa: latent + k_pe, index keys on the full layers, no ring or pools).
-    if (!state_carve(max_ctx, lat_q8_ ? GlmStateMode::Int8 : fast_mode_ ? GlmStateMode::Fp16 : GlmStateMode::SlowF32,
+    if (!state_carve(max_ctx, lat_q8_ == 2 ? GlmStateMode::Q4 : lat_q8_ == 1 ? GlmStateMode::Int8 : fast_mode_ ? GlmStateMode::Fp16 : GlmStateMode::SlowF32,
                      fast_mode_ ? glm_state_fast_ik_ring(max_ctx) : (int) max_ctx, mtp_il_, err, lat_rows))
         return false;
     if (lay_.glm_dsa()) std::fprintf(stderr, "glm pack: CUDA%d %s\n", dev_, lay_.describe().c_str());

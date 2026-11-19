@@ -566,3 +566,20 @@ is empty - run it twice before believing a prefill regression. And `pkill -f "ma
 matches the SSH command line itself; put it in a script.
 
 Upstream is now at **v1.1.67 / v1.1.68**; the tree is on v1.1.66 + our series.
+
+## 2026-11-19 - v1.1.68 + q4_0 restored: prefill 1,900 tok/s, decode 23-30, no non-finite
+
+**Live:** v1.1.68 + our series, merge `9f998f6b`, `--kv q4_0`, prompt path on, tag
+`deployed/v1.1.68-q4-20261119-1630`.
+
+**The KV mode is q4_0 again** (`latent cache q4_0 (288 bytes a position and layer)`). The selector my
+v1.1.59 merge deleted is restored as a tri-state (`int lat_q8_`: 0 fp16 / 1 int8 / 2 q4_0) with
+`MAYA_GLM_KV_Q4` from `--kv q4_0`. See `docs/UPGRADE_PLAYBOOK.md` §3 for the site list.
+
+**Measured:** cold prefill 1,772 / 1,902 tok/s (two runs - the first warms the expert cache; a single cold
+number of ~390 is not a regression). Decode 23.3 -> 30.0 tok/s on 200 tokens. n=4 smoke: 4 rows answering,
+no errors. **Zero non-finite** since the switch - the random-layer decode failures were fp16, which q4_0
+does not use.
+
+**Still open (upstream):** int8 + prompt path + ~97k-token prompts produced `prompt layer 7 ... non-finite`
+(Sphinx). q4_0 is the mode we run, so that path is not on ours; if it recurs, bisect prompt length.

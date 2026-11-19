@@ -255,14 +255,14 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
 void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
                float* q_abs, int64_t qa_stride, cudaStream_t s);
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+                int kv_lora, float* ctx, cudaStream_t s, int lat_q8);
 /// mla_attend of T tokens in a few launches (up to kMlaTokMax tokens each; the tensor-core attention: NVIDIA sm_80+,
 /// kv_lora 512): token t's q_abs at q_abs + t * q_stride, its n_sel[t] cells at cells + t * c_stride, its ctx at
 /// ctx + t * ctx_stride - each token's sums mla_attend's bit for bit.  false: not available here (mla_attend per token)
 constexpr int kMlaTokMax = 8;
 bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                      cudaStream_t s, bool lat_q8);
+                      cudaStream_t s, int lat_q8);
 /// mla_attend_batch for tokens of DIFFERENT sequences (the batched rows of several conversations): token t's latents at
 /// lat[t] and its n_sel[t] cells at cells[t] (each its own cache: the resident rows, or a streamed layer's slot rows),
 /// the partials in the caller's `part` (mla_rows_part_floats() a token, room for part_tokens tokens: launches of
@@ -272,7 +272,7 @@ size_t mla_rows_part_floats(int n_head, int kv_lora);
 bool mla_rows_ok(int kv_lora);
 bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
-                     float* part, int part_tokens, cudaStream_t s, bool lat_q8);
+                     float* part, int part_tokens, cudaStream_t s, int lat_q8);
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
 /// The INT8 latent cache (MAYA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values

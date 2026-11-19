@@ -35,7 +35,8 @@ namespace strata::core {
 enum class GlmStateMode : int {
     SlowF32 = 0,   // the reference path (MAYA_GLM_SLOW, load()): F32 latent
     Fp16 = 1,      // the fast path: FP16 latent rows
-    Int8 = 2,      // the fast path with MAYA_GLM_KV_INT8: INT8 latent records (glm_fast.hpp lat8_rec_bytes)
+    Int8 = 2,
+    Q4 = 3,        // OUR stage B: q4_0 latent records (glm_lat4.cuh; lat4_rec_bytes = 288 B at kv_lora 512)      // the fast path with MAYA_GLM_KV_INT8: INT8 latent records (glm_fast.hpp lat8_rec_bytes)
 };
 
 struct GlmStateLayout {

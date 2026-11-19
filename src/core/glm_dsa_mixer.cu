@@ -420,7 +420,7 @@ const int* dsa_kv_resolve(void* ctx, const int* cells, int n_cap, const int* n_s
 void Glm5Model::dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream) const {
     glmdsa::MixerCache& c = *(glmdsa::MixerCache*) cache;
     c.lat = state_ + lay_.dsa_lat[(size_t) il];
-    c.lat_q8 = lat_q8_ ? 1 : 0;
+    c.lat_q8 = lat_q8_;
     c.k_pe = g_.qk_rope > 0 ? (uint16_t*) (state_ + lay_.dsa_kpe[(size_t) il]) : nullptr;
     if (!kv_streamed(kv_, il)) return;
     DsaKvCtx& k = *(DsaKvCtx*) kctx;

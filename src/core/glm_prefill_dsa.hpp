@@ -61,7 +61,7 @@ struct Io {
     int64_t p0 = 0;                   // position of row 0
     float* state = nullptr;           // the part's state arena (Glm5Model::state_)
     const GlmStateLayout* lay = nullptr;
-    bool lat_q8 = false;
+    int lat_q8 = 0;
     int64_t max_ctx = 0;
     const glmdsa::GlmDsaFast* dsa = nullptr;
     bool skip_output = false;         // the tail-skip layer: caches only, no attn_output

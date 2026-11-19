@@ -9286,7 +9286,8 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
         return r;
     }
     // FP16 latents take half a float each, INT8 records lat8_rec_bytes / 4
-    const int64_t lat_pp = lat_q8      ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
+    const int64_t lat_pp = lat_q8 == 2 ? (int64_t) gf::lat4_rec_bytes(g.kv_lora) / 4
+                           : lat_q8 == 1 ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
                            : fast_mode ? g.kv_lora / 2
                                        : g.kv_lora;
     const int64_t pools = (n + g.idx_kpool - 1) / g.idx_kpool;

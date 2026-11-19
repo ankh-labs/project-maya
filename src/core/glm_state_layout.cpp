@@ -19,6 +19,7 @@ int64_t lat_floats_per_pos(const Glm5Geometry& g, GlmStateMode mode) {
     const bool dsa = g.arch == GlmArch::GlmDsa;
     switch (mode) {
     case GlmStateMode::Int8: return (int64_t) strata::kernels::glmf::lat8_rec_bytes(g.kv_lora) / 4;
+    case GlmStateMode::Q4:   return (int64_t) strata::kernels::glmf::lat4_rec_bytes(g.kv_lora) / 4;
     case GlmStateMode::Fp16: return (int64_t) g.kv_lora / 2;
     case GlmStateMode::SlowF32: break;
     }
@@ -136,7 +137,8 @@ bool glm_state_carve(const Glm5Geometry& g, int l0, int l1, int mtp_il, int64_t 
                   " of " + std::to_string(g.n_layers) + " layers)";
             return false;
         }
-        if (mode == GlmStateMode::Int8 && strata::kernels::glmf::lat8_rec_bytes(g.kv_lora) % 16 != 0) {
+        if ((mode == GlmStateMode::Int8 ? strata::kernels::glmf::lat8_rec_bytes(g.kv_lora)
+             : mode == GlmStateMode::Q4 ? strata::kernels::glmf::lat4_rec_bytes(g.kv_lora) : 0) % 16 != 0) {
             err = "glm state layout: the INT8 latent record (" +
                   std::to_string(strata::kernels::glmf::lat8_rec_bytes(g.kv_lora)) + " B) is not 16-byte aligned";
             return false;

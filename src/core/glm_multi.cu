@@ -86,7 +86,7 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : ctx;
     GlmStateLayout L;
     std::string err;
-    if (!glm_state_carve(g, l0_, l1_, mtp_il_, ctx, lat_q8_ ? GlmStateMode::Int8 : GlmStateMode::Fp16,
+    if (!glm_state_carve(g, l0_, l1_, mtp_il_, ctx, lat_q8_ == 2 ? GlmStateMode::Q4 : lat_q8_ ? GlmStateMode::Int8 : GlmStateMode::Fp16,
                          glm_state_fast_ik_ring(ctx), L, err, lat_rows)) {
         std::fprintf(stderr, "glm multi: %s\n", err.c_str());
         c.bytes = 0;

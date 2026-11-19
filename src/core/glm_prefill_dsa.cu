@@ -558,7 +558,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         pa.q_stride = QH;
         pa.q_pe_off = NOPE;
         pa.lat = lat;
-        pa.lat_q8 = io.lat_q8 ? 1 : 0;
+        pa.lat_q8 = io.lat_q8;
         pa.k_pe = k_pe;
         pa.walk = glmd::AttnWalk::Dense;
         pa.T = 1;
@@ -633,7 +633,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         pr.a.kv_raw = kv_raw;
         pr.a.kv_norm = L.kv_a_norm;
         pr.a.lat = lat;
-        pr.a.lat_q8 = io.lat_q8 ? 1 : 0;
+        pr.a.lat_q8 = io.lat_q8;
         pr.a.kv_lora = KV;
         pr.a.k_pe = k_pe;
         pr.a.qk_rope = R;
@@ -750,7 +750,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         a.q_stride = QH;
         a.q_pe_off = NOPE;
         a.lat = lat;
-        a.lat_q8 = io.lat_q8 ? 1 : 0;
+        a.lat_q8 = io.lat_q8;
         a.k_pe = k_pe;
         a.walk = walk;
         a.sel = sel;
@@ -867,7 +867,7 @@ bool mtp_fill(const Io& io, const MtpIo& m, std::string& err) {
         pr.a.kv_raw = kv_raw;
         pr.a.kv_norm = L.kv_a_norm;
         pr.a.lat = lat;
-        pr.a.lat_q8 = io.lat_q8 ? 1 : 0;
+        pr.a.lat_q8 = io.lat_q8;
         pr.a.kv_lora = g.kv_lora;
         pr.a.k_pe = k_pe;
         pr.a.qk_rope = g.qk_rope;

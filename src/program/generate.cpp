@@ -1151,7 +1151,7 @@ static int glm_pack_generate(const Options& o) {
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
                     "cpu_threads=%d cpu_threads_max=%d pcie_share=%.2f logit_bias=1\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) o.max_context, model.kv_int8() ? "int8" : model.kv_q4() ? "q4_0" : "fp16", (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
@@ -1437,7 +1437,7 @@ static int glm_pack_generate(const Options& o) {
         // metadata says 8), ctx bounds n_pos and the latent rows, and the KV precision changes the latent layout.
         // Expert-cache / slot sizing is deliberately NOT here - it changes placement, not the state's meaning.
         id << " k=" << model.geometry().n_exp_used << " ctx=" << o.max_context
-           << " kv=" << model.kv_int8() ? "int8" : "fp16";
+           << " kv=" << model.kv_int8() ? "int8" : model.kv_q4() ? "q4_0" : "fp16";
         std::error_code ec;
         // the pack by CONTENT, not sizes: index.txt fully describes the tensor layout (two packs of the
         // same file sizes can differ), and dense.bin's size+mtime catches a repack the index misses.  This
@@ -5279,6 +5279,10 @@ int main(int argc, char** argv) {
         if (!o.kv_given && std::getenv("MAYA_GLM_KV_INT8") == nullptr) o.kv = "int8";
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("MAYA_GLM_KV_INT8") == nullptr) set_env("MAYA_GLM_KV_INT8", "1");
+          // --kv q4_0 on the GLM path: OUR stage-B q4_0 records (288 B a position; Glm5Model::lat_q8_ = 2).
+          // The qsa_* calls below are the Qwen path; these env names are what the GLM loader reads.
+          if (o.kv == "q4_0") { set_env("MAYA_GLM_KV_Q4", "1"); set_env("MAYA_GLM_KV_INT8", "0"); }
+          else if (o.kv == "int8") set_env("MAYA_GLM_KV_Q4", "0");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
         if (o.kv_resident < 0) {
             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");

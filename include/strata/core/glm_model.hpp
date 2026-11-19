@@ -660,7 +660,7 @@ public:
     int ik_ring_ = 0;
     // the fast path's latent cache in INT8 records (--kv int8 / MAYA_GLM_KV_INT8=1; glm_fast.hpp lat8_rec_bytes):
     // 544 bytes a position and layer against FP16's 1024
-    bool lat_q8_ = false;
+    int lat_q8_ = 0;          // --kv on the latent cache: 0 fp16, 1 int8, 2 q4_0 (our stage B)
     // KV streaming (--kv-resident N / MAYA_GLM_KV_RESIDENT; strata/kernels/glm_kv_stream.hpp): the fast path's DSA
     // layers keep their latent cache in pinned RAM and N positions of it in VRAM - state_ + dsa_lat_[il] is then the
     // layer's VRAM slots.  Null: every position in VRAM.  (glm_fast_state.hpp)
@@ -731,7 +731,8 @@ public:
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
-    bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (MAYA_GLM_KV_INT8=1)
+    bool kv_int8() const { return lat_q8_ == 1; }
+    bool kv_q4() const { return lat_q8_ == 2; }   // q4_0 records (our stage B; 288 B a position and layer)   // the latent cache in INT8 (MAYA_GLM_KV_INT8=1)
     /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
     /// MAYA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
     /// or when the context fits in that many anyway

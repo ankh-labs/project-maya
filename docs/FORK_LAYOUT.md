@@ -820,3 +820,33 @@ a silent corruption of every routed answer.  This is the kind of hunk that compi
 | correctness | needle `ZQ-4471` in 11.9k, Uranus/Jupiter/hexagon/391 |
 | n=4 concurrent smoke | **4/4**, no engine errors, no router non-finite |
 | ablation | `settings.ablate: true` |
+
+## 2026-11-19 - v1.1.68 merged; the q4_0 selector restored (patch 8 back on)
+
+**Branch `feat/v1168-from-good`**, merge `9f998f6b`, VERSION 1.1.68, plus the q4_0 restore.  v1.1.67 was a
+correctness release (GLM where the experts do not all fit in VRAM, small-card start); v1.1.68 adds Hy4-Flash
+(Tencent 220B, its own engine - not ours).
+
+### The q4_0 restore - the patch my v1.1.59 resolution had silently deleted
+
+`--kv q4_0` had stopped selecting anything: `generate.cpp` only called `qsa_set_kv_q4` (the Qwen path) and
+`glm_model.cu` derived the latent from `MAYA_GLM_KV_INT8` alone, so GLM fell through to **FP16** - the mode
+measured failing 5 of 8 decode requests. Restored to the tri-state it had on `homelab/v3q-support`:
+
+| site | change |
+|---|---|
+| `glm_state_layout.hpp` | `Q4 = 3` mode |
+| `glm_state_layout.cpp` | `lat4_rec_bytes(kv_lora)/4` floats a position; the 16-byte alignment check covers Q4 |
+| `glm_model.hpp` | `bool lat_q8_` -> `int` (0 fp16 / 1 int8 / 2 q4_0); `kv_int8()` tests 1, `kv_q4()` tests 2 |
+| `glm_model.cu` | selector: `MAYA_GLM_KV_Q4` wins over `MAYA_GLM_KV_INT8`; lat_floats, the log line, the state mode and the stream `row_bytes` all tri-state |
+| `glm_multi.cu`, `glm_fast_path.cu` | the state carve and the slots' per-position bytes |
+| `glm_fast.hpp`, `glm_fast.cu`, `glm_prefill_dsa.hpp` | the `bool lat_q8` signatures go back to `int`, so `if (lat_q8 == 2) fwht512_rows_cuda(...)` is reachable |
+| `glm_dsa_mixer.cu`, `glm_prefill_dsa.cu` | pass the value through instead of collapsing it to 0/1 |
+| `generate.cpp` | `--kv q4_0` sets `MAYA_GLM_KV_Q4=1` and clears `MAYA_GLM_KV_INT8`; the kv name prints `q4_0` |
+
+**Measured after (v1.1.68, q4_0 288 B/pos, prompt path on):** cold prefill **1,772 then 1,902 tok/s** (two
+runs, first warms the expert cache); decode **23.3 -> 30.0 tok/s** (200 tokens, warm); n=4 concurrency smoke
+4 rows answering, no errors; **no NON-FINITE at all** (the fp16 failures are gone with fp16 unused).
+
+Gates: invariants 15/15 before and after; build clean; our divergences present (`admit_row0`, `pipe_scratch`,
+`hseq`, `MAYA_GLM_LAYER_PIPE`, `kv_q4()`).
