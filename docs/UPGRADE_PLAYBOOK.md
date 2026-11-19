@@ -40,6 +40,34 @@ in a conflict resolution - do not "fix" the symptom, re-apply the patch.
 
 ## 3. The KV mode trap (this is the one that keeps biting)
 
+> **CORRECTED 2026-11-19 - it is a DROPPED PATCH, not an upstream limitation.** q4_0 was never
+> "silently fp16" as a property of the codebase: our selector was removed by **my v1.1.59 merge
+> resolution**, which took upstream's `bool lat_q8_` and deleted `lat_type_`. The feature still
+> exists and still works when the selector is restored. This is the exact content of
+> `homelab/v3q-support:src/core/glm_model.cu`:
+>
+> ```c
+> const char* kv_int_env = getenv("MAYA_GLM_KV_INT8");          // (STRATA_ on that branch;
+> const bool want_int8 = kv_int_env && atoi(kv_int_env) != 0;   //  env_alias maps it at start)
+> const char* kv_q4_env  = getenv("MAYA_GLM_KV_Q4");
+> const bool want_q4    = kv_q4_env && atoi(kv_q4_env) != 0;
+> lat_type_ = want_q4 ? LatType::q4_0 : want_int8 ? LatType::int8 : LatType::fp16;
+> ```
+>
+> **Restoring it is a tri-state job, not a one-liner:**
+> 1. `glm_model.hpp`: `int lat_q8_` (0 fp16 / 1 int8 / 2 q4_0), not `bool`; accessors that state the
+>    type (`kv_int8()`, `kv_q4()`) for the printf/slot identity.
+> 2. `generate.cpp`: `--kv q4_0` must set `MAYA_GLM_KV_Q4=1` **and** clear `MAYA_GLM_KV_INT8`
+>    (today `-kv q4_0` only calls `qsa_set_kv_q4`, the Qwen path).
+> 3. `glm_model.cu`: the selection above, plus the state-layout mode (q4_0 records are 288 B/pos).
+> 4. The `int lat_q8` signatures we changed to `bool` in the v1.1.59/1.1.66 merges
+>    (`glm_fast.hpp`, `mla_attend*`, `mla_out`) must go back to the tri-state where the stage-B
+>    branch `if (lat_q8 == 2) fwht512_rows_cuda(...)` lives (`glm_batch.cu`).
+>
+> **Verify:** the boot log must say `latent cache q4_0 (288 bytes a position and layer)` - if it
+> says INT8 (544 B) or FP16 (1024 B), the selector is still missing. Then cold bench >=1,500 tok/s
+> and decode 20-25 tok/s.
+
 `--kv q4_0` is **not** handled by GLM's engine any more:
 
 ```c
