@@ -301,6 +301,9 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME ds4_draft_placement_test COMMAND ds4_draft_placement_test)
   add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
   add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
+  # maya-hy4's --kv auto and its pictures' room: what is tried, in which order (src/hy4/hy4_plan.hpp; no GPU)
+  add_executable(hy4_plan_test tests/hy4_plan_test.cpp)
+  add_test(NAME hy4_plan_test COMMAND hy4_plan_test)
   add_executable(ds4_pcie_test tests/ds4_pcie_test.cpp)
   add_test(NAME ds4_pcie_test COMMAND ds4_pcie_test)
   add_executable(ds4_ram_slice_test tests/ds4_ram_slice_test.cpp)
@@ -958,6 +961,35 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs on AMD: ds4_lt.cu, measured)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
       target_link_libraries(maya-mm3 PRIVATE roc::hipblaslt)
+    endif()
+    # Tencent's Hy4-flash (a GGUF set, tools/hy4/pack_gguf.py): its own engine (src/hy4) on maya-ds4's ggml block-type
+    # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA, and AMD on Linux
+    if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+      add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_vision.cu src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/hy4/hy4_tp.cpp
+                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+      target_include_directories(maya-hy4 PRIVATE ${_strata_gpu_include_directories} include src/hy4 src/mm3
+                                                  third_party/ggml)
+      target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
+                                             Threads::Threads)
+      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY)
+      if(STRATA_BUILD_TESTS)
+        # maya-hy4's routed experts (no model): the token, window and prompt forms on ds4_iq's kernels against
+        # per-matrix GEMVs, in Hy4-flash's types (Q4_K / Q6_K, and the MTP block's Q8_0)
+        add_executable(hy4_experts_test tests/hy4_experts_test.cu src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp
+                                        src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+        target_include_directories(hy4_experts_test PRIVATE ${_strata_gpu_include_directories} include src/hy4
+                                                           third_party/ggml)
+        target_link_libraries(hy4_experts_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+        target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_ONLY)
+        add_test(NAME hy4_experts_test COMMAND hy4_experts_test)
+        # maya-hy4's own kernels (no model): hyper-connections, the latent cache and MLA attention with sinks, the
+        # router, the indexer's pools / scores / picks, Engram - against double-precision host references
+        add_executable(hy4_kernels_test tests/hy4_kernels_test.cu src/hy4/hy4_kernels.cu)
+        target_include_directories(hy4_kernels_test PRIVATE ${_strata_gpu_include_directories} include src/hy4)
+        target_link_libraries(hy4_kernels_test PRIVATE ${_strata_gpu_runtime_target})
+        add_test(NAME hy4_kernels_test COMMAND hy4_kernels_test)
+        set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
+      endif()
     endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with

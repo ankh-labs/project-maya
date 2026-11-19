@@ -1,0 +1,126 @@
+{
+ "exe": "G:\\AI\\maya-eval\\project-maya\\build\\maya.exe",
+ "args": [
+  "--glm-pack",
+  "G:\\AI\\dsquant-work\\gguf\\v3q\\pack-repack-20261027",
+  "--max-context",
+  "524288",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "65536",
+  "--kv-streaming",
+  "on",
+  "--expert-profile",
+  "G:\\AI\\maya-eval\\project-maya\\data\\expert-profile-glm.bin",
+  "--vram-reserve-mib",
+  "512",
+  "--parallel",
+  "4",
+  "--kv",
+  "int8",
+  "--ablate",
+  "G:\\AI\\maya-eval\\models\\refusal-directions\\GLM-5.3-Flash-refusal-direction.gguf",
+  "--ablate-default",
+  "off"
+ ],
+ "cwd": "G:\\AI\\maya-eval\\project-maya",
+ "tokenizer": "G:\\AI\\dsquant-work\\gguf\\v3q\\pack-repack-20261027\\tokenizer",
+ "model_name": "glm-5.3-flash",
+ "gpu": [
+  0
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 40,
+  "min_p": 0.05,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "repetition_penalty": 1.0,
+  "penalty_last_n": 64
+ },
+ "reasoning_effort": "low",
+ "lib_dirs": [
+  "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin",
+  "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin\\x64"
+ ],
+ "port": 8080,
+ "log": "G:\\AI\\maya-eval\\project-maya\\maya-v3q-q4-par4.log",
+ "installer": {
+  "models_dir": "G:\\AI\\maya-eval\\Maya-data\\models",
+  "quant": "v3q q4_0 KV (streaming - correct)",
+  "gguf": "G:\\AI\\dsquant-work\\gguf\\v3q\\GLM-5.3-Flash-UD-IQ3_XXS-00001-of-00004.gguf",
+  "gguf_dir": "G:\\AI\\dsquant-work\\gguf\\v3q",
+  "draft": "mtp",
+  "written": "2026-10-26 20:22",
+  "as_set_up": {
+   "context": 262144,
+   "gpus": [
+    0
+   ],
+   "env": {},
+   "images": false,
+   "reserve_mib": null,
+   "parallel": 1,
+   "draft": "mtp",
+   "expert_cache": null,
+   "prefill": null,
+   "kv_streaming": true,
+   "kv_resident": null
+  },
+  "tuned_on": {
+   "driver": "616.92",
+   "pci": "00000000:01:00.0"
+  }
+ },
+ "env": {
+  "MAYA_GLM_THINK_TOKEN_ONLY": "1",
+  "MAYA_GLM_ORPHAN_THINK": "1",
+  "MAYA_GLM_CPU_RETIME": "0",
+  "MAYA_GLM_SLOT_KEEP": "1",
+  "MAYA_GLM_SLOT_DIR": "G:\\AI\\maya-eval\\scratch\\slots",
+  "MAYA_GLM_SLOTS": "20",
+  "MAYA_GLM_SLOT_MIN": "1024",
+  "MAYA_GLM_SLOT_GB": "24",
+  "MAYA_GLM_ROWS_ATTN": "1",
+  "MAYA_GLM_EXPERT_USED": "7",
+  "MAYA_GLM_USAGE": "G:\\AI\\maya-eval\\scratch\\usage-v3q.json",
+  "MAYA_GLM_PREFILL_INTERLEAVE": "2048,2"
+ },
+ "vision": {
+  "exe": "G:\\AI\\maya-eval\\project-maya\\build-vision\\bin\\maya-vision.exe",
+  "mmproj": "G:\\AI\\dsquant-work\\gguf\\v3q\\vision\\mmproj-GLM-5.3-Flash-F16.gguf",
+  "model": "G:\\AI\\dsquant-work\\gguf\\v3q\\vision\\GLM-5.3-Flash-vocab.gguf",
+  "gpu": true
+ },
+ "ablate": {
+  "file": "G:\\AI\\maya-eval\\models\\refusal-directions\\GLM-5.3-Flash-refusal-direction.gguf",
+  "default": true
+ },
+ "mcp_servers": {
+  "exa": {
+   "url": "https://mcp.exa.ai/mcp"
+  },
+  "context7": {
+   "url": "https://mcp.context7.com/mcp"
+  },
+  "search": {
+   "command": "C:\\Users\\agips\\AppData\\Local\\Microsoft\\WinGet\\Packages\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe\\uvx.exe",
+   "args": [
+    "duckduckgo-mcp-server"
+   ]
+  },
+  "fetch": {
+   "command": "C:\\Users\\agips\\AppData\\Local\\Microsoft\\WinGet\\Packages\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe\\uvx.exe",
+   "args": [
+    "mcp-server-fetch"
+   ]
+  }
+ },
+ "mcp": {
+  "start_timeout_s": 90,
+  "timeout_s": 60,
+  "max_rounds": 6
+ }
+}

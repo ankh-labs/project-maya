@@ -1494,7 +1494,52 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (tot <= avail) break;
             --per;
         }
+        // NO POOL (a small card: the VRAM left after the dense weights and the state holds fewer slots a layer than a
+        // route has experts): the start used to stop here.  It goes on without a pool instead - no expert is resident
+        // in VRAM, none is promoted, and every routed expert of every token is served the way a miss already is: the
+        // CPU lane computes it from the RAM tier, or it crosses PCIe into the device's 8 scratch slots (the lane's own
+        // measured split; a disk-only one through the staging buffers) - the same kernels and the same bytes as any
+        // other start's misses, only for all of them.  Slower, never wrong.  The batched prompt path has no tail to
+        // borrow (token by token) and the one-GPU MTP decode's verify rows would each cost their experts in full
+        // (off).  Only where the start would stop: a pool that holds a route starts as before.  Not on a layer split,
+        // with a DFlash drafter or with --parallel (their windows and rows share the scratch slots; untested), nor
+        // on unified memory (its pool is RAM: none left means none for the RAM tier either), nor - until one is tested -
+        // an EXL3 pack or a glm-dsa model: those keep the refusal.
+        // MAYA_GLM_NO_POOL=0 keeps the refusal everywhere.
+        bool no_pool = false;
+        std::string np_note;   // the refusal's: why the start without a pool is not taken
         if (per < g.n_exp_used) {
+            const char* const np_env = getenv("MAYA_GLM_NO_POOL");
+            const char* const np_why = np_env != nullptr && std::atoi(np_env) == 0 ? "MAYA_GLM_NO_POOL=0 is set"
+                                       : n_parts_ != 1     ? "the model is split over several GPUs"
+                                       : dflash_on_        ? "a DFlash drafter is loaded - start without it"
+                                       : seq_count() > 1   ? "--parallel is above 1 - start with --parallel 1"
+                                       : F->unified_memory ? "this GPU's memory is the system's RAM"
+                                       : exl3_             ? "it is not tested with EXL3 packs yet"
+                                       : g_.arch == GlmArch::GlmDsa ? "it is not tested with GLM-5.3 (744B) yet"
+                                                           : nullptr;
+            no_pool = np_why == nullptr;
+            if (!no_pool)
+                np_note = std::string(". The start without an expert pool (every expert from RAM, slower) is not "
+                                      "available here: ") + np_why;
+        }
+        if (no_pool) {
+            const size_t need = (size_t) g.n_exp_used * stride_sum;
+            const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            std::fprintf(stderr, "glm fast: CUDA%d: no room for an expert pool (%d slots a layer fit, a route needs %d - "
+                                 "about %zu MiB short; the budget was %zu MiB, the free VRAM less the %zu MiB reserve): "
+                                 "starting WITHOUT one - every expert is computed on the CPU from RAM or streamed to "
+                                 "the GPU for its token. The model is the same; decoding and prompt reading are much "
+                                 "slower than on a card that holds a pool\n",
+                         dev_, per, g.n_exp_used, short_mib, avail >> 20, reserve >> 20);
+            if (mtp_dec_) {
+                mtp_dec_ = false;
+                std::fprintf(stderr, "glm fast: CUDA%d: no expert pool - MTP drafting is off (a verify row would cost "
+                                     "its experts in full)\n", dev_);
+            }
+            per = 0;
+            avail = 0;
+        } else if (per < g.n_exp_used) {
             // what is short, and what makes room
             const size_t need = (size_t) g.n_exp_used * stride_sum;
             const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
@@ -1526,6 +1571,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                                          : "more is short than the whole " + std::to_string(res_mib) + " MiB reserve") +
                              "; " + by_hand
                        : std::string());
+            err += np_note;
             return false;
         }
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all
@@ -1553,7 +1599,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (const char* v = getenv("MAYA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
             const bool uni = F->unified_memory;
-            const int full = glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
+            const int full = !no_pool && glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
                                  ? glmfast::complete_pool_slots(uni ? room_u : avail, stride_sum, g.n_expert,
                                                                 gf::kSpares, k_full)
                                  : 0;
@@ -1568,6 +1614,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             }
         }
+        if (no_pool)   // (whether prefill_setup above sized a chunk or not)
+            std::fprintf(stderr, "glm prefill: CUDA%d no expert pool - the batched prompt path is off, prompts are read "
+                                 "token by token\n", dev_);
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
@@ -1576,9 +1625,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
-            if (per - k_extra < k_keep) {
+            if (!no_pool && per - k_extra < k_keep)
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
+            if (no_pool || per - k_extra < k_keep) {
                 prefill_destroy();
                 k_extra = 0;
             }
@@ -1619,7 +1669,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
         if (getenv("MAYA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert) &&
-            !F->complete) {
+            !F->complete && !no_pool) {
             std::vector<std::vector<double>> share((size_t) NL);
             // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
             // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
@@ -1725,7 +1775,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<uint8_t*> segs;
         std::vector<int> seg_of((size_t) NL, 0);
         const size_t main_bytes = tot - xtot;
-        if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
+        if (no_pool) {
+            segs.push_back(nullptr);   // (no slots: nothing to allocate - P.base stays null and P.n 0 in every layer)
+        } else if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
             segs.push_back(one);
         } else {
             cudaGetLastError();
@@ -5480,6 +5532,24 @@ void Glm5Model::fast_service() {
                 if (++F->usage[(size_t) key] >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
                 const bool resident = (((miss | fetch | cpu | skip) >> i) & 1u) == 0;
+                if (!F->tv_stale.empty()) {   // MAYA_GLM_TIER_VERIFY (debug): did this route read a stale RAM entry?
+                    if ((miss >> i) & 1u) F->tv_taint[(size_t) key] = 0;   // (read from disk again: its own bytes)
+                    const int ss = F->tv_stale[(size_t) key];
+                    if (ss >= 0 && (((fetch | cpu) >> i) & 1u)) {
+                        // a slot freed and not written since still has this expert's bytes; any other holds another's
+                        if (ss < R.n && R.st[(size_t) ss] == FastState::kRFree) {
+                            F->tv_use_same.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            F->tv_use_wrong.fetch_add(1, std::memory_order_relaxed);
+                            if ((promo >> i) & 1u) {
+                                F->tv_taint[(size_t) key] = 1;
+                                F->tv_promo_wrong.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    } else if (resident && F->tv_taint[(size_t) key] != 0) {
+                        F->tv_taint_use.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 if (resident) {
                     const int s = F->slot_of[(size_t) key];
                     if (s >= 0) P.tick[(size_t) s] = F->clock;
@@ -6266,6 +6336,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (key >= 0 && (ro == s || ro < 0)) {
                     upd(F->rtab_key(key), 0ull);
                     if (ro == s) F->ram_of[(size_t) key] = -1;
+                } else if (key >= 0) {
+                    // the expert's copy is another RAM slot (ro): the device's entry may still be THIS slot, which is
+                    // free from here on - the next expert written into it would be read as this one.  The entry goes to
+                    // the other slot where that one is live, else it is cleared (its own landing sets it)
+                    const char rst = R.st[(size_t) ro];
+                    upd(F->rtab_key(key), rst == FastState::kRHold || rst == FastState::kRPin
+                                              ? (unsigned long long) (R.slot((size_t) ro)) : 0ull);
                 }
                 R.key[(size_t) s] = -1;
                 R.st[(size_t) s] = FastState::kRFree;
@@ -6465,7 +6542,23 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             auto& P = F->lp[(size_t) m.il];
             auto& R = F->rc[(size_t) m.rclass];
-            if (m.up) {
+            if (m.up && F->slot_of[(size_t) m.key] >= 0 && F->slot_of[(size_t) m.key] != m.vslot) {
+                // a route fetched the expert from its RAM slot and kept it in a spare while this copy was on its way:
+                // that slot is the resident one (the device's table says so) and this one is free again.  Taking this
+                // one too left the expert in two slots under one key - evicted one after the other, each took the
+                // table's entry with it and each left a RAM copy, and the RAM slot freed first was still the entry
+                // the device read: the next expert written there was then computed under this one's name
+                if (P.st[(size_t) m.vslot] == FastState::kLanding) {
+                    P.st[(size_t) m.vslot] = FastState::kFree;
+                    P.key[(size_t) m.vslot] = -1;
+                }
+                if (R.st[(size_t) m.rslot] == FastState::kRPin) {
+                    R.st[(size_t) m.rslot] = FastState::kRFree;
+                    R.key[(size_t) m.rslot] = -1;
+                }
+                if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
+                upd(F->rtab_key((size_t) m.key), 0ull);
+            } else if (m.up) {
                 P.st[(size_t) m.vslot] = FastState::kResident;
                 P.key[(size_t) m.vslot] = m.key % NE;
                 P.tick[(size_t) m.vslot] = F->clock;
@@ -6650,6 +6743,118 @@ bool Glm5Model::fast_boundary(std::string& err) {
                      (unsigned long long) F->bnd_seq, (unsigned long long) hs, (unsigned long long) hr,
                      (unsigned long long) hc, (unsigned long long) hv, (unsigned long long) ho, F->bg.size(),
                      F->draining.size(), (unsigned long long) F->helper_swaps);
+    }
+    // MAYA_GLM_TIER_VERIFY=1 (debug, off by default): the tables as the next token's routes find them, the device's
+    // read back (the flush above ended with the stream idle) and checked against the host's - glm_fast_state.hpp
+    static const bool tier_verify = [] {
+        const char* v = getenv("MAYA_GLM_TIER_VERIFY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (tier_verify && ok) {
+        const size_t N = (size_t) F->n_keys;
+        const int NE = g.n_expert;
+        if (F->tv_tab.empty()) {
+            F->tv_tab.assign(2 * N, 0ull);
+            F->tv_flag.assign(N, 0);
+            F->tv_taint.assign(N, 0);
+            F->tv_rmap.resize(F->rc.size());
+            for (size_t c = 0; c < F->rc.size(); ++c)
+                for (int s = 0; s < F->rc[c].n; ++s) F->tv_rmap[c][(unsigned long long) F->rc[c].slot((size_t) s)] = s;
+            F->tv_stale.assign(N, -1);
+        }
+        if (!glmfast::cuda_ok(cudaMemcpy(F->tv_tab.data(), F->tab, 2 * N * sizeof(unsigned long long),
+                                         cudaMemcpyDeviceToHost), "glm tier verify", err))
+            return false;
+        ++F->tv_n;
+        int stale_now = 0, dup_now = 0, split_now = 0, vbad_now = 0;
+        bool news = false;
+        std::vector<int> first((size_t) NE);
+        std::vector<uint8_t> two((size_t) NE);
+        const auto flag = [&](size_t k, uint8_t bit, bool on, uint64_t& total) {
+            const bool was = (F->tv_flag[k] & bit) != 0;
+            if (on) F->tv_flag[k] |= bit;
+            else F->tv_flag[k] &= (uint8_t) ~bit;
+            if (on && !was) ++total;
+            return on && !was && F->tv_lines < 200;
+        };
+        for (int il = l0_; il < lt_; ++il) {
+            if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+            const auto& P = F->lp[(size_t) il];
+            const size_t c = (size_t) F->layer_rc[(size_t) il];
+            const auto& R = F->rc[c];
+            two.assign((size_t) NE, 0);
+            first.assign((size_t) NE, -1);
+            for (int s = 0; s < P.n; ++s) {
+                if (P.st[(size_t) s] != FastState::kResident || P.key[(size_t) s] < 0 || P.key[(size_t) s] >= NE) continue;
+                const int e = P.key[(size_t) s];
+                if (first[(size_t) e] < 0) {
+                    first[(size_t) e] = s;
+                    continue;
+                }
+                two[(size_t) e] = 1;
+                if (flag((size_t) il * NE + e, 1, true, F->tv_dup_new)) {
+                    ++F->tv_lines;
+                    news = true;
+                    std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: TWO SLOTS layer %d expert %d: VRAM slots %d "
+                                         "and %d (the host's table: %d)\n", dev_, (unsigned long long) F->bnd_seq, il, e,
+                                 first[(size_t) e], s, F->slot_of[(size_t) il * NE + e]);
+                }
+            }
+            for (int e = 0; e < NE; ++e) {
+                const size_t k = (size_t) il * NE + e;
+                if (two[(size_t) e] == 0) flag(k, 1, false, F->tv_dup_new);
+                dup_now += two[(size_t) e];
+                const unsigned long long v = F->tv_tab[k], r = F->tv_tab[N + k];
+                bool vbad = false;
+                if (v != 0ull) {
+                    const int s = P.slot_index(v);
+                    vbad = s < 0 || !(P.st[(size_t) s] == FastState::kDraining ||
+                                      (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] == e));
+                }
+                vbad_now += vbad;
+                if (flag(k, 4, vbad, F->tv_vbad_new)) {
+                    ++F->tv_lines;
+                    news = true;
+                    std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: VRAM ENTRY layer %d expert %d: points at "
+                                         "slot %d, which does not hold it\n", dev_, (unsigned long long) F->bnd_seq, il, e,
+                                 P.slot_index(v));
+                }
+                int stale = -1;
+                bool split = false;
+                if (r != 0ull) {
+                    const auto it = F->tv_rmap[c].find(r);
+                    const int s = it == F->tv_rmap[c].end() ? R.n : it->second;
+                    if (s >= R.n || R.key[(size_t) s] != (int) k || R.st[(size_t) s] == FastState::kRFree) stale = s;
+                    else split = F->ram_of[k] != s;
+                }
+                split_now += split;
+                if (flag(k, 2, split, F->tv_split_new)) news = true;
+                if (stale >= 0) {
+                    ++stale_now;
+                    if (F->tv_stale[k] < 0) {
+                        ++F->tv_stale_new;
+                        news = true;
+                        if (F->tv_lines++ < 200) {
+                            const int held = stale < R.n ? R.key[(size_t) stale] : -1;
+                            std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: STALE layer %d expert %d: the device's "
+                                                 "RAM entry points at slot %d, which holds key %d (state %d; the host's "
+                                                 "table: %d)\n", dev_, (unsigned long long) F->bnd_seq, il, e, stale, held,
+                                         stale < R.n ? (int) R.st[(size_t) stale] : -1, F->ram_of[k]);
+                        }
+                    }
+                }
+                F->tv_stale[k] = stale;
+            }
+        }
+        if (news || F->tv_n % 64 == 0)
+            std::fprintf(stderr, "glm tier verify CUDA%d: %llu boundaries | stale RAM entries %llu (now %d) | experts in two "
+                                 "VRAM slots %llu (now %d) | entry-host splits %llu (now %d) | VRAM entries off %llu (now %d) "
+                                 "| routes through a stale entry: %llu same bytes, %llu another expert's (%llu promoted) | "
+                                 "routes on such a promoted copy %llu\n", dev_, (unsigned long long) F->tv_n,
+                         (unsigned long long) F->tv_stale_new, stale_now, (unsigned long long) F->tv_dup_new, dup_now,
+                         (unsigned long long) F->tv_split_new, split_now, (unsigned long long) F->tv_vbad_new, vbad_now,
+                         (unsigned long long) F->tv_use_same.load(), (unsigned long long) F->tv_use_wrong.load(),
+                         (unsigned long long) F->tv_promo_wrong.load(), (unsigned long long) F->tv_taint_use.load());
     }
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("MAYA_GLM_TIER_DIAG") != nullptr;
